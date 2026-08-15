@@ -17,8 +17,8 @@ use pnet::util::MacAddr;
 use crate::capture::{Event, Tx};
 use crate::session::{Message, Session};
 use crate::wire::{
-    Aarp, Addr, Aep, Atp, Body, Ddp, DdpBody, Echo, Encode, Frame, Nbp, NbpFunc, NbpTuple, Packet,
-    Zip, ZipAtp, AARP, DDP, DDP_AEP, DDP_ATP, DDP_NBP, DDP_ZIP,
+    Aarp, Addr, Aep, Atp, Body, Ddp, DdpBody, Echo, Encode, Frame, Func, Nbp, NbpFunc, NbpTuple,
+    Packet, Zip, ZipAtp, AARP, DDP, DDP_AEP, DDP_ATP, DDP_NBP, DDP_ZIP,
 };
 
 /// Where ELAP sends AppleTalk broadcasts, and where AARP probes and requests
@@ -223,6 +223,11 @@ const LOOKUP_INTERVAL: Duration = Duration::from_secs(1);
 const PING_INTERVAL: Duration = Duration::from_secs(1);
 const ZONE_TRIES: u32 = 3;
 const ZONE_INTERVAL: Duration = Duration::from_secs(2);
+/// ponytail: only `zone_list` drains this, so every other `wait` caller would
+/// otherwise accumulate unrelated completed transactions for the life of the
+/// node. Cap it well above the one-reply-per-request working set. Give each
+/// caller its own drain if a future command needs more than the last reply.
+const MAX_MESSAGES: usize = 64;
 
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
@@ -446,7 +451,10 @@ impl Node {
             let mut reply = None;
             for _ in 0..ZONE_TRIES {
                 self.send_ddp(router, 6, DDP_ATP, body.clone())?;
-                reply = self.wait(Instant::now() + ZONE_INTERVAL, |n, _| {
+                reply = self.wait(Instant::now() + ZONE_INTERVAL, |n, p| {
+                    if !zone_reply_matches(p, router, tid) {
+                        return None;
+                    }
                     n.messages.drain(..).find_map(|m| match m {
                         Message::Zip(z @ ZipAtp::Reply { .. }) => Some(z),
                         _ => None,
@@ -538,6 +546,12 @@ impl Node {
                 Ok(Event::Packet { at, packet }) => {
                     glean(&mut self.amt, &packet);
                     self.messages.extend(self.session.push(at, &packet));
+                    // Only `zone_list` drains this; every other caller must
+                    // not let it grow unbounded on a busy wire.
+                    if self.messages.len() > MAX_MESSAGES {
+                        let drop = self.messages.len() - MAX_MESSAGES;
+                        self.messages.drain(..drop);
+                    }
                     if let AarpAction::AnswerTo(mac) =
                         aarp_action(&packet, self.addr, self.tx.mac, self.probing)
                         && let Body::Aarp(a) = &packet.body
@@ -616,9 +630,23 @@ pub fn zone_list_request(tid: u16, start: u16) -> Atp {
 /// complete. The next index is this one plus however many names came back.
 pub fn next_start(start: u16, reply: &ZipAtp) -> Option<u16> {
     match reply {
-        ZipAtp::Reply { last: false, zones } => Some(start + zones.len() as u16),
+        // An empty page that also claims more to come is malformed — a router
+        // past the end of the list sets the flag (PDF 187). Stop rather than
+        // re-requesting the same index forever.
+        ZipAtp::Reply { last: false, zones } if !zones.is_empty() => {
+            Some(start + zones.len() as u16)
+        }
         _ => None,
     }
+}
+
+/// Whether this packet is the ATP response completing our zone-list request.
+/// Capture is promiscuous and GetZoneList is at-least-once with no release, so
+/// another node's reply — or a stale retransmission of our own previous page —
+/// is on the wire too and must not be mistaken for this page's answer.
+pub fn zone_reply_matches(p: &Packet, router: Addr, tid: u16) -> bool {
+    matches!(&p.body, Body::Ddp(d, DdpBody::Atp(a))
+        if d.src == router && a.func == Func::Resp && a.tid == tid)
 }
 
 #[cfg(test)]
@@ -985,6 +1013,42 @@ mod tests {
 
         // Anything that is not a reply ends the series rather than looping.
         assert_eq!(next_start(1, &ZipAtp::GetMyZone), None);
+    }
+
+    #[test]
+    fn an_empty_non_final_page_is_malformed_and_ends_the_series() {
+        // A router past the end of the list sets `last` (PDF 187); `last:
+        // false` with no zones is not a real page. Treating it as terminal,
+        // not `Some(start)`, is what keeps this from looping forever.
+        let malformed = ZipAtp::Reply { last: false, zones: vec![] };
+        assert_eq!(next_start(9, &malformed), None);
+    }
+
+    #[test]
+    fn zone_reply_matches_gates_on_router_func_and_tid() {
+        let router = Addr { net: 3, node: 1 };
+        let other = Addr { net: 3, node: 2 };
+
+        let resp = |tid: u16| Packet {
+            frame: frame(THEIR_MAC, OUR_MAC, DDP, Vec::new()),
+            body: Body::Ddp(
+                datagram(router, 6, OURS, OUR_SOCKET, DDP_ATP, Vec::new()),
+                DdpBody::Atp(Atp::response(tid, 0, true, false, [8, 0, 0, 1], Vec::new())),
+            ),
+        };
+        assert!(zone_reply_matches(&resp(4660), router, 4660));
+        // A stale retransmission answering a different page.
+        assert!(!zone_reply_matches(&resp(4660), router, 4661));
+
+        // Someone else's reply, seen because capture is promiscuous.
+        let mut wrong_source = resp(4660);
+        if let Body::Ddp(d, _) = &mut wrong_source.body {
+            d.src = other;
+        }
+        assert!(!zone_reply_matches(&wrong_source, router, 4660));
+
+        // Not ATP at all.
+        assert!(!zone_reply_matches(&netinfo((3, 5), "Engineering", None), router, 4660));
     }
 
     #[test]
