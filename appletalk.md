@@ -58,8 +58,11 @@ specifies every field.
 |---------------------------------|-----------|
 | AARP packet formats             | 87        |
 | ELAP packet format              | 93        |
+| AARP on ELAP: multicast, probe  | 98        |
 | DDP packet format               | 116–119   |
 | DDP checksum + hop counts       | 120       |
+| Node address acquisition        | 111–112   |
+| Zone acquisition at startup     | 181       |
 | RTMP Data packet format         | 136–138   |
 | NBP packet formats              | 169–172   |
 | ZIP Query / Reply               | 184–187   |
