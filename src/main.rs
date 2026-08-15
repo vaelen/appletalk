@@ -6,6 +6,7 @@
 //! Usage: sudo ./appletalk [interface]
 
 mod capture;
+mod session;
 mod text;
 mod wire;
 

@@ -93,7 +93,7 @@ pub(crate) fn put_pstring(out: &mut Vec<u8>, s: &str) {
 }
 
 /// An AppleTalk network address: 16-bit network, 8-bit node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Addr {
     pub net: u16,
     pub node: u8,
