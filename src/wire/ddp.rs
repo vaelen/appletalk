@@ -10,6 +10,9 @@ use super::{Addr, Encode, DDP_AEP, DDP_ATP, DDP_NBP, DDP_ZIP};
 /// The DDP checksum (Inside AppleTalk, PDF 120): add each byte, rotate the
 /// running total left one bit, and substitute $FFFF for a zero result because
 /// a zero checksum on the wire means "not computed".
+///
+/// ponytail: checksums are optional on the wire; unused until a node transmits.
+#[allow(dead_code)]
 pub fn checksum(bytes: &[u8]) -> u16 {
     let mut sum: u16 = 0;
     for &b in bytes {
@@ -69,6 +72,9 @@ impl Ddp {
 
     /// Checksum over everything following the checksum field — destination
     /// network through the last data byte.
+    ///
+    /// ponytail: checksums are optional on the wire; unused until a node transmits.
+    #[allow(dead_code)]
     pub fn compute_checksum(&self) -> u16 {
         checksum(&self.to_bytes()[4..])
     }
@@ -76,6 +82,9 @@ impl Ddp {
 
 impl Encode for Ddp {
     fn encode(&self, out: &mut Vec<u8>) {
+        // ponytail: silently truncates if hops > 15 or data.len() > 1023 (real DDP
+        // data max is 586, so this is safe in practice). Validate in a constructor
+        // when a node starts transmitting.
         let len = (13 + self.data.len()) as u16;
         // byte 0: 2 bits reserved, 4 bits hops, top 2 bits of a 10-bit length.
         out.push(((self.hops & 0x0f) << 2) | ((len >> 8) as u8 & 0x03));
@@ -191,7 +200,7 @@ mod tests {
         d.data = vec![0; 587 - 13]; // 574 bytes -> length 587
         let out = d.to_bytes();
         assert_eq!(out[0], (5 << 2) | 0x02); // hops 5, length bit 9 set
-        assert_eq!(out[1], 587u16 as u8 & 0xff);
+        assert_eq!(out[1], 587u16 as u8);
     }
 
     #[test]

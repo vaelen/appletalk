@@ -12,6 +12,9 @@ use pnet::util::MacAddr;
 /// Serialises a wire type. Derived fields — lengths, counts, padding — are
 /// recomputed here rather than read from the struct, so a parsed packet whose
 /// length field disagreed with its data cannot be re-transmitted that way.
+///
+/// Implemented by Tasks 3-6 for the remaining protocols; nothing consumes it yet.
+#[allow(dead_code)]
 pub trait Encode {
     /// Appends to `out` so nested layers share one allocation.
     fn encode(&self, out: &mut Vec<u8>);
