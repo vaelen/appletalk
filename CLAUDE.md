@@ -56,11 +56,23 @@ Before committing: `cargo test && cargo clippy --all-targets` — both clean.
 Short — one or two sentences. No body paragraphs restating the diff, no
 `Co-Authored-By` or session trailers.
 
-## Verifying against real traffic
+## Verifying layouts
 
-Nothing here has been tested against a live AppleTalk network. Layouts written
-from *Inside AppleTalk* are marked where they are worth confirming. Cross-check
-with `tcpdump -e -x` before trusting a decode.
+`inside-appletalk-second-edition.pdf` in the repo root is the authority. It is
+gitignored — 57MB, and Apple's copyright. It has an OCR text layer, so grep it
+instead of reading page images:
+
+```sh
+pdftotext -f 209 -l 212 inside-appletalk-second-edition.pdf -
+```
+
+`appletalk.md` has a section-to-PDF-page index. **Check the book before writing
+a parser, not after.** Every layout in `wire.rs` has been verified against it;
+keep it that way.
+
+Still untested against a live AppleTalk network — the book settles the byte
+layouts, not our behavior. Cross-check with `tcpdump -e -x` before trusting a
+decode of real traffic.
 
 ```sh
 sudo setcap cap_net_raw+ep target/debug/appletalk   # or run as root
