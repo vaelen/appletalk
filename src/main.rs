@@ -7,6 +7,7 @@
 
 mod capture;
 mod cli;
+mod node;
 mod session;
 mod text;
 mod wire;
@@ -15,7 +16,7 @@ use clap::Parser;
 
 fn main() {
     let args = cli::Cli::parse();
-    let (iface, events) = match capture::spawn(args.interface.as_deref()) {
+    let (iface, _tx, events) = match capture::spawn(args.interface.as_deref()) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("appletalk: {e}");

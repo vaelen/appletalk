@@ -9,9 +9,10 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread;
 use std::time::SystemTime;
 
-use pnet::datalink::{self, Channel::Ethernet, Config, DataLinkReceiver};
+use pnet::datalink::{self, Channel::Ethernet, Config, DataLinkReceiver, DataLinkSender};
+use pnet::util::MacAddr;
 
-use crate::wire;
+use crate::wire::{self, Encode};
 
 /// Decoded packets that may queue before the capture thread starts dropping.
 ///
@@ -33,12 +34,37 @@ pub enum Event {
     Error(String),
 }
 
+/// The transmit half of the NIC, wrapped so pnet stays inside this module.
+/// Callers hand it a `wire::Frame`; it does the encoding.
+///
+/// Nothing calls `send` or reads `mac` yet — `main` discards this as `_tx` —
+/// so both are dead code until Task 2 wires address claiming through it.
+/// ponytail: allow(dead_code) below, remove once that lands.
+#[allow(dead_code)]
+pub struct Tx {
+    inner: Box<dyn DataLinkSender>,
+    /// The NIC's own MAC. Every frame we build is sourced from it.
+    pub mac: MacAddr,
+}
+
+impl Tx {
+    #[allow(dead_code)]
+    pub fn send(&mut self, f: &wire::Frame) -> io::Result<()> {
+        let bytes = f.to_bytes();
+        // pnet returns None when the frame does not fit its buffer.
+        self.inner
+            .send_to(&bytes, None)
+            .unwrap_or_else(|| Err(io::Error::other("frame too large to send")))
+    }
+}
+
 /// Opens `want` (or the first sensible interface) and starts capturing.
 ///
-/// Returns the interface name and the event stream. Opening happens before the
-/// thread starts, so the common failure — no CAP_NET_RAW — surfaces here
-/// rather than killing a thread nobody is watching.
-pub fn spawn(want: Option<&str>) -> io::Result<(String, Receiver<Event>)> {
+/// Returns the interface name, a transmit handle, and the event stream.
+/// Opening happens before the thread starts, so the common failure — no
+/// CAP_NET_RAW — surfaces here rather than killing a thread nobody is
+/// watching.
+pub fn spawn(want: Option<&str>) -> io::Result<(String, Tx, Receiver<Event>)> {
     let iface = datalink::interfaces()
         .into_iter()
         .find(|i| match want {
@@ -51,8 +77,8 @@ pub fn spawn(want: Option<&str>) -> io::Result<(String, Receiver<Event>)> {
         })?;
 
     let cfg = Config { promiscuous: true, ..Default::default() };
-    let rx = match datalink::channel(&iface, cfg) {
-        Ok(Ethernet(_tx, rx)) => rx,
+    let (sender, rx) = match datalink::channel(&iface, cfg) {
+        Ok(Ethernet(tx, rx)) => (tx, rx),
         Ok(_) => {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "not an Ethernet channel"));
         }
@@ -61,10 +87,15 @@ pub fn spawn(want: Option<&str>) -> io::Result<(String, Receiver<Event>)> {
             return Err(io::Error::new(e.kind(), msg));
         }
     };
+    // A named interface is not guaranteed to have one; we cannot source frames
+    // without it.
+    let mac = iface.mac.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("{} has no MAC address", iface.name))
+    })?;
 
     let (tx, events) = sync_channel(QUEUE);
     thread::spawn(move || capture_loop(rx, tx));
-    Ok((iface.name, events))
+    Ok((iface.name, Tx { inner: sender, mac }, events))
 }
 
 fn capture_loop(mut rx: Box<dyn DataLinkReceiver>, tx: SyncSender<Event>) {

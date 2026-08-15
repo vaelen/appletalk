@@ -11,6 +11,7 @@ protocol overview and the planned build order.
 | `src/wire/`      | Protocol parsers, one file per protocol; `decode()`. No I/O.                                 |
 | `src/session.rs` | Reassembles multi-packet ATP transactions. The only stateful module, driven by the frontend. |
 | `src/capture.rs` | Capture thread: NIC to `Event`s on a bounded channel.                                        |
+| `src/node.rs`    | Node runtime: claims an address, defends it, sends requests, awaits replies.                 |
 | `src/text.rs`    | Plain-text frontend. Timestamps and hexdump.                                                 |
 | `src/cli.rs`     | `clap` command line: subcommands, and the output/filter flags a frontend obeys.              |
 | `src/main.rs`    | Glue: pick an interface, pick a frontend, start it.                                          |

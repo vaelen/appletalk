@@ -12,11 +12,6 @@ use pnet::util::MacAddr;
 /// Serialises a wire type. Derived fields — lengths, counts, padding — are
 /// recomputed here rather than read from the struct, so a parsed packet whose
 /// length field disagreed with its data cannot be re-transmitted that way.
-///
-/// This crate is a passive dumper — nothing transmits yet — so only tests
-/// call `encode`/`to_bytes` in a binary crate, which is what the allow below
-/// suppresses. Drop it once a node runtime sends packets.
-#[allow(dead_code)]
 pub trait Encode {
     /// Appends to `out` so nested layers share one allocation.
     fn encode(&self, out: &mut Vec<u8>);
