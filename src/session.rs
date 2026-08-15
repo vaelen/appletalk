@@ -27,7 +27,7 @@ pub struct TxnKey {
 #[allow(dead_code)] // Tasks 8-10 consume Transactions/TxnKey/Transaction
 pub struct Transaction {
     pub key: TxnKey,
-    /// From the first response packet. ASP and PAP put their headers here.
+    /// From response packet 0. ASP and PAP put their headers here.
     pub user_bytes: [u8; 4],
     /// Response payloads concatenated in sequence order.
     pub data: Vec<u8>,
@@ -109,7 +109,10 @@ impl Transactions {
         };
 
         let partial = self.open.entry(key).or_insert_with(|| Partial::new(at));
-        if partial.segments[seq as usize].is_none() {
+        // Packet 0 is guaranteed present at completion (0..=eom), so anchoring
+        // on it rather than "whichever fragment arrived first" is
+        // deterministic under out-of-order delivery, which is normal traffic.
+        if seq == 0 {
             partial.user_bytes = atp.user_bytes;
         }
         partial.segments[seq as usize] = Some(atp.data.clone());
@@ -121,6 +124,14 @@ impl Transactions {
         let user_bytes = partial.user_bytes;
         self.open.remove(&key);
         Some(Transaction { key, user_bytes, data, at })
+    }
+
+    /// Number of transactions still awaiting completion. Pulled forward from
+    /// Task 8 (eviction) so the seq > 7 reject test can assert no entry was
+    /// created rather than just checking the return value.
+    #[allow(dead_code)] // Task 8's eviction sweep uses this
+    fn open_count(&self) -> usize {
+        self.open.len()
     }
 }
 
@@ -163,6 +174,12 @@ mod tests {
 
     fn resp(seq: u8, eom: bool, data: &[u8]) -> Packet {
         packet(Atp::response(4660, seq, eom, false, [1, 2, 3, 4], data.to_vec()))
+    }
+
+    /// Like `resp`, but with caller-chosen user bytes, for tests that need to
+    /// tell fragments apart by which one's user bytes won.
+    fn resp_ub(seq: u8, eom: bool, user_bytes: [u8; 4], data: &[u8]) -> Packet {
+        packet(Atp::response(4660, seq, eom, false, user_bytes, data.to_vec()))
     }
 
     #[test]
@@ -217,5 +234,32 @@ mod tests {
         assert!(t.push(at(0), &resp(0, false, b"aaa")).is_none());
         assert_eq!(t.push(at(1), &other).unwrap().data, b"x");
         assert_eq!(t.push(at(2), &resp(1, true, b"bbb")).unwrap().data, b"aaabbb");
+    }
+
+    #[test]
+    fn user_bytes_come_from_packet_0_in_order() {
+        let mut t = Transactions::new();
+        assert!(t.push(at(0), &resp_ub(0, false, [0xaa, 0, 0, 0], b"aaa")).is_none());
+        assert!(t.push(at(1), &resp_ub(1, false, [0xbb, 0, 0, 0], b"bbb")).is_none());
+        let done = t.push(at(2), &resp_ub(2, true, [0xcc, 0, 0, 0], b"ccc")).unwrap();
+        assert_eq!(done.user_bytes, [0xaa, 0, 0, 0]);
+    }
+
+    #[test]
+    fn user_bytes_come_from_packet_0_out_of_order() {
+        let mut t = Transactions::new();
+        assert!(t.push(at(0), &resp_ub(2, true, [0xcc, 0, 0, 0], b"ccc")).is_none());
+        assert!(t.push(at(1), &resp_ub(1, false, [0xbb, 0, 0, 0], b"bbb")).is_none());
+        let done = t.push(at(2), &resp_ub(0, false, [0xaa, 0, 0, 0], b"aaa")).unwrap();
+        assert_eq!(done.user_bytes, [0xaa, 0, 0, 0]);
+    }
+
+    #[test]
+    fn sequence_numbers_past_7_are_rejected_without_opening_a_transaction() {
+        let mut t = Transactions::new();
+        assert!(t.push(at(0), &resp(8, true, b"x")).is_none());
+        assert_eq!(t.open_count(), 0);
+        assert!(t.push(at(1), &resp(255, true, b"x")).is_none());
+        assert_eq!(t.open_count(), 0);
     }
 }
