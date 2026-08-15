@@ -9,7 +9,11 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::{Duration, SystemTime};
 
-use crate::wire::{Addr, Body, DdpBody, Func, Packet};
+use crate::wire::{Addr, Body, DdpBody, Func, Packet, ZipAtp};
+
+/// The Zone Information Socket. ZIP's ATP requests are always addressed here,
+/// so a completed transaction from socket 6 is a ZIP reply.
+const ZIS: u8 = 6;
 
 /// Identifies one ATP transaction. The address pair plus sockets, because a
 /// TID is only unique between a given pair of sockets.
@@ -171,6 +175,8 @@ pub enum Message {
     /// A completed ATP transaction on a connection whose protocol we never saw
     /// negotiated. Classification into ASP and PAP arrives with those parsers.
     Unclassified(Transaction),
+    /// A completed ZIP GetMyZone / GetZoneList / GetLocalZones reply.
+    Zip(ZipAtp),
 }
 
 impl fmt::Display for Message {
@@ -183,6 +189,7 @@ impl fmt::Display for Message {
                 t.data.len(),
                 t.user_bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
             ),
+            Message::Zip(z) => write!(f, "ZIP {z}"),
         }
     }
 }
@@ -199,11 +206,15 @@ impl Session {
     }
 
     pub fn push(&mut self, at: SystemTime, p: &Packet) -> Vec<Message> {
-        self.transactions
-            .push(at, p)
-            .map(Message::Unclassified)
-            .into_iter()
-            .collect()
+        let Some(txn) = self.transactions.push(at, p) else { return Vec::new() };
+        // A response travels responder -> requester, so the responder's socket
+        // is the transaction's source socket.
+        if txn.key.src_socket == ZIS
+            && let Some(z) = ZipAtp::parse_reply(&txn.user_bytes, &txn.data)
+        {
+            return vec![Message::Zip(z)];
+        }
+        vec![Message::Unclassified(txn)]
     }
 
     /// Call on `Event::Dropped`.
@@ -392,5 +403,36 @@ mod tests {
         assert!(s.push(at(0), &resp(0, false, b"aaa")).is_empty());
         s.flush();
         assert!(s.push(at(1), &resp(1, true, b"bbb")).is_empty());
+    }
+
+    #[test]
+    fn session_classifies_a_zip_reply_from_the_zone_information_socket() {
+        use crate::wire::testkit::ps;
+        let mut data = ps("Engineering");
+        data.extend(ps("Marketing"));
+        // resp() sends from 65280.128:6 — the ZIS.
+        let p = packet(Atp::response(4660, 0, true, false, [1, 0, 0, 2], data));
+        let mut s = Session::new();
+        match s.push(at(0), &p).as_slice() {
+            [Message::Zip(ZipAtp::Reply { last, zones })] => {
+                assert!(last);
+                assert_eq!(zones, &["Engineering".to_string(), "Marketing".to_string()]);
+            }
+            other => panic!("expected a ZIP reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_leaves_non_zip_sockets_unclassified() {
+        let mut s = Session::new();
+        // Same shape, but from a dynamically assigned socket rather than the ZIS.
+        let mut p = packet(Atp::response(4660, 0, true, false, [1, 0, 0, 0], b"x".to_vec()));
+        if let Body::Ddp(d, _) = &mut p.body {
+            d.src_socket = 253;
+        }
+        match s.push(at(0), &p).as_slice() {
+            [Message::Unclassified(_)] => {}
+            other => panic!("expected unclassified, got {other:?}"),
+        }
     }
 }

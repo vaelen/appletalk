@@ -118,6 +118,68 @@ impl fmt::Display for Zip {
     }
 }
 
+/// ZIP's three ATP-based requests. These ride ATP rather than arriving as DDP
+/// type 6, with the function in the ATP user bytes, so they surface through
+/// the transaction reassembler rather than through `decode`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZipAtp {
+    // Only `parse_request` constructs these three, and nothing calls it
+    // outside tests yet: `Session` classifies completed responses, not
+    // requests. Wire this in once a frontend wants to show the request that
+    // prompted a reply.
+    #[allow(dead_code)]
+    GetMyZone,
+    #[allow(dead_code)]
+    GetZoneList { start: u16 },
+    #[allow(dead_code)]
+    GetLocalZones { start: u16 },
+    Reply { last: bool, zones: Vec<String> },
+}
+
+impl ZipAtp {
+    /// `user` is the ATP request's four user bytes.
+    #[allow(dead_code)] // only tests call this; no production request-side caller yet
+    pub fn parse_request(user: &[u8], _data: &[u8]) -> Option<Self> {
+        let u: &[u8; 4] = user.get(..4)?.try_into().ok()?;
+        let start = u16::from_be_bytes([u[2], u[3]]);
+        match u[0] {
+            7 => Some(ZipAtp::GetMyZone),
+            8 => Some(ZipAtp::GetZoneList { start }),
+            9 => Some(ZipAtp::GetLocalZones { start }),
+            _ => None,
+        }
+    }
+
+    /// `user` is the reply's user bytes: a last-packet flag, a reserved zero,
+    /// then the number of zone names in `data`.
+    pub fn parse_reply(user: &[u8], data: &[u8]) -> Option<Self> {
+        let u: &[u8; 4] = user.get(..4)?.try_into().ok()?;
+        let count = u16::from_be_bytes([u[2], u[3]]) as usize;
+        let mut rest = data;
+        let mut zones = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (name, r) = pstring(rest)?;
+            zones.push(name);
+            rest = r;
+        }
+        Some(ZipAtp::Reply { last: u[0] != 0, zones })
+    }
+}
+
+impl fmt::Display for ZipAtp {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ZipAtp::GetMyZone => f.write_str("get-my-zone"),
+            ZipAtp::GetZoneList { start } => write!(f, "get-zone-list from {start}"),
+            ZipAtp::GetLocalZones { start } => write!(f, "get-local-zones from {start}"),
+            ZipAtp::Reply { last, zones } => {
+                let tail = if *last { "last" } else { "more" };
+                write!(f, "zones ({tail}) {}", zones.join(", "))
+            }
+        }
+    }
+}
+
 impl Encode for Zip {
     fn encode(&self, out: &mut Vec<u8>) {
         match self {
@@ -257,5 +319,56 @@ mod tests {
         info.extend(ps("Engineering"));
         let z = Zip::parse(&info).unwrap();
         assert_eq!(Zip::parse(&z.to_bytes()), Some(z));
+    }
+
+    #[test]
+    fn zip_atp_parses_requests() {
+        assert_eq!(
+            ZipAtp::parse_request(&[8, 0, 0, 1], &[]),
+            Some(ZipAtp::GetZoneList { start: 1 })
+        );
+        assert_eq!(
+            ZipAtp::parse_request(&[9, 0, 0, 5], &[]),
+            Some(ZipAtp::GetLocalZones { start: 5 })
+        );
+        assert_eq!(ZipAtp::parse_request(&[7, 0, 0, 0], &[]), Some(ZipAtp::GetMyZone));
+        assert_eq!(ZipAtp::parse_request(&[6, 0, 0, 0], &[]), None);
+    }
+
+    #[test]
+    fn zip_atp_parses_a_reply_with_two_zones() {
+        use crate::wire::testkit::ps;
+        let mut data = ps("Engineering");
+        data.extend(ps("Marketing"));
+        let r = ZipAtp::parse_reply(&[1, 0, 0, 2], &data).unwrap();
+        assert_eq!(
+            r,
+            ZipAtp::Reply { last: true, zones: vec!["Engineering".into(), "Marketing".into()] }
+        );
+        assert_eq!(r.to_string(), "zones (last) Engineering, Marketing");
+    }
+
+    #[test]
+    fn zip_atp_reply_reports_more_to_come() {
+        use crate::wire::testkit::ps;
+        let r = ZipAtp::parse_reply(&[0, 0, 0, 1], &ps("Engineering")).unwrap();
+        assert_eq!(r, ZipAtp::Reply { last: false, zones: vec!["Engineering".into()] });
+        assert_eq!(r.to_string(), "zones (more) Engineering");
+    }
+
+    #[test]
+    fn zip_atp_reply_rejects_a_count_that_overruns_the_data() {
+        use crate::wire::testkit::ps;
+        assert!(ZipAtp::parse_reply(&[1, 0, 0, 4], &ps("Engineering")).is_none());
+    }
+
+    #[test]
+    fn zip_atp_accepts_the_empty_end_of_list_reply() {
+        // A router returns a zero-length response when the start index is past the
+        // end of its list.
+        assert_eq!(
+            ZipAtp::parse_reply(&[1, 0, 0, 0], &[]),
+            Some(ZipAtp::Reply { last: true, zones: Vec::new() })
+        );
     }
 }

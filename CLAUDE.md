@@ -6,15 +6,16 @@ protocol overview and the planned build order.
 
 ## Layout
 
-| File             | Holds                                                     |
-|------------------|------------------------------------------------------------|
-| `src/wire/`      | Protocol parsers, one file per protocol; `decode()`. No I/O.|
-| `src/capture.rs` | Capture thread: NIC to `Event`s on a bounded channel.       |
-| `src/text.rs`    | Plain-text frontend. Timestamps and hexdump.                |
-| `src/main.rs`    | Glue: pick an interface, pick a frontend, start it.         |
-| `appletalk.md`   | Protocol reference: layers, addressing, Phase 1 vs 2.       |
+| File             | Holds                                                                                        |
+|------------------|----------------------------------------------------------------------------------------------|
+| `src/wire/`      | Protocol parsers, one file per protocol; `decode()`. No I/O.                                 |
+| `src/session.rs` | Reassembles multi-packet ATP transactions. The only stateful module, driven by the frontend. |
+| `src/capture.rs` | Capture thread: NIC to `Event`s on a bounded channel.                                        |
+| `src/text.rs`    | Plain-text frontend. Timestamps and hexdump.                                                 |
+| `src/main.rs`    | Glue: pick an interface, pick a frontend, start it.                                          |
+| `appletalk.md`   | Protocol reference: layers, addressing, Phase 1 vs 2.                                        |
 
-Keep parsing pure and in `wire.rs` — it stays testable without a NIC.
+Keep parsing pure and in `wire/` — it stays testable without a NIC.
 
 Frontends consume `Receiver<capture::Event>` and nothing else; they never touch
 pnet. `wire::Packet` is fully owned so it can cross that channel — pnet lends
@@ -67,7 +68,7 @@ pdftotext -f 209 -l 212 inside-appletalk-second-edition.pdf -
 ```
 
 `appletalk.md` has a section-to-PDF-page index. **Check the book before writing
-a parser, not after.** Every layout in `wire.rs` has been verified against it;
+a parser, not after.** Every layout in `wire/` has been verified against it;
 keep it that way.
 
 Still untested against a live AppleTalk network — the book settles the byte

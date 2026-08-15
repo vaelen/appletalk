@@ -44,7 +44,7 @@ pub use atp::{Atp, Func};
 pub use ddp::Ddp;
 #[allow(unused_imports)]
 pub use nbp::{Nbp, NbpFunc, NbpTuple};
-pub use zip::Zip;
+pub use zip::{Zip, ZipAtp};
 
 pub const DDP: u16 = 0x809b; // AppleTalk Datagram Delivery Protocol
 pub const AARP: u16 = 0x80f3; // AppleTalk Address Resolution Protocol
