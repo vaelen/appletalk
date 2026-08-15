@@ -1,3 +1,6 @@
+// Copyright 2026 Andrew C. Young <andrew@vaelen.org>
+// SPDX-License-Identifier: MIT
+
 //! Dump EtherTalk (AppleTalk-over-Ethernet) frames off the wire.
 //!
 //! Usage: sudo ./appletalk [interface]

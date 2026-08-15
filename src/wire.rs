@@ -1,3 +1,6 @@
+// Copyright 2026 Andrew C. Young <andrew@vaelen.org>
+// SPDX-License-Identifier: MIT
+
 //! Parsers for the AppleTalk protocols, bottom up: ELAP, AARP, DDP, then the
 //! protocols DDP carries. Every `parse` takes a byte slice and returns None
 //! rather than decoding something it does not recognise.

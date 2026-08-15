@@ -2,6 +2,8 @@
 name = "appletalk"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+authors = ["Andrew C. Young <andrew@vaelen.org>"]
 
 [dependencies]
 pnet = "0.35.0"
