@@ -383,7 +383,7 @@ mod tests {
             let p = packet(Atp::response(tid, 0, false, false, [0; 4], b"x".to_vec()));
             t.push(at(0), &p);
         }
-        assert!(t.open_count() <= MAX_OPEN);
+        assert_eq!(t.open_count(), MAX_OPEN);
     }
 
     #[test]

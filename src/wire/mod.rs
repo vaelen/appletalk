@@ -13,7 +13,9 @@ use pnet::util::MacAddr;
 /// recomputed here rather than read from the struct, so a parsed packet whose
 /// length field disagreed with its data cannot be re-transmitted that way.
 ///
-/// Implemented by Tasks 3-6 for the remaining protocols; nothing consumes it yet.
+/// This crate is a passive dumper — nothing transmits yet — so only tests
+/// call `encode`/`to_bytes` in a binary crate, which is what the allow below
+/// suppresses. Drop it once a node runtime sends packets.
 #[allow(dead_code)]
 pub trait Encode {
     /// Appends to `out` so nested layers share one allocation.
@@ -34,12 +36,11 @@ mod nbp;
 mod zip;
 
 pub use aarp::Aarp;
-// Nothing in this crate names Echo/Func/NbpFunc/NbpTuple directly yet — they
-// are matched through Display and the Body/DdpBody enums instead — so the
+// Nothing in this crate names Echo/NbpFunc/NbpTuple directly yet — they are
+// matched through Display and the Body/DdpBody enums instead — so the
 // re-export otherwise trips unused_imports.
 #[allow(unused_imports)]
 pub use aep::{Aep, Echo};
-#[allow(unused_imports)]
 pub use atp::{Atp, Func};
 pub use ddp::Ddp;
 #[allow(unused_imports)]
@@ -127,7 +128,7 @@ impl Frame {
     /// plain EtherType. Non-SNAP LLC frames return None.
     pub fn parse(b: &[u8]) -> Option<Self> {
         let (dst, src) = (mac(b.get(..6)?)?, mac(b.get(6..12)?)?);
-        let typelen = u16::from_be_bytes([b[12], b[13]]);
+        let typelen = u16::from_be_bytes([*b.get(12)?, *b.get(13)?]);
         let body = b.get(14..)?;
         if typelen > 1500 {
             let payload = body.to_vec();
@@ -154,6 +155,7 @@ impl Frame {
 
 impl Encode for Frame {
     fn encode(&self, out: &mut Vec<u8>) {
+        let start = out.len();
         out.extend(mac_bytes(self.dst));
         out.extend(mac_bytes(self.src));
         if self.snap {
@@ -163,11 +165,16 @@ impl Encode for Frame {
             out.extend([0xaa, 0xaa, 0x03]);
             out.extend(if self.proto == AARP { SNAP_AARP } else { SNAP_DDP });
         } else {
+            // ponytail: Phase 1 has no length field to trim padding with, so a
+            // short payload round-trips with trailing zero padding attached.
+            // Upgrade path: carry the pre-padding length alongside the frame
+            // (or drop the padding at capture time) if Phase 1 round-tripping
+            // ever needs to be exact.
             out.extend(self.proto.to_be_bytes());
         }
         out.extend(&self.payload);
-        if out.len() < 60 {
-            out.resize(60, 0);
+        if out.len() - start < 60 {
+            out.resize(start + 60, 0);
         }
     }
 }
@@ -333,6 +340,8 @@ mod tests {
         assert!(Frame::parse(&frame(3, &[0x42, 0x42, 0x03])).is_none()); // plain LLC
         assert!(Frame::parse(&[0; 10]).is_none()); // runt
         assert!(Frame::parse(&frame(1400, &[0xaa; 8])).is_none()); // length > frame
+        assert!(Frame::parse(&[0; 12]).is_none()); // exactly the two MACs, no typelen
+        assert!(Frame::parse(&[0; 13]).is_none()); // one byte short of typelen
     }
 
     #[test]
@@ -429,6 +438,23 @@ mod tests {
         assert_eq!(out.len(), 60);
         assert_eq!(u16::from_be_bytes([out[12], out[13]]), 9); // 8 + 1, not 46
         assert_eq!(Frame::parse(&out).unwrap().payload, [1]);
+    }
+
+    #[test]
+    fn frame_pads_each_frame_when_encoded_back_to_back() {
+        let f = Frame {
+            dst: MacAddr::new(0, 0, 0, 0, 0, 0),
+            src: MacAddr::new(0, 0, 0, 0, 0, 0),
+            proto: DDP,
+            snap: true,
+            payload: vec![1],
+        };
+        let mut out = Vec::new();
+        f.encode(&mut out);
+        let first_len = out.len();
+        f.encode(&mut out);
+        assert_eq!(first_len, 60); // first frame padded to the minimum
+        assert_eq!(out.len() - first_len, 60); // second frame padded too, not just topped up to 60 total
     }
 
     #[test]

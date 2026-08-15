@@ -31,7 +31,7 @@ impl fmt::Display for Func {
 /// The five legal ATP release-timer values. Encodings 5-7 are reserved by the
 /// book, so they are unrepresentable here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Task 7's reassembler tests consume this
+#[allow(dead_code)] // only tests construct this; no encode path is exercised until a node transmits
 pub enum TrelTimeout {
     S30,
     M1,
@@ -116,7 +116,7 @@ impl Atp {
 
     /// `xo` carries the release timer; Phase 1 nodes ignore it and always use
     /// 30 seconds.
-    #[allow(dead_code)] // Task 7's reassembler tests consume this
+    #[allow(dead_code)] // only tests construct this; no encode path is exercised until a node transmits
     pub fn request(
         tid: u16,
         bitmap: u8,
@@ -131,7 +131,7 @@ impl Atp {
         Atp { func: Func::Req, control, bitmap, tid, user_bytes, data }
     }
 
-    #[allow(dead_code)] // Task 7's reassembler tests consume this
+    #[allow(dead_code)] // only tests construct this; no encode path is exercised until a node transmits
     pub fn response(
         tid: u16,
         seq: u8,
@@ -151,7 +151,7 @@ impl Atp {
     }
 
     /// The book notes a TRel's user bytes are not significant.
-    #[allow(dead_code)] // Task 7's reassembler tests consume this
+    #[allow(dead_code)] // only tests construct this; no encode path is exercised until a node transmits
     pub fn release(tid: u16) -> Self {
         Atp {
             func: Func::Rel,

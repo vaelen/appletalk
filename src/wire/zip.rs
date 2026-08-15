@@ -36,9 +36,9 @@ pub enum Zip {
 
 impl Zip {
     pub fn parse(p: &[u8]) -> Option<Self> {
-        let count = *p.get(1)? as usize;
         match *p.first()? {
             1 => {
+                let count = *p.get(1)? as usize;
                 let nets = p
                     .get(2..2 + count * 2)?
                     .chunks_exact(2)
@@ -47,6 +47,7 @@ impl Zip {
                 Some(Zip::Query { nets })
             }
             cmd @ (2 | 8) => {
+                let count = *p.get(1)? as usize;
                 let mut rest = p.get(2..)?;
                 let mut zones = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -318,6 +319,25 @@ mod tests {
         info.extend([6, 0x09, 0x00, 0x07, 0x00, 0x00, 0x01]);
         info.extend(ps("Engineering"));
         let z = Zip::parse(&info).unwrap();
+        assert_eq!(Zip::parse(&z.to_bytes()), Some(z));
+    }
+
+    #[test]
+    fn zip_notify_round_trips() {
+        let z = Zip::Notify;
+        assert_eq!(z.to_bytes(), vec![7]);
+        assert_eq!(Zip::parse(&z.to_bytes()), Some(z));
+    }
+
+    #[test]
+    fn zip_get_net_info_request_round_trips() {
+        let z = Zip::GetNetInfo { zone: "Engineering".into() };
+        assert_eq!(Zip::parse(&z.to_bytes()), Some(z));
+    }
+
+    #[test]
+    fn zip_extended_reply_round_trips() {
+        let z = Zip::Reply { zones: vec![(3, "Engineering".into())], extended: true };
         assert_eq!(Zip::parse(&z.to_bytes()), Some(z));
     }
 

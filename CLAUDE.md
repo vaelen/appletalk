@@ -27,11 +27,16 @@ that ignores it shows a gap with no explanation.
 
 ## Conventions
 
-- Every wire type gets `fn parse(&[u8]) -> Option<Self>` and `impl Display`.
-  Use `Display`, not bespoke `to_str` helpers, so `{}` and `format!` work.
+- Every wire type gets `fn parse(&[u8]) -> Option<Self>`, `impl Display`, and
+  `impl Encode`. Use `Display`, not bespoke `to_str` helpers, so `{}` and
+  `format!` work.
 - **Fail closed.** A parser that does not fully recognise its input returns
   `None`; the caller falls back to a hexdump. Never decode partially or guess —
   a wrong decode is worse than a hex dump.
+- **Recompute derived fields at encode time** — lengths, counts, padding —
+  rather than trusting what's stored on the struct. A parsed packet whose
+  length field disagreed with its data must not be able to re-transmit that
+  disagreement; `encode` derives it fresh from the data every time.
 - Slice with `.get()` and `?`, never index into untrusted wire bytes.
 - All AppleTalk fields are big-endian.
 - Comment the byte layout where it is not obvious (bit-packed fields,
