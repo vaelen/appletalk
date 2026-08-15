@@ -12,6 +12,7 @@ protocol overview and the planned build order.
 | `src/session.rs` | Reassembles multi-packet ATP transactions. The only stateful module, driven by the frontend. |
 | `src/capture.rs` | Capture thread: NIC to `Event`s on a bounded channel.                                        |
 | `src/text.rs`    | Plain-text frontend. Timestamps and hexdump.                                                 |
+| `src/cli.rs`     | `clap` command line: subcommands, and the output/filter flags a frontend obeys.              |
 | `src/main.rs`    | Glue: pick an interface, pick a frontend, start it.                                          |
 | `appletalk.md`   | Protocol reference: layers, addressing, Phase 1 vs 2.                                        |
 
@@ -20,6 +21,10 @@ Keep parsing pure and in `wire/` — it stays testable without a NIC.
 Frontends consume `Receiver<capture::Event>` and nothing else; they never touch
 pnet. `wire::Packet` is fully owned so it can cross that channel — pnet lends
 out a buffer that dies on the next read, so parsers copy their payloads.
+
+Filtering (`--only`/`--hide`) happens **at display time only**. Hidden packets
+are still captured, decoded and reassembled — filtering upstream would mean a
+hidden protocol never reassembles, and would stop a TUI toggling filters live.
 
 The queue is bounded and the capture thread **drops** rather than blocking when
 a frontend falls behind, reporting the count via `Event::Dropped`. A frontend
@@ -82,5 +87,5 @@ decode of real traffic.
 
 ```sh
 sudo setcap cap_net_raw+ep target/debug/appletalk   # or run as root
-./target/debug/appletalk [interface]
+./target/debug/appletalk [-i interface] [--hex] [--hide rtmp,...]
 ```

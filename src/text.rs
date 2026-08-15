@@ -7,6 +7,7 @@ use std::sync::mpsc::Receiver;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::capture::Event;
+use crate::cli::Output;
 use crate::session::{Message, Session};
 use crate::wire::{Body, DdpBody, Packet};
 
@@ -29,28 +30,46 @@ fn hexdump(b: &[u8]) {
     }
 }
 
-fn print_packet(at: SystemTime, p: &Packet) {
-    println!("{} {}", timestamp(at), p.frame);
+fn print_packet(at: SystemTime, p: &Packet, o: &Output) {
+    if !o.no_link {
+        println!("{} {}", timestamp(at), p.frame);
+    }
     match &p.body {
         // Fully decoded: a hexdump would just repeat it.
         Body::Aarp(a) => println!("  {a}"),
         Body::Ddp(d, inner) => {
-            println!("  {d}");
+            if !o.no_net {
+                println!("  {d}");
+            }
             match inner {
                 DdpBody::Atp(a) => {
                     println!("    {a}");
-                    hexdump(&a.data);
+                    if o.hex {
+                        hexdump(&a.data);
+                    }
                 }
                 DdpBody::Aep(a) => {
                     println!("    {a}");
-                    hexdump(&a.data);
+                    if o.hex {
+                        hexdump(&a.data);
+                    }
                 }
                 DdpBody::Nbp(n) => println!("    {n}"),
                 DdpBody::Zip(z) => println!("    {z}"),
-                DdpBody::Unknown => hexdump(&d.data),
+                // No protocol line to print: without --hex this packet shows
+                // only its outer lines, and with those hidden too, nothing.
+                DdpBody::Unknown => {
+                    if o.hex {
+                        hexdump(&d.data)
+                    }
+                }
             }
         }
-        Body::Unknown => hexdump(&p.frame.payload),
+        Body::Unknown => {
+            if o.hex {
+                hexdump(&p.frame.payload)
+            }
+        }
     }
 }
 
@@ -60,14 +79,22 @@ pub fn print_message(m: &Message) {
 }
 
 /// Renders events until the capture thread goes away.
-pub fn run(events: Receiver<Event>) {
+pub fn run(events: Receiver<Event>, output: &Output) {
     let mut session = Session::new();
     for event in events {
         match event {
             Event::Packet { at, packet } => {
-                print_packet(at, &packet);
+                // Hidden packets still reassemble — only the printing stops —
+                // so a filter can never break a transaction. Their completed
+                // messages are suppressed with them.
+                let show = output.shows(&packet);
+                if show {
+                    print_packet(at, &packet, output);
+                }
                 for msg in session.push(at, &packet) {
-                    print_message(&msg);
+                    if show {
+                        print_message(&msg);
+                    }
                 }
             }
             Event::Dropped(n) => {

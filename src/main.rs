@@ -3,16 +3,19 @@
 
 //! Dump EtherTalk (AppleTalk-over-Ethernet) frames off the wire.
 //!
-//! Usage: sudo ./appletalk [interface]
+//! Usage: sudo ./appletalk [-i interface] [monitor] [flags]
 
 mod capture;
+mod cli;
 mod session;
 mod text;
 mod wire;
 
+use clap::Parser;
+
 fn main() {
-    let want = std::env::args().nth(1);
-    let (iface, events) = match capture::spawn(want.as_deref()) {
+    let args = cli::Cli::parse();
+    let (iface, events) = match capture::spawn(args.interface.as_deref()) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("appletalk: {e}");
@@ -20,5 +23,6 @@ fn main() {
         }
     };
     println!("listening on {iface}");
-    text::run(events);
+    // Only `monitor` exists, implicit or not; both land here.
+    text::run(events, args.output());
 }
