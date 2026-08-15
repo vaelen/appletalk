@@ -7,6 +7,7 @@ use std::sync::mpsc::Receiver;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::capture::Event;
+use crate::session::{Message, Session};
 use crate::wire::{Body, DdpBody, Packet};
 
 /// Wall clock, UTC, no date — a dumper's reader cares about the seconds
@@ -53,12 +54,27 @@ fn print_packet(at: SystemTime, p: &Packet) {
     }
 }
 
+/// Reassembled messages are indented under the packets that produced them.
+pub fn print_message(m: &Message) {
+    println!("  >> {m}");
+}
+
 /// Renders events until the capture thread goes away.
 pub fn run(events: Receiver<Event>) {
+    let mut session = Session::new();
     for event in events {
         match event {
-            Event::Packet { at, packet } => print_packet(at, &packet),
-            Event::Dropped(n) => eprintln!("dropped {n} frames (queue full)"),
+            Event::Packet { at, packet } => {
+                print_packet(at, &packet);
+                for msg in session.push(at, &packet) {
+                    print_message(&msg);
+                }
+            }
+            Event::Dropped(n) => {
+                // Any gap could have hit any transaction in flight.
+                session.flush();
+                eprintln!("dropped {n} frames (queue full)");
+            }
             Event::Error(e) => eprintln!("rx: {e}"),
         }
     }

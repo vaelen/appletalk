@@ -6,15 +6,16 @@ protocol overview and the planned build order.
 
 ## Layout
 
-| File             | Holds                                                     |
-|------------------|------------------------------------------------------------|
-| `src/wire.rs`    | Protocol parsers, `Display` impls, `decode()`. No I/O.      |
-| `src/capture.rs` | Capture thread: NIC to `Event`s on a bounded channel.       |
-| `src/text.rs`    | Plain-text frontend. Timestamps and hexdump.                |
-| `src/main.rs`    | Glue: pick an interface, pick a frontend, start it.         |
-| `appletalk.md`   | Protocol reference: layers, addressing, Phase 1 vs 2.       |
+| File             | Holds                                                                                        |
+|------------------|----------------------------------------------------------------------------------------------|
+| `src/wire/`      | Protocol parsers, one file per protocol; `decode()`. No I/O.                                 |
+| `src/session.rs` | Reassembles multi-packet ATP transactions. The only stateful module, driven by the frontend. |
+| `src/capture.rs` | Capture thread: NIC to `Event`s on a bounded channel.                                        |
+| `src/text.rs`    | Plain-text frontend. Timestamps and hexdump.                                                 |
+| `src/main.rs`    | Glue: pick an interface, pick a frontend, start it.                                          |
+| `appletalk.md`   | Protocol reference: layers, addressing, Phase 1 vs 2.                                        |
 
-Keep parsing pure and in `wire.rs` — it stays testable without a NIC.
+Keep parsing pure and in `wire/` — it stays testable without a NIC.
 
 Frontends consume `Receiver<capture::Event>` and nothing else; they never touch
 pnet. `wire::Packet` is fully owned so it can cross that channel — pnet lends
@@ -26,11 +27,16 @@ that ignores it shows a gap with no explanation.
 
 ## Conventions
 
-- Every wire type gets `fn parse(&[u8]) -> Option<Self>` and `impl Display`.
-  Use `Display`, not bespoke `to_str` helpers, so `{}` and `format!` work.
+- Every wire type gets `fn parse(&[u8]) -> Option<Self>`, `impl Display`, and
+  `impl Encode`. Use `Display`, not bespoke `to_str` helpers, so `{}` and
+  `format!` work.
 - **Fail closed.** A parser that does not fully recognise its input returns
   `None`; the caller falls back to a hexdump. Never decode partially or guess —
   a wrong decode is worse than a hex dump.
+- **Recompute derived fields at encode time** — lengths, counts, padding —
+  rather than trusting what's stored on the struct. A parsed packet whose
+  length field disagreed with its data must not be able to re-transmit that
+  disagreement; `encode` derives it fresh from the data every time.
 - Slice with `.get()` and `?`, never index into untrusted wire bytes.
 - All AppleTalk fields are big-endian.
 - Comment the byte layout where it is not obvious (bit-packed fields,
@@ -67,7 +73,7 @@ pdftotext -f 209 -l 212 inside-appletalk-second-edition.pdf -
 ```
 
 `appletalk.md` has a section-to-PDF-page index. **Check the book before writing
-a parser, not after.** Every layout in `wire.rs` has been verified against it;
+a parser, not after.** Every layout in `wire/` has been verified against it;
 keep it that way.
 
 Still untested against a live AppleTalk network — the book settles the byte
