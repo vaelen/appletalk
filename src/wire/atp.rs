@@ -5,6 +5,8 @@
 
 use std::fmt;
 
+use super::Encode;
+
 /// ATP function code, from the top two bits of the control byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Func {
@@ -23,6 +25,30 @@ impl fmt::Display for Func {
             Func::Resp => "TResp",
             Func::Rel => "TRel",
         })
+    }
+}
+
+/// The five legal ATP release-timer values. Encodings 5-7 are reserved by the
+/// book, so they are unrepresentable here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Task 7's reassembler tests consume this
+pub enum TrelTimeout {
+    S30,
+    M1,
+    M2,
+    M4,
+    M8,
+}
+
+impl TrelTimeout {
+    fn bits(self) -> u8 {
+        match self {
+            TrelTimeout::S30 => 0,
+            TrelTimeout::M1 => 1,
+            TrelTimeout::M2 => 2,
+            TrelTimeout::M4 => 3,
+            TrelTimeout::M8 => 4,
+        }
     }
 }
 
@@ -87,6 +113,55 @@ impl Atp {
             _ => "reserved",
         }
     }
+
+    /// `xo` carries the release timer; Phase 1 nodes ignore it and always use
+    /// 30 seconds.
+    #[allow(dead_code)] // Task 7's reassembler tests consume this
+    pub fn request(
+        tid: u16,
+        bitmap: u8,
+        xo: Option<TrelTimeout>,
+        user_bytes: [u8; 4],
+        data: Vec<u8>,
+    ) -> Self {
+        let mut control = 0x40;
+        if let Some(t) = xo {
+            control |= 0x20 | t.bits();
+        }
+        Atp { func: Func::Req, control, bitmap, tid, user_bytes, data }
+    }
+
+    #[allow(dead_code)] // Task 7's reassembler tests consume this
+    pub fn response(
+        tid: u16,
+        seq: u8,
+        eom: bool,
+        sts: bool,
+        user_bytes: [u8; 4],
+        data: Vec<u8>,
+    ) -> Self {
+        let mut control = 0x80;
+        if eom {
+            control |= 0x10;
+        }
+        if sts {
+            control |= 0x08;
+        }
+        Atp { func: Func::Resp, control, bitmap: seq, tid, user_bytes, data }
+    }
+
+    /// The book notes a TRel's user bytes are not significant.
+    #[allow(dead_code)] // Task 7's reassembler tests consume this
+    pub fn release(tid: u16) -> Self {
+        Atp {
+            func: Func::Rel,
+            control: 0xc0,
+            bitmap: 0,
+            tid,
+            user_bytes: [0; 4],
+            data: Vec::new(),
+        }
+    }
 }
 
 impl fmt::Display for Atp {
@@ -112,6 +187,18 @@ impl fmt::Display for Atp {
         }
         let user: String = self.user_bytes.iter().map(|b| format!("{b:02x}")).collect();
         write!(f, " user {user}")
+    }
+}
+
+impl Encode for Atp {
+    fn encode(&self, out: &mut Vec<u8>) {
+        // The control byte IS the wire field; func/xo/eom/sts are views onto
+        // it, so there is nothing to recompute.
+        out.push(self.control);
+        out.push(self.bitmap);
+        out.extend(self.tid.to_be_bytes());
+        out.extend(self.user_bytes);
+        out.extend(&self.data);
     }
 }
 
@@ -151,5 +238,60 @@ mod tests {
     fn atp_rejects_reserved_func_and_short() {
         assert!(Atp::parse(&atp(0x00, 0, &[])).is_none()); // function code 00
         assert!(Atp::parse(&atp(0x40, 0, &[])[..7]).is_none()); // truncated header
+    }
+
+    #[test]
+    fn atp_request_builds_its_control_byte() {
+        let a = Atp::request(4660, 0x07, Some(TrelTimeout::S30), [1, 2, 3, 4], vec![9, 9]);
+        assert_eq!(a.control, 0x60); // 0x40 TReq | 0x20 XO | 000 timeout
+        assert_eq!(a.func, Func::Req);
+        assert!(a.xo());
+        assert_eq!(a.trel_timeout(), "30s");
+
+        let plain = Atp::request(1, 0x01, None, [0; 4], Vec::new());
+        assert_eq!(plain.control, 0x40);
+        assert!(!plain.xo());
+    }
+
+    #[test]
+    fn atp_request_encodes_each_trel_timeout() {
+        for (t, bits) in [
+            (TrelTimeout::S30, 0),
+            (TrelTimeout::M1, 1),
+            (TrelTimeout::M2, 2),
+            (TrelTimeout::M4, 3),
+            (TrelTimeout::M8, 4),
+        ] {
+            let a = Atp::request(1, 1, Some(t), [0; 4], Vec::new());
+            assert_eq!(a.control & 0x07, bits, "{t:?}");
+        }
+    }
+
+    #[test]
+    fn atp_response_sets_eom_and_sts() {
+        let a = Atp::response(4660, 2, true, true, [1, 2, 3, 4], Vec::new());
+        assert_eq!(a.control, 0x98); // 0x80 TResp | 0x10 EOM | 0x08 STS
+        assert_eq!(a.bitmap, 2);
+        assert_eq!(a.to_string(), "TResp tid 4660 seq 2 EOM STS user 01020304");
+    }
+
+    #[test]
+    fn atp_release_carries_no_data() {
+        let a = Atp::release(4660);
+        assert_eq!(a.control, 0xc0);
+        assert!(a.data.is_empty());
+        assert_eq!(a.to_string(), "TRel tid 4660 user 00000000");
+    }
+
+    #[test]
+    fn atp_encodes_known_bytes() {
+        let a = Atp::request(4660, 0x07, None, [1, 2, 3, 4], vec![9, 9]);
+        assert_eq!(a.to_bytes(), vec![0x40, 0x07, 0x12, 0x34, 1, 2, 3, 4, 9, 9]);
+    }
+
+    #[test]
+    fn atp_round_trips() {
+        let a = Atp::response(4660, 2, true, false, [0xde, 0xad, 0xbe, 0xef], vec![1, 2, 3]);
+        assert_eq!(Atp::parse(&a.to_bytes()), Some(a));
     }
 }
