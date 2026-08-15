@@ -6,6 +6,7 @@
 //! so a frontend can render raw packets and reassembled messages side by side.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::time::{Duration, SystemTime};
 
 use crate::wire::{Addr, Body, DdpBody, Func, Packet};
@@ -13,7 +14,6 @@ use crate::wire::{Addr, Body, DdpBody, Func, Packet};
 /// Identifies one ATP transaction. The address pair plus sockets, because a
 /// TID is only unique between a given pair of sockets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)] // Tasks 8-10 consume Transactions/TxnKey/Transaction
 pub struct TxnKey {
     pub src: Addr,
     pub src_socket: u8,
@@ -24,7 +24,6 @@ pub struct TxnKey {
 
 /// A completed ATP response message.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Tasks 8-10 consume Transactions/TxnKey/Transaction
 pub struct Transaction {
     pub key: TxnKey,
     /// From response packet 0. ASP and PAP put their headers here.
@@ -40,7 +39,6 @@ pub struct Transaction {
 /// that misses a response retransmits its TReq with a bitmap of only the
 /// missing sequence numbers.
 #[derive(Debug)]
-#[allow(dead_code)] // Task 8's eviction reads first_seen; fields otherwise consumed via Transactions::push
 struct Partial {
     segments: [Option<Vec<u8>>; 8],
     user_bytes: [u8; 4],
@@ -52,7 +50,6 @@ struct Partial {
 impl Partial {
     /// `SystemTime` has no `Default`, so this is a constructor rather than a
     /// derive.
-    #[allow(dead_code)] // Tasks 8-10 exercise Transactions from outside this module
     fn new(first_seen: SystemTime) -> Self {
         Partial {
             segments: Default::default(),
@@ -63,7 +60,6 @@ impl Partial {
     }
 
     /// Complete once EOM has arrived and every sequence up to it is present.
-    #[allow(dead_code)] // Tasks 8-10 exercise Transactions from outside this module
     fn take_if_complete(&self) -> Option<Vec<u8>> {
         let last = self.last?;
         let mut out = Vec::new();
@@ -83,20 +79,18 @@ const TXN_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const MAX_OPEN: usize = 512;
 
 #[derive(Debug, Default)]
-#[allow(dead_code)] // Tasks 8-10 consume Transactions/TxnKey/Transaction
 pub struct Transactions {
     open: HashMap<TxnKey, Partial>,
 }
 
 impl Transactions {
-    #[allow(dead_code)] // Tasks 8-10 construct Transactions from outside this module
+    #[allow(dead_code)] // only tests construct Transactions directly; Session uses Default
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Feeds one packet in. Returns a Transaction on the packet that completes
     /// it. Non-ATP packets, requests, and releases are ignored.
-    #[allow(dead_code)] // Tasks 8-10 call Transactions::push from the frontend loop
     pub fn push(&mut self, at: SystemTime, p: &Packet) -> Option<Transaction> {
         self.expire(at);
         let Body::Ddp(ddp, DdpBody::Atp(atp)) = &p.body else { return None };
@@ -145,7 +139,6 @@ impl Transactions {
     /// thread reports how many frames were lost but not which, so any gap
     /// could have hit any transaction. Keeping them would silently produce a
     /// reassembled message with a hole in it.
-    #[allow(dead_code)] // Task 9 wires this to Event::Dropped in the frontend loop
     pub fn flush(&mut self) {
         self.open.clear();
     }
@@ -169,6 +162,53 @@ impl Transactions {
                 self.open.remove(key);
             }
         }
+    }
+}
+
+/// A message reassembled from several datagrams.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Message {
+    /// A completed ATP transaction on a connection whose protocol we never saw
+    /// negotiated. Classification into ASP and PAP arrives with those parsers.
+    Unclassified(Transaction),
+}
+
+impl fmt::Display for Message {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Message::Unclassified(t) => write!(
+                f,
+                "transaction {} complete, {} bytes, user {}",
+                t.key.tid,
+                t.data.len(),
+                t.user_bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            ),
+        }
+    }
+}
+
+/// Owns every reassembler. The frontend drives it; it never spawns a thread.
+#[derive(Debug, Default)]
+pub struct Session {
+    transactions: Transactions,
+}
+
+impl Session {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, at: SystemTime, p: &Packet) -> Vec<Message> {
+        self.transactions
+            .push(at, p)
+            .map(Message::Unclassified)
+            .into_iter()
+            .collect()
+    }
+
+    /// Call on `Event::Dropped`.
+    pub fn flush(&mut self) {
+        self.transactions.flush();
     }
 }
 
@@ -333,5 +373,24 @@ mod tests {
             t.push(at(0), &p);
         }
         assert!(t.open_count() <= MAX_OPEN);
+    }
+
+    #[test]
+    fn session_emits_a_message_when_a_transaction_completes() {
+        let mut s = Session::new();
+        assert!(s.push(at(0), &resp(0, false, b"aaa")).is_empty());
+        let msgs = s.push(at(1), &resp(1, true, b"bbb"));
+        match msgs.as_slice() {
+            [Message::Unclassified(t)] => assert_eq!(t.data, b"aaabbb"),
+            other => panic!("expected one unclassified message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_flush_clears_in_flight_state() {
+        let mut s = Session::new();
+        assert!(s.push(at(0), &resp(0, false, b"aaa")).is_empty());
+        s.flush();
+        assert!(s.push(at(1), &resp(1, true, b"bbb")).is_empty());
     }
 }
