@@ -16,6 +16,10 @@ use clap::Parser;
 
 fn main() {
     let args = cli::Cli::parse();
+    if args.conflicting_output() {
+        eprintln!("appletalk: output flags before a subcommand name are ambiguous; put them after it");
+        std::process::exit(2);
+    }
     let (iface, tx, events) = match capture::spawn(args.interface.as_deref()) {
         Ok(v) => v,
         Err(e) => {

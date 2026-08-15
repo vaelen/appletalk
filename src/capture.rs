@@ -35,12 +35,8 @@ pub enum Event {
 }
 
 /// The transmit half of the NIC, wrapped so pnet stays inside this module.
-/// Callers hand it a `wire::Frame`; it does the encoding.
-///
-/// Nothing calls `send` or reads `mac` yet — `main` discards this as `_tx` —
-/// so both are dead code until Task 2 wires address claiming through it.
-/// ponytail: allow(dead_code) below, remove once that lands.
-#[allow(dead_code)]
+/// Callers hand it a `wire::Frame`; it does the encoding. `node::Node` holds
+/// one and uses `mac` to source every frame it builds.
 pub struct Tx {
     inner: Box<dyn DataLinkSender>,
     /// The NIC's own MAC. Every frame we build is sourced from it.
@@ -48,7 +44,6 @@ pub struct Tx {
 }
 
 impl Tx {
-    #[allow(dead_code)]
     pub fn send(&mut self, f: &wire::Frame) -> io::Result<()> {
         let bytes = f.to_bytes();
         // pnet returns None when the frame does not fit its buffer.

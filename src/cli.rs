@@ -9,7 +9,7 @@ use crate::wire::{Body, Packet};
 
 /// Dump EtherTalk (AppleTalk-over-Ethernet) traffic.
 #[derive(Parser)]
-#[command(version, about, args_conflicts_with_subcommands = true)]
+#[command(version, about)]
 pub struct Cli {
     /// NIC to capture on; defaults to the first up, non-loopback one with a MAC
     #[arg(short, long, global = true)]
@@ -29,12 +29,23 @@ pub struct Cli {
 
 impl Cli {
     /// The output flags in force, whichever side of the subcommand they came
-    /// from. `args_conflicts_with_subcommands` guarantees only one side is set.
+    /// from. `main` rejects combining a top-level flag with a subcommand
+    /// other than `monitor`, so in practice only one side is ever set.
     pub fn output(&self) -> &Output {
         match &self.command {
             Some(Command::Monitor { output }) => output,
             _ => &self.output,
         }
+    }
+
+    /// Whether an output flag was given before a subcommand name — ambiguous,
+    /// since a flag there could mean either "implicit monitor" or "meant for
+    /// the subcommand that follows". Clap can no longer reject this for us:
+    /// `global = true` is what lets `-i`/`--node` precede a subcommand, and
+    /// clap 4.6 has no way to say "these globals may precede a subcommand,
+    /// but these flattened args may not".
+    pub fn conflicting_output(&self) -> bool {
+        self.command.is_some() && self.output != Output::default()
     }
 }
 
@@ -55,14 +66,14 @@ pub enum Command {
         /// `net.node`, or `object:type@zone`
         target: String,
         /// Number of echoes to send
-        #[arg(short, long, default_value_t = 4)]
+        #[arg(short, long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..))]
         count: u16,
     },
     /// List the zones on the internet.
     Zones,
 }
 
-#[derive(Args, Clone, Default)]
+#[derive(Args, Clone, Default, PartialEq)]
 pub struct Output {
     /// Hex dump payloads
     #[arg(long)]
@@ -203,8 +214,31 @@ mod tests {
     }
 
     #[test]
-    fn top_level_flags_conflict_with_a_subcommand() {
-        assert!(Cli::try_parse_from(["appletalk", "--hex", "monitor"]).is_err());
+    fn top_level_flags_before_a_subcommand_parse_but_are_flagged_conflicting() {
+        // clap itself accepts this now — `global = true` requires it — but
+        // `Cli::conflicting_output` (checked in `main`) still rejects it.
+        let cli = parse(&["appletalk", "--hex", "monitor"]);
+        assert!(cli.conflicting_output());
+    }
+
+    #[test]
+    fn global_flags_survive_in_either_position_around_a_subcommand() {
+        for args in [
+            &["appletalk", "-i", "eth0", "zones"][..],
+            &["appletalk", "--node", "3.4", "zones"][..],
+            &["appletalk", "-i", "eth0", "monitor"][..],
+            &["appletalk", "zones", "--node", "3.4"][..],
+            &["appletalk", "ping", "-i", "eth0", "3.4"][..],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            assert!(!cli.conflicting_output(), "{args:?} should not be flagged conflicting");
+        }
+    }
+
+    #[test]
+    fn ping_count_must_be_at_least_one() {
+        assert!(Cli::try_parse_from(["appletalk", "ping", "-c", "0", "1.2"]).is_err());
+        assert!(Cli::try_parse_from(["appletalk", "ping", "-c", "1", "1.2"]).is_ok());
     }
 
     #[test]

@@ -1,8 +1,9 @@
 # appletalk
 
-A Rust implementation of the AppleTalk protocol stack. Currently a passive
-EtherTalk frame dumper; the intent is a working node. `appletalk.md` has the
-protocol overview and the planned build order.
+A Rust implementation of the AppleTalk protocol stack. It dumps EtherTalk
+traffic passively by default, and can also claim an AppleTalk address and act
+as a node: `zones`, `nodes` and `ping`. `appletalk.md` has the protocol
+overview and the planned build order.
 
 ## Layout
 
@@ -88,5 +89,8 @@ decode of real traffic.
 
 ```sh
 sudo setcap cap_net_raw+ep target/debug/appletalk   # or run as root
-./target/debug/appletalk [-i interface] [--hex] [--hide rtmp,...]
+./target/debug/appletalk [-i interface] [--hex] [--hide rtmp,...]   # monitor, the default
+./target/debug/appletalk zones                                     # list zones on the internet
+./target/debug/appletalk nodes [zone]                               # list entities in a zone
+./target/debug/appletalk ping <net.node | object:type@zone>         # echo a node
 ```

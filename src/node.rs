@@ -132,6 +132,12 @@ pub fn netinfo_verdict(p: &Packet, provisional: Addr) -> Option<(NetInfo, String
     else {
         return None;
     };
+    // Capture is promiscuous and GetNetInfo replies are sometimes broadcast
+    // (PDF 187), so another booting node's reply is on the wire too. Only one
+    // addressed to us is ours to adopt.
+    if d.dst != provisional {
+        return None;
+    }
     // A range whose end precedes its start is not something we recognise, and
     // the span arithmetic downstream would underflow on it. Fail closed: with
     // no verdict the caller falls through to the routerless path and keeps its
@@ -187,10 +193,15 @@ pub fn lookup_replies(p: &Packet, id: u8) -> &[NbpTuple] {
 }
 
 /// Appends tuples we have not already seen. Requests are retransmitted, so the
-/// same entity answers more than once.
+/// same entity answers more than once. Dedupes on `(addr, socket, enumerator,
+/// object, type)`, not the zone — a responder that spells its zone
+/// differently across replies is still the same entity.
 pub fn merge(into: &mut Vec<NbpTuple>, tuples: &[NbpTuple]) {
+    let same = |a: &NbpTuple, b: &NbpTuple| {
+        (a.addr, a.socket, a.enumerator, &a.object, &a.typ) == (b.addr, b.socket, b.enumerator, &b.object, &b.typ)
+    };
     for t in tuples {
-        if !into.contains(t) {
+        if !into.iter().any(|e| same(e, t)) {
             into.push(t.clone());
         }
     }
@@ -223,6 +234,11 @@ const LOOKUP_INTERVAL: Duration = Duration::from_secs(1);
 const PING_INTERVAL: Duration = Duration::from_secs(1);
 const ZONE_TRIES: u32 = 3;
 const ZONE_INTERVAL: Duration = Duration::from_secs(2);
+/// ponytail: a page holds up to ~2300 names (PDF 187), so this covers any
+/// plausible zone list with headroom to spare. Bumping it is the upgrade path
+/// if a real network ever needs more; an unauthenticated "router" should
+/// never be able to make us page forever.
+const MAX_ZONE_PAGES: u32 = 1000;
 /// ponytail: only `zone_list` drains this, so every other `wait` caller would
 /// otherwise accumulate unrelated completed transactions for the life of the
 /// node. Cap it well above the one-reply-per-request working set. Give each
@@ -244,7 +260,8 @@ pub struct Node {
     amt: HashMap<Addr, MacAddr>,
     /// Reused wholesale for ATP reassembly.
     session: Session,
-    /// True until the address is claimed; suppresses AARP answers.
+    /// True only while `claim_one` is sending Probes for an address;
+    /// suppresses AARP answers for that interval (PDF 86).
     probing: bool,
     next_id: u16,
     /// Scratch for `wait` closures that accumulate across callbacks.
@@ -265,7 +282,7 @@ impl Node {
             router: None,
             amt: HashMap::new(),
             session: Session::new(),
-            probing: true,
+            probing: false,
             next_id: 1,
             pending: Vec::new(),
             messages: Vec::new(),
@@ -273,6 +290,14 @@ impl Node {
 
         n.addr = match want {
             Some(a) => {
+                // 254 and 255 are reserved on Ethernet (PDF 98). Harmless as a
+                // ping target, but not something to claim as our own address.
+                if a.node == 254 || a.node == 255 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("node {} is reserved and cannot be claimed", a.node),
+                    ));
+                }
                 n.claim_one(a)?;
                 a
             }
@@ -284,8 +309,18 @@ impl Node {
             n.router = Some(router);
             n.zone = Some(zone);
             if let NetInfo::Repick { range } = verdict {
-                let addr = n.claim_in_range(range)?;
-                n.addr = addr;
+                if want.is_some() {
+                    // The user asked for this address specifically; it is
+                    // their business that it falls outside the cable range,
+                    // and we say what we did rather than second-guessing it.
+                    eprintln!(
+                        "{} is outside this cable's range {}-{}; keeping it as requested",
+                        n.addr, range.0, range.1
+                    );
+                } else {
+                    let addr = n.claim_in_range(range)?;
+                    n.addr = addr;
+                }
             }
             eprintln!(
                 "claimed {}, zone {:?}, router {}",
@@ -298,7 +333,6 @@ impl Node {
             // final and `*` is the only zone name valid in lookups.
             eprintln!("claimed {}, no router on this network", n.addr);
         }
-        n.probing = false;
         Ok(n)
     }
 
@@ -327,13 +361,19 @@ impl Node {
         Err(io::Error::new(io::ErrorKind::AddrInUse, "could not claim an address in range"))
     }
 
-    /// Probes one address. Ok means nobody objected.
+    /// Probes one address. Ok means nobody objected. `probing` is scoped to
+    /// exactly this call — PDF 86 withholds AARP answers only "while sending
+    /// Probe packets", not for the GetNetInfo round that follows.
     fn claim_one(&mut self, addr: Addr) -> io::Result<()> {
+        self.probing = true;
         let our_mac = self.tx.mac;
         for _ in 0..PROBE_TRIES {
             let p = probe(addr, our_mac);
             let f = frame(our_mac, BROADCAST_MAC, AARP, p.to_bytes());
-            self.tx.send(&f)?;
+            if let Err(e) = self.tx.send(&f) {
+                self.probing = false;
+                return Err(e);
+            }
             let taken = self.wait(Instant::now() + PROBE_INTERVAL, |_, pkt| {
                 match aarp_action(pkt, addr, our_mac, true) {
                     AarpAction::Conflict => Some(()),
@@ -341,9 +381,11 @@ impl Node {
                 }
             });
             if taken.is_some() {
+                self.probing = false;
                 return Err(io::Error::new(io::ErrorKind::AddrInUse, format!("{addr} is taken")));
             }
         }
+        self.probing = false;
         Ok(())
     }
 
@@ -371,7 +413,12 @@ impl Node {
         let id = self.next_id() as u8;
         let (func, dst) = match self.router() {
             Some(r) => (NbpFunc::BrRq, r),
-            None => (NbpFunc::LkUp, Addr { net: self.addr.net, node: 255 }),
+            // Net 0 is the network-wide broadcast (PDF 110), same as
+            // `get_net_info` uses. A network-specific broadcast to our own net
+            // would only be accepted by nodes sharing it, and on a routerless
+            // cable everyone picked their startup net independently, so
+            // almost nobody would.
+            None => (NbpFunc::LkUp, Addr { net: 0, node: 255 }),
         };
         let body = lookup_request(func, id, self.addr, OUR_SOCKET, object, typ, zone).to_bytes();
 
@@ -445,11 +492,16 @@ impl Node {
         let mut zones: Vec<String> = Vec::new();
         let mut start = 1u16;
 
-        loop {
+        for _ in 0..MAX_ZONE_PAGES {
             let tid = self.next_id();
             let body = zone_list_request(tid, start).to_bytes();
             let mut reply = None;
             for _ in 0..ZONE_TRIES {
+                // PDF 187's Figure 8-2 shows GetZoneList going out from socket
+                // 6; we knowingly send from our dynamic socket (128) instead —
+                // ATP replies go back to whatever socket asked, and `Session`
+                // classifies on the responder's socket, so this works by
+                // construction. Unconfirmed against real hardware.
                 self.send_ddp(router, 6, DDP_ATP, body.clone())?;
                 reply = self.wait(Instant::now() + ZONE_INTERVAL, |n, p| {
                     if !zone_reply_matches(p, router, tid) {
@@ -634,7 +686,7 @@ pub fn next_start(start: u16, reply: &ZipAtp) -> Option<u16> {
         // past the end of the list sets the flag (PDF 187). Stop rather than
         // re-requesting the same index forever.
         ZipAtp::Reply { last: false, zones } if !zones.is_empty() => {
-            Some(start + zones.len() as u16)
+            start.checked_add(zones.len() as u16)
         }
         _ => None,
     }
@@ -851,6 +903,15 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_addressed_to_a_different_node_is_not_our_verdict() {
+        // Capture is promiscuous and replies are sometimes broadcast; a reply
+        // meant for another booting node must not be adopted as ours.
+        let p = netinfo((0xff00, 0xff0a), "Engineering", None);
+        let other = Addr { net: 3, node: 9 };
+        assert!(netinfo_verdict(&p, other).is_none());
+    }
+
+    #[test]
     fn an_invalid_requested_zone_is_replaced_by_the_default_zone() {
         // The reply echoes the zone we asked for and appends the real default.
         let p = netinfo((3, 5), "Nonesuch", Some("Engineering"));
@@ -920,6 +981,21 @@ mod tests {
         merge(&mut all, &[tuple("Mac", 42), tuple("Printer", 43)]);
         merge(&mut all, &[tuple("Mac", 42)]);
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn merging_ignores_zone_when_comparing_tuples() {
+        // The spec's dedupe key is (addr, socket, enumerator, object, type) —
+        // not zone. A responder spelling its zone differently across replies
+        // is still the same entity.
+        let mut a = tuple("Mac", 42);
+        let mut b = tuple("Mac", 42);
+        a.zone = "Engineering".to_string();
+        b.zone = "engineering".to_string();
+        let mut all = Vec::new();
+        merge(&mut all, &[a]);
+        merge(&mut all, &[b]);
+        assert_eq!(all.len(), 1);
     }
 
     #[test]
@@ -1013,6 +1089,12 @@ mod tests {
 
         // Anything that is not a reply ends the series rather than looping.
         assert_eq!(next_start(1, &ZipAtp::GetMyZone), None);
+    }
+
+    #[test]
+    fn next_start_does_not_overflow_past_u16_max() {
+        let reply = ZipAtp::Reply { last: false, zones: vec!["a".into()] };
+        assert_eq!(next_start(u16::MAX, &reply), None);
     }
 
     #[test]
