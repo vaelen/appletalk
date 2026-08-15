@@ -59,6 +59,10 @@ pub(crate) fn mac(b: &[u8]) -> Option<MacAddr> {
     Some(MacAddr::from(<[u8; 6]>::try_from(b).ok()?))
 }
 
+pub(crate) fn mac_bytes(m: MacAddr) -> [u8; 6] {
+    [m.0, m.1, m.2, m.3, m.4, m.5]
+}
+
 /// Reads a length-prefixed (Pascal) string, returning it and the rest.
 ///
 /// ponytail: AppleTalk names are Mac OS Roman; non-ASCII bytes become '.'

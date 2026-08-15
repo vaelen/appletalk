@@ -5,6 +5,8 @@
 
 use std::fmt;
 
+use super::Encode;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Echo {
     Request,
@@ -48,6 +50,16 @@ impl fmt::Display for Aep {
     }
 }
 
+impl Encode for Aep {
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.push(match self.func {
+            Echo::Request => 1,
+            Echo::Reply => 2,
+        });
+        out.extend(&self.data);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,5 +81,16 @@ mod tests {
     fn aep_rejects_unknown_func_and_empty() {
         assert!(Aep::parse(&[0]).is_none());
         assert!(Aep::parse(&[]).is_none());
+    }
+
+    #[test]
+    fn aep_encodes_and_round_trips() {
+        let a = Aep { func: Echo::Request, data: vec![0xde, 0xad] };
+        assert_eq!(a.to_bytes(), vec![1, 0xde, 0xad]);
+        assert_eq!(Aep::parse(&a.to_bytes()), Some(a));
+
+        let r = Aep { func: Echo::Reply, data: Vec::new() };
+        assert_eq!(r.to_bytes(), vec![2]);
+        assert_eq!(Aep::parse(&r.to_bytes()), Some(r));
     }
 }

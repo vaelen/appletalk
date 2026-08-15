@@ -8,7 +8,7 @@ use std::fmt;
 
 use pnet::util::MacAddr;
 
-use super::{mac, Addr};
+use super::{mac, mac_bytes, Addr, Encode};
 
 /// An AARP packet: ARP's layout with AppleTalk addresses. Ethernet AARP is
 /// always 28 bytes and carries no payload.
@@ -64,6 +64,24 @@ impl fmt::Display for Aarp {
     }
 }
 
+impl Encode for Aarp {
+    fn encode(&self, out: &mut Vec<u8>) {
+        // Hardware type 1 (Ethernet), protocol 0x809b, 6-byte MAC, 4-byte
+        // AppleTalk address — the only combination this parser accepts.
+        out.extend([0x00, 0x01, 0x80, 0x9b, 6, 4]);
+        out.extend(self.op.to_be_bytes());
+        let addr = |out: &mut Vec<u8>, a: &Addr| {
+            out.push(0); // the pad byte before the network number
+            out.extend(a.net.to_be_bytes());
+            out.push(a.node);
+        };
+        out.extend(mac_bytes(self.src_hw));
+        addr(out, &self.src);
+        out.extend(mac_bytes(self.dst_hw));
+        addr(out, &self.dst);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +109,19 @@ mod tests {
         let mut token_ring = aarp(1, &[]);
         token_ring[1] = 0x02; // hardware type != Ethernet
         assert!(Aarp::parse(&token_ring).is_none());
+    }
+
+    #[test]
+    fn aarp_encodes_known_bytes() {
+        let a = Aarp::parse(&crate::wire::testkit::aarp(3, &[])).unwrap();
+        assert_eq!(a.to_bytes(), crate::wire::testkit::aarp(3, &[]));
+    }
+
+    #[test]
+    fn aarp_round_trips_each_opcode() {
+        for op in [1, 2, 3] {
+            let a = Aarp::parse(&crate::wire::testkit::aarp(op, &[])).unwrap();
+            assert_eq!(Aarp::parse(&a.to_bytes()), Some(a), "opcode {op}");
+        }
     }
 }
