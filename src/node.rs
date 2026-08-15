@@ -80,14 +80,18 @@ pub enum AarpAction {
 }
 
 /// What an incoming packet means for our address. `probing` is true until the
-/// address is claimed — a probing node answers nothing (PDF 98).
+/// address is claimed — a probing node answers nothing (PDF 86).
 pub fn aarp_action(p: &Packet, ours: Addr, our_mac: MacAddr, probing: bool) -> AarpAction {
     let Body::Aarp(a) = &p.body else { return AarpAction::Ignore };
     match a.op {
         // A response for the address means it is taken.
         2 if a.src == ours => AarpAction::Conflict,
-        // Someone else probing for the same address: both sides give up.
-        3 if a.src == ours && a.src_hw != our_mac => AarpAction::Conflict,
+        // Someone else probing for the same address. While we are probing too,
+        // both sides give up (PDF 86). Once claimed, we defend it by answering
+        // — that response is how the prober learns the address is taken (PDF 85).
+        3 if a.src == ours && a.src_hw != our_mac => {
+            if probing { AarpAction::Conflict } else { AarpAction::AnswerTo(a.src_hw) }
+        }
         1 if a.dst == ours && !probing => AarpAction::AnswerTo(a.src_hw),
         _ => AarpAction::Ignore,
     }
@@ -95,7 +99,7 @@ pub fn aarp_action(p: &Packet, ours: Addr, our_mac: MacAddr, probing: bool) -> A
 
 /// Records the sender's address-to-MAC mapping, so a later directed frame has
 /// somewhere to go. Gleaning is optional in the book and deliberately excludes
-/// Probes, whose source address is only tentative (PDF 98).
+/// Probes, whose source address is only tentative (PDF 87).
 pub fn glean(amt: &mut HashMap<Addr, MacAddr>, p: &Packet) {
     match &p.body {
         Body::Aarp(a) if a.op != 3 => {
@@ -167,6 +171,17 @@ mod tests {
         // Two nodes probing at once: the book has the receiver give up too.
         let p = aarp_packet(3, OURS, THEIR_MAC, OURS);
         assert!(matches!(aarp_action(&p, OURS, OUR_MAC, true), AarpAction::Conflict));
+    }
+
+    #[test]
+    fn a_probe_for_our_claimed_address_is_answered_not_conceded() {
+        // Once claimed, a Probe for our address must be defended (PDF 85) —
+        // conceding it here would let the newcomer take our address.
+        let p = aarp_packet(3, OURS, THEIR_MAC, OURS);
+        match aarp_action(&p, OURS, OUR_MAC, false) {
+            AarpAction::AnswerTo(m) => assert_eq!(m, THEIR_MAC),
+            other => panic!("expected AnswerTo, got {other:?}"),
+        }
     }
 
     #[test]
