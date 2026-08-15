@@ -15,6 +15,10 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub interface: Option<String>,
 
+    /// Claim this address instead of discovering one, as `net.node`
+    #[arg(long, global = true, value_name = "NET.NODE")]
+    pub node: Option<String>,
+
     /// Flags for the implicit `monitor`; conflict with naming a subcommand.
     #[command(flatten)]
     output: Output,
@@ -29,7 +33,7 @@ impl Cli {
     pub fn output(&self) -> &Output {
         match &self.command {
             Some(Command::Monitor { output }) => output,
-            None => &self.output,
+            _ => &self.output,
         }
     }
 }
@@ -40,6 +44,11 @@ pub enum Command {
     Monitor {
         #[command(flatten)]
         output: Output,
+    },
+    /// List the entities registered in a zone. Defaults to the local zone.
+    Nodes {
+        /// Zone to look in; `*` means this cable only.
+        zone: Option<String>,
     },
 }
 

@@ -16,14 +16,51 @@ use clap::Parser;
 
 fn main() {
     let args = cli::Cli::parse();
-    let (iface, _tx, events) = match capture::spawn(args.interface.as_deref()) {
+    let (iface, tx, events) = match capture::spawn(args.interface.as_deref()) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("appletalk: {e}");
             std::process::exit(1);
         }
     };
-    println!("listening on {iface}");
-    // Only `monitor` exists, implicit or not; both land here.
-    text::run(events, args.output());
+    eprintln!("listening on {iface}");
+
+    match &args.command {
+        // Only the passive path; a dumper needs no address.
+        None | Some(cli::Command::Monitor { .. }) => text::run(events, args.output()),
+        Some(cmd) => {
+            if let Err(e) = run_node(cmd, tx, events, args.node.as_deref()) {
+                eprintln!("appletalk: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// Everything that needs a claimed address.
+fn run_node(
+    cmd: &cli::Command,
+    tx: capture::Tx,
+    events: std::sync::mpsc::Receiver<capture::Event>,
+    want: Option<&str>,
+) -> std::io::Result<()> {
+    let want = match want {
+        Some(s) => Some(node::parse_addr(s)?),
+        None => None,
+    };
+    let mut n = node::Node::claim(tx, events, want)?;
+    match cmd {
+        cli::Command::Nodes { zone } => {
+            let zone = zone.clone().unwrap_or_else(|| n.zone().to_string());
+            let found = n.lookup("=", "=", &zone)?;
+            if found.is_empty() {
+                eprintln!("no entities answered in zone {zone:?}");
+            }
+            for t in found {
+                println!("{t}");
+            }
+            Ok(())
+        }
+        cli::Command::Monitor { .. } => unreachable!("handled by the passive path"),
+    }
 }

@@ -20,7 +20,10 @@ use pnet::util::MacAddr;
 
 use crate::capture::{Event, Tx};
 use crate::session::Session;
-use crate::wire::{Aarp, Addr, Body, Ddp, DdpBody, Encode, Frame, Packet, Zip, AARP, DDP, DDP_ZIP};
+use crate::wire::{
+    Aarp, Addr, Body, Ddp, DdpBody, Encode, Frame, Nbp, NbpFunc, NbpTuple, Packet, Zip, AARP, DDP,
+    DDP_NBP, DDP_ZIP,
+};
 
 /// Where ELAP sends AppleTalk broadcasts, and where AARP probes and requests
 /// belong too (PDF 98). Non-AppleTalk nodes never register on it.
@@ -151,6 +154,65 @@ pub fn netinfo_verdict(p: &Packet, provisional: Addr) -> Option<(NetInfo, String
     Some((verdict, zone, d.src))
 }
 
+/// A lookup carries exactly one tuple: the name being asked about, with the
+/// requester's own address in the address field so responders know where to
+/// send the LkUp-Reply (PDF 169–172).
+pub fn lookup_request(
+    func: NbpFunc,
+    id: u8,
+    ours: Addr,
+    socket: u8,
+    object: &str,
+    typ: &str,
+    zone: &str,
+) -> Nbp {
+    Nbp {
+        func,
+        id,
+        tuples: vec![NbpTuple {
+            addr: ours,
+            socket,
+            // Ignored by the recipient of a lookup; only replies carry a
+            // meaningful enumerator.
+            enumerator: 0,
+            object: object.to_string(),
+            typ: typ.to_string(),
+            zone: zone.to_string(),
+        }],
+    }
+}
+
+/// The tuples in a LkUp-Reply that answers lookup `id`, or nothing.
+pub fn lookup_replies(p: &Packet, id: u8) -> &[NbpTuple] {
+    match &p.body {
+        Body::Ddp(_, DdpBody::Nbp(n)) if n.func == NbpFunc::LkUpReply && n.id == id => &n.tuples,
+        _ => &[],
+    }
+}
+
+/// Appends tuples we have not already seen. Requests are retransmitted, so the
+/// same entity answers more than once.
+pub fn merge(into: &mut Vec<NbpTuple>, tuples: &[NbpTuple]) {
+    for t in tuples {
+        if !into.contains(t) {
+            into.push(t.clone());
+        }
+    }
+}
+
+/// `net.node`, both decimal. Node 0 is not a valid node ID, so it is rejected
+/// here rather than producing a datagram nobody can answer.
+pub fn parse_addr(s: &str) -> io::Result<Addr> {
+    let bad = || io::Error::new(io::ErrorKind::InvalidInput, format!("bad address {s:?}"));
+    let (net, node) = s.split_once('.').ok_or_else(bad)?;
+    let net: u16 = net.parse().map_err(|_| bad())?;
+    let node: u8 = node.parse().map_err(|_| bad())?;
+    if node == 0 {
+        return Err(bad());
+    }
+    Ok(Addr { net, node })
+}
+
 /// PDF 98: ten retransmissions, one fifth of a second apart.
 const PROBE_TRIES: u32 = 10;
 const PROBE_INTERVAL: Duration = Duration::from_millis(200);
@@ -159,6 +221,9 @@ const ADDRESS_TRIES: u32 = 5;
 /// PDF 181: "retransmitted several times to insure that a response is received".
 const NETINFO_TRIES: u32 = 3;
 const NETINFO_INTERVAL: Duration = Duration::from_secs(1);
+/// How many times to retransmit a lookup.
+const LOOKUP_TRIES: u32 = 3;
+const LOOKUP_INTERVAL: Duration = Duration::from_secs(1);
 
 pub struct Node {
     tx: Tx,
@@ -174,6 +239,8 @@ pub struct Node {
     /// True until the address is claimed; suppresses AARP answers.
     probing: bool,
     next_id: u16,
+    /// Scratch for `wait` closures that accumulate across callbacks.
+    pending: Vec<NbpTuple>,
 }
 
 impl Node {
@@ -190,6 +257,7 @@ impl Node {
             session: Session::new(),
             probing: true,
             next_id: 1,
+            pending: Vec::new(),
         };
 
         n.addr = match want {
@@ -283,6 +351,37 @@ impl Node {
             }
         }
         None
+    }
+
+    /// Sends a lookup and collects answers. With a router this is a BrRq to
+    /// its NBP socket, which the router explodes into zone-wide LkUps for us;
+    /// without one, a local broadcast reaches everybody who could answer.
+    pub fn lookup(&mut self, object: &str, typ: &str, zone: &str) -> io::Result<Vec<NbpTuple>> {
+        let id = self.next_id() as u8;
+        let (func, dst) = match self.router() {
+            Some(r) => (NbpFunc::BrRq, r),
+            None => (NbpFunc::LkUp, Addr { net: self.addr.net, node: 255 }),
+        };
+        let body = lookup_request(func, id, self.addr, OUR_SOCKET, object, typ, zone).to_bytes();
+
+        let mut found = Vec::new();
+        for _ in 0..LOOKUP_TRIES {
+            self.send_ddp(dst, 2, DDP_NBP, body.clone())?;
+            // Collect for the whole interval rather than stopping at the first
+            // answer: a lookup has many responders, not one.
+            let deadline = Instant::now() + LOOKUP_INTERVAL;
+            while self
+                .wait(deadline, |n, p| {
+                    let tuples = lookup_replies(p, id);
+                    (!tuples.is_empty()).then(|| merge(&mut n.pending, tuples))
+                })
+                .is_some()
+            {}
+            let batch = std::mem::take(&mut self.pending);
+            merge(&mut found, &batch);
+        }
+        found.sort_by(|a, b| (&a.object, &a.typ).cmp(&(&b.object, &b.typ)));
+        Ok(found)
     }
 
     /// The clock mixed with the NIC's MAC. See `pick_address` for why this is
@@ -380,7 +479,10 @@ mod tests {
 
     use pnet::util::MacAddr;
 
-    use crate::wire::{Aarp, Body, DdpBody, Encode, Packet, Zip, AARP, DDP, DDP_ZIP};
+    use crate::wire::{
+        Aarp, Body, DdpBody, Encode, Nbp, NbpFunc, NbpTuple, Packet, Zip, AARP, DDP, DDP_NBP,
+        DDP_ZIP,
+    };
 
     fn aarp_packet(op: u16, src: Addr, src_hw: MacAddr, dst: Addr) -> Packet {
         let body = Body::Aarp(Aarp {
@@ -588,6 +690,69 @@ mod tests {
             body: Body::Ddp(d, DdpBody::Zip(z)),
         };
         assert!(netinfo_verdict(&p, OURS).is_none());
+    }
+
+    fn lkup_reply(id: u8, tuples: Vec<NbpTuple>) -> Packet {
+        let n = Nbp { func: NbpFunc::LkUpReply, id, tuples };
+        let d = datagram(Addr { net: 3, node: 42 }, 2, OURS, OUR_SOCKET, DDP_NBP, n.to_bytes());
+        Packet {
+            frame: frame(THEIR_MAC, OUR_MAC, DDP, Vec::new()),
+            body: Body::Ddp(d, DdpBody::Nbp(n)),
+        }
+    }
+
+    fn tuple(object: &str, node: u8) -> NbpTuple {
+        NbpTuple {
+            addr: Addr { net: 3, node },
+            socket: 253,
+            enumerator: 0,
+            object: object.to_string(),
+            typ: "AFPServer".to_string(),
+            zone: "Engineering".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_broadcast_request_carries_the_wildcard_and_our_return_address() {
+        let n = lookup_request(NbpFunc::BrRq, 7, OURS, OUR_SOCKET, "=", "=", "Engineering");
+        assert_eq!(n.tuples.len(), 1);
+        // The tuple's address field is where the responders send their answers.
+        assert_eq!(n.tuples[0].addr, OURS);
+        assert_eq!(n.tuples[0].socket, OUR_SOCKET);
+        assert_eq!((&*n.tuples[0].object, &*n.tuples[0].typ), ("=", "="));
+
+        let b = n.to_bytes();
+        assert_eq!(b[0], 0x11); // function 1 (BrRq) in the high nibble, 1 tuple
+        assert_eq!(b[1], 7); // the NBP id
+    }
+
+    #[test]
+    fn replies_are_matched_by_nbp_id() {
+        let p = lkup_reply(7, vec![tuple("Mac", 42)]);
+        assert_eq!(lookup_replies(&p, 7).len(), 1);
+        // A reply to somebody else's lookup, or to one we have moved past.
+        assert!(lookup_replies(&p, 8).is_empty());
+        // Not NBP at all.
+        assert!(lookup_replies(&netinfo((3, 5), "Engineering", None), 7).is_empty());
+    }
+
+    #[test]
+    fn merging_drops_tuples_we_already_have() {
+        // Requests are retransmitted, so the same entity answers repeatedly.
+        let mut all = Vec::new();
+        merge(&mut all, &[tuple("Mac", 42), tuple("Printer", 43)]);
+        merge(&mut all, &[tuple("Mac", 42)]);
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn addresses_parse_as_net_dot_node() {
+        assert_eq!(parse_addr("65280.137").unwrap(), OURS);
+        assert!(parse_addr("3.42").is_ok());
+        // Fail closed on anything that is not exactly two numbers in range.
+        for bad in ["", "3", "3.42.1", "3.", "eth0", "65536.1", "3.256", "3.0", "-1.2"] {
+            assert!(parse_addr(bad).is_err(), "{bad:?} should not parse");
+        }
     }
 
     #[test]
