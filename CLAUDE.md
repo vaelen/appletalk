@@ -6,13 +6,23 @@ protocol overview and the planned build order.
 
 ## Layout
 
-| File           | Holds                                                      |
-|----------------|-------------------------------------------------------------|
-| `src/wire.rs`  | Protocol parsers and their `Display` impls. No I/O.          |
-| `src/main.rs`  | Capture loop, interface selection, hexdump.                  |
-| `appletalk.md` | Protocol reference: layers, addressing, Phase 1 vs 2.        |
+| File             | Holds                                                     |
+|------------------|------------------------------------------------------------|
+| `src/wire.rs`    | Protocol parsers, `Display` impls, `decode()`. No I/O.      |
+| `src/capture.rs` | Capture thread: NIC to `Event`s on a bounded channel.       |
+| `src/text.rs`    | Plain-text frontend. Timestamps and hexdump.                |
+| `src/main.rs`    | Glue: pick an interface, pick a frontend, start it.         |
+| `appletalk.md`   | Protocol reference: layers, addressing, Phase 1 vs 2.       |
 
 Keep parsing pure and in `wire.rs` — it stays testable without a NIC.
+
+Frontends consume `Receiver<capture::Event>` and nothing else; they never touch
+pnet. `wire::Packet` is fully owned so it can cross that channel — pnet lends
+out a buffer that dies on the next read, so parsers copy their payloads.
+
+The queue is bounded and the capture thread **drops** rather than blocking when
+a frontend falls behind, reporting the count via `Event::Dropped`. A frontend
+that ignores it shows a gap with no explanation.
 
 ## Conventions
 

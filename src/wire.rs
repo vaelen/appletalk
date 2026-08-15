@@ -54,26 +54,29 @@ impl fmt::Display for Addr {
 
 /// An Ethernet frame carrying AppleTalk (ELAP).
 #[derive(Debug, PartialEq, Eq)]
-pub struct Frame<'a> {
+pub struct Frame {
     pub dst: MacAddr,
     pub src: MacAddr,
     /// EtherType, or the SNAP protocol when `snap` is set.
     pub proto: u16,
     /// True for Phase 2: IEEE 802.3 + 802.2 LLC + SNAP.
     pub snap: bool,
-    pub payload: &'a [u8],
+    /// Owned, so a decoded packet can cross a channel to a frontend. pnet
+    /// hands out a borrow of its own buffer that dies on the next read.
+    pub payload: Vec<u8>,
 }
 
-impl<'a> Frame<'a> {
+impl Frame {
     /// Phase 2 EtherTalk is 802.3 (the type field is a *length*) + LLC + SNAP,
     /// so the real protocol number sits 8 bytes further in. Phase 1 used a
     /// plain EtherType. Non-SNAP LLC frames return None.
-    pub fn parse(b: &'a [u8]) -> Option<Self> {
+    pub fn parse(b: &[u8]) -> Option<Self> {
         let (dst, src) = (mac(b.get(..6)?)?, mac(b.get(6..12)?)?);
         let typelen = u16::from_be_bytes([b[12], b[13]]);
         let body = b.get(14..)?;
         if typelen > 1500 {
-            return Some(Frame { dst, src, proto: typelen, snap: false, payload: body });
+            let payload = body.to_vec();
+            return Some(Frame { dst, src, proto: typelen, snap: false, payload });
         }
         // 802.3: trim the padding Ethernet added to reach the 60-byte minimum.
         match body.get(..typelen as usize)? {
@@ -83,14 +86,14 @@ impl<'a> Frame<'a> {
                 src,
                 proto: u16::from_be_bytes([*hi, *lo]),
                 snap: true,
-                payload: rest,
+                payload: rest.to_vec(),
             }),
             _ => None,
         }
     }
 }
 
-impl fmt::Display for Frame<'_> {
+impl fmt::Display for Frame {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let name = match self.proto {
             DDP => "DDP",
@@ -173,7 +176,7 @@ impl fmt::Display for Aarp {
 /// EtherTalk carries. The 5-byte short header is LocalTalk-only, where LLAP's
 /// type field tells the two apart.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Ddp<'a> {
+pub struct Ddp {
     pub hops: u8,
     /// Header + data, per the wire. Compare against `data` to spot truncation.
     pub length: u16,
@@ -184,11 +187,11 @@ pub struct Ddp<'a> {
     pub src: Addr,
     pub src_socket: u8,
     pub typ: u8,
-    pub data: &'a [u8],
+    pub data: Vec<u8>,
 }
 
-impl<'a> Ddp<'a> {
-    pub fn parse(p: &'a [u8]) -> Option<Self> {
+impl Ddp {
+    pub fn parse(p: &[u8]) -> Option<Self> {
         let h = p.get(..13)?;
         Some(Ddp {
             // byte 0: 2 bits reserved, 4 bits hop count, then the top 2 of a
@@ -201,7 +204,7 @@ impl<'a> Ddp<'a> {
             src: Addr { net: u16::from_be_bytes([h[6], h[7]]), node: h[9] },
             src_socket: h[11],
             typ: h[12],
-            data: &p[13..],
+            data: p[13..].to_vec(),
         })
     }
 
@@ -219,7 +222,7 @@ impl<'a> Ddp<'a> {
     }
 }
 
-impl fmt::Display for Ddp<'_> {
+impl fmt::Display for Ddp {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
@@ -270,7 +273,7 @@ impl fmt::Display for Func {
 
 /// An ATP packet: an 8-byte header over DDP, carrying up to 578 bytes.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Atp<'a> {
+pub struct Atp {
     pub func: Func,
     /// The raw control byte; the flag accessors read their bits from it.
     pub control: u8,
@@ -281,11 +284,11 @@ pub struct Atp<'a> {
     /// Four bytes ATP does not interpret — ASP and PAP put their own headers
     /// here rather than in the data.
     pub user_bytes: [u8; 4],
-    pub data: &'a [u8],
+    pub data: Vec<u8>,
 }
 
-impl<'a> Atp<'a> {
-    pub fn parse(p: &'a [u8]) -> Option<Self> {
+impl Atp {
+    pub fn parse(p: &[u8]) -> Option<Self> {
         let h = p.get(..8)?;
         Some(Atp {
             func: match h[0] & 0xc0 {
@@ -298,7 +301,7 @@ impl<'a> Atp<'a> {
             bitmap: h[1],
             tid: u16::from_be_bytes([h[2], h[3]]),
             user_bytes: h[4..8].try_into().ok()?,
-            data: &p[8..],
+            data: p[8..].to_vec(),
         })
     }
 
@@ -331,7 +334,7 @@ impl<'a> Atp<'a> {
     }
 }
 
-impl fmt::Display for Atp<'_> {
+impl fmt::Display for Atp {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{} tid {}", self.func, self.tid)?;
         match self.func {
@@ -378,25 +381,25 @@ impl fmt::Display for Echo {
 /// unchanged. There is no sequence number — a pinger matches replies to
 /// requests by putting its own marker in the data.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Aep<'a> {
+pub struct Aep {
     pub func: Echo,
-    pub data: &'a [u8],
+    pub data: Vec<u8>,
 }
 
-impl<'a> Aep<'a> {
-    pub fn parse(p: &'a [u8]) -> Option<Self> {
+impl Aep {
+    pub fn parse(p: &[u8]) -> Option<Self> {
         Some(Aep {
             func: match p.first()? {
                 1 => Echo::Request,
                 2 => Echo::Reply,
                 _ => return None,
             },
-            data: &p[1..],
+            data: p[1..].to_vec(),
         })
     }
 }
 
-impl fmt::Display for Aep<'_> {
+impl fmt::Display for Aep {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{} {} bytes", self.func, self.data.len())
     }
@@ -624,6 +627,63 @@ impl fmt::Display for Zip {
     }
 }
 
+// ------------------------------------------------------------- decode tree
+
+/// One captured frame, decoded as far down the stack as its bytes could be
+/// followed. Owned throughout, so it can be sent to a frontend.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Packet {
+    pub frame: Frame,
+    pub body: Body,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Body {
+    Aarp(Aarp),
+    Ddp(Ddp, DdpBody),
+    /// A header we could not follow. The bytes are in `Frame::payload`.
+    Unknown,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum DdpBody {
+    Atp(Atp),
+    Aep(Aep),
+    Nbp(Nbp),
+    Zip(Zip),
+    /// A DDP type we do not decode, or a body we could not follow. The bytes
+    /// are in `Ddp::data`.
+    Unknown,
+}
+
+/// Decodes one Ethernet frame. Returns None for anything that is not
+/// AppleTalk — the capture thread uses this to filter before queueing.
+///
+/// Note that a *recognised* protocol whose body fails to parse still yields a
+/// Packet, with `Unknown` at the layer that stopped: the caller can fall back
+/// to hexdumping the enclosing layer's bytes.
+pub fn decode(bytes: &[u8]) -> Option<Packet> {
+    let frame = Frame::parse(bytes)?;
+    let body = match frame.proto {
+        AARP => Aarp::parse(&frame.payload).map_or(Body::Unknown, Body::Aarp),
+        DDP => match Ddp::parse(&frame.payload) {
+            Some(d) => {
+                let inner = match d.typ {
+                    DDP_NBP => Nbp::parse(&d.data).map_or(DdpBody::Unknown, DdpBody::Nbp),
+                    DDP_ATP => Atp::parse(&d.data).map_or(DdpBody::Unknown, DdpBody::Atp),
+                    DDP_AEP => Aep::parse(&d.data).map_or(DdpBody::Unknown, DdpBody::Aep),
+                    DDP_ZIP => Zip::parse(&d.data).map_or(DdpBody::Unknown, DdpBody::Zip),
+                    _ => DdpBody::Unknown,
+                };
+                Body::Ddp(d, inner)
+            }
+            None => Body::Unknown,
+        },
+        _ => return None,
+    };
+    Some(Packet { frame, body })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -669,7 +729,8 @@ mod tests {
         ];
         let bytes = frame(body.len() as u16, &body);
         let f = Frame::parse(&bytes).unwrap();
-        assert_eq!((f.proto, f.snap, f.payload), (DDP, true, &[1, 2, 3, 4][..]));
+        assert_eq!((f.proto, f.snap), (DDP, true));
+        assert_eq!(f.payload, [1, 2, 3, 4]);
         assert_eq!(
             f.to_string(),
             "ff:ff:ff:ff:ff:ff > ff:ff:ff:ff:ff:ff  DDP (0x809b)  phase 2  4 bytes"
@@ -681,7 +742,8 @@ mod tests {
         let body = [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x80, 0xf3, 9];
         let bytes = frame(body.len() as u16, &body);
         let f = Frame::parse(&bytes).unwrap();
-        assert_eq!((f.proto, f.snap, f.payload), (AARP, true, &[9][..]));
+        assert_eq!((f.proto, f.snap), (AARP, true));
+        assert_eq!(f.payload, [9]);
     }
 
     #[test]
@@ -689,7 +751,7 @@ mod tests {
         let bytes = frame(DDP, &[1, 2, 3]);
         let f = Frame::parse(&bytes).unwrap();
         assert_eq!((f.proto, f.snap), (DDP, false));
-        assert_eq!(&f.payload[..3], &[1, 2, 3]); // no length field: padding included
+        assert_eq!(f.payload[..3], [1, 2, 3]); // no length field: padding included
     }
 
     #[test]
@@ -712,7 +774,7 @@ mod tests {
         ];
         let d = Ddp::parse(&dgram).unwrap();
         assert_eq!(d.src, Addr { net: 65280, node: 128 });
-        assert_eq!(d.data, &[1, 2, 3, 4]);
+        assert_eq!(d.data, [1, 2, 3, 4]);
         assert_eq!(
             d.to_string(),
             "65280.128:253 > 0.255:2  type 2 (NBP) hops 0 len 17 cksum none"
@@ -741,7 +803,7 @@ mod tests {
         let a = Atp::parse(&p).unwrap();
         assert_eq!((a.func, a.tid, a.bitmap), (Func::Req, 4660, 0x07));
         assert!(a.xo() && !a.eom());
-        assert_eq!(a.data, &[9, 9]);
+        assert_eq!(a.data, [9, 9]);
         assert_eq!(a.to_string(), "TReq tid 4660 bitmap 0x07 XO(30s) user 01020304");
     }
 
@@ -771,11 +833,12 @@ mod tests {
     fn aep_request_and_reply() {
         let req = Aep::parse(&[1, 0xde, 0xad, 0xbe, 0xef]).unwrap();
         assert_eq!(req.func, Echo::Request);
-        assert_eq!(req.data, &[0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(req.data, [0xde, 0xad, 0xbe, 0xef]);
         assert_eq!(req.to_string(), "request 4 bytes");
 
         let reply = Aep::parse(&[2]).unwrap();
-        assert_eq!((reply.func, reply.data), (Echo::Reply, &[][..]));
+        assert_eq!(reply.func, Echo::Reply);
+        assert!(reply.data.is_empty());
         assert_eq!(reply.to_string(), "reply 0 bytes");
     }
 
@@ -900,5 +963,55 @@ mod tests {
         assert!(Zip::parse(&[99, 0]).is_none());
         assert!(Zip::parse(&[1]).is_none()); // no count byte
         assert!(Zip::parse(&[1, 4, 0, 3]).is_none()); // count exceeds body
+    }
+
+    #[test]
+    fn decode_walks_the_whole_stack() {
+        // Ethernet + SNAP -> DDP type 3 -> ATP TReq.
+        let mut dgram = vec![
+            0x00, 0, // hops 0, length patched below
+            0x00, 0x00, // no checksum
+            0x00, 0x03, 0xff, 0x00, // dst net 3, src net 65280
+            42, 128, // dst node, src node
+            253, 6, // dst socket, src socket
+            DDP_ATP,
+        ];
+        dgram.extend(atp(0x40, 0x01, &[7]));
+        dgram[1] = dgram.len() as u8;
+
+        let mut body = vec![0xaa, 0xaa, 0x03, 0x08, 0x00, 0x07, 0x80, 0x9b];
+        body.extend(&dgram);
+        let p = decode(&frame(body.len() as u16, &body)).unwrap();
+
+        assert_eq!(p.frame.proto, DDP);
+        match p.body {
+            Body::Ddp(d, DdpBody::Atp(a)) => {
+                assert_eq!((d.typ, d.dst), (DDP_ATP, Addr { net: 3, node: 42 }));
+                assert_eq!((a.func, a.tid), (Func::Req, 4660));
+                assert_eq!(a.data, [7]);
+            }
+            other => panic!("expected ATP over DDP, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_skips_non_appletalk() {
+        assert!(decode(&frame(0x0800, &[0; 20])).is_none()); // IPv4
+        assert!(decode(&[0; 10]).is_none()); // runt
+    }
+
+    #[test]
+    fn decode_keeps_bytes_for_layers_it_cannot_follow() {
+        // DDP type 7 (ADSP) — recognised as DDP, but we have no ADSP parser,
+        // so the datagram still decodes and its body stays available as bytes.
+        let mut dgram = vec![0x00, 17, 0x00, 0x00, 0x00, 0x03, 0xff, 0x00, 42, 128, 253, 6, 7];
+        dgram.extend([1, 2, 3, 4]);
+        let mut body = vec![0xaa, 0xaa, 0x03, 0x08, 0x00, 0x07, 0x80, 0x9b];
+        body.extend(&dgram);
+        let p = decode(&frame(body.len() as u16, &body)).unwrap();
+        match p.body {
+            Body::Ddp(d, DdpBody::Unknown) => assert_eq!(d.data, [1, 2, 3, 4]),
+            other => panic!("expected undecoded DDP body, got {other:?}"),
+        }
     }
 }

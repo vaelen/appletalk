@@ -38,7 +38,7 @@ Apple's (1=RTMP, 2=NBP, 4=echo, 6=ZIP), 128–254 dynamic.
 
 Phase 2 (1989) introduced *extended* networks — a cable range instead of one net
 number, multiple zones per cable, >254 nodes — and moved EtherTalk onto
-802.3/LLC/SNAP. That's the split `parse_frame()` in `src/main.rs` handles.
+802.3/LLC/SNAP. That's the split `Frame::parse()` in `src/wire.rs` handles.
 
 ## Build order
 
