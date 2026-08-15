@@ -6,7 +6,7 @@
 //! so a frontend can render raw packets and reassembled messages side by side.
 
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::wire::{Addr, Body, DdpBody, Func, Packet};
 
@@ -74,6 +74,14 @@ impl Partial {
     }
 }
 
+/// ATP's shortest release timer. A transaction quiet for longer than this is
+/// never going to complete.
+const TXN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// ponytail: hard cap as a backstop for the timeout, in case a flood arrives
+/// faster than the clock advances. Raise it if real captures overflow.
+pub(crate) const MAX_OPEN: usize = 512;
+
 #[derive(Debug, Default)]
 #[allow(dead_code)] // Tasks 8-10 consume Transactions/TxnKey/Transaction
 pub struct Transactions {
@@ -90,6 +98,7 @@ impl Transactions {
     /// it. Non-ATP packets, requests, and releases are ignored.
     #[allow(dead_code)] // Tasks 8-10 call Transactions::push from the frontend loop
     pub fn push(&mut self, at: SystemTime, p: &Packet) -> Option<Transaction> {
+        self.expire(at);
         let Body::Ddp(ddp, DdpBody::Atp(atp)) = &p.body else { return None };
         if atp.func != Func::Resp {
             return None;
@@ -126,12 +135,40 @@ impl Transactions {
         Some(Transaction { key, user_bytes, data, at })
     }
 
-    /// Number of transactions still awaiting completion. Pulled forward from
-    /// Task 8 (eviction) so the seq > 7 reject test can assert no entry was
-    /// created rather than just checking the return value.
-    #[allow(dead_code)] // Task 8's eviction sweep uses this
+    /// Number of transactions still awaiting completion. Used by `expire`'s
+    /// cap check and by tests.
     fn open_count(&self) -> usize {
         self.open.len()
+    }
+
+    /// Discards everything in flight. Call on `Event::Dropped`: the capture
+    /// thread reports how many frames were lost but not which, so any gap
+    /// could have hit any transaction. Keeping them would silently produce a
+    /// reassembled message with a hole in it.
+    #[allow(dead_code)] // Task 9 wires this to Event::Dropped in the frontend loop
+    pub fn flush(&mut self) {
+        self.open.clear();
+    }
+
+    /// Packet arrival is the clock, so this behaves identically when replaying
+    /// a stored capture and needs no timer thread.
+    ///
+    /// Runs before `push`'s own insert, so the cap check trims to `MAX_OPEN -
+    /// 1` rather than `MAX_OPEN`: it doesn't yet know whether this packet
+    /// will add a new entry, and reserving that one slot is what keeps the
+    /// post-insert count at exactly `MAX_OPEN` in steady state instead of
+    /// settling one over it.
+    fn expire(&mut self, now: SystemTime) {
+        self.open.retain(|_, p| {
+            now.duration_since(p.first_seen).unwrap_or_default() < TXN_TIMEOUT
+        });
+        if self.open_count() >= MAX_OPEN {
+            let mut times: Vec<_> = self.open.iter().map(|(k, p)| (p.first_seen, *k)).collect();
+            times.sort_by_key(|&(t, _)| t);
+            for (_, key) in times.iter().take(self.open_count() - (MAX_OPEN - 1)) {
+                self.open.remove(key);
+            }
+        }
     }
 }
 
@@ -261,5 +298,40 @@ mod tests {
         assert_eq!(t.open_count(), 0);
         assert!(t.push(at(1), &resp(255, true, b"x")).is_none());
         assert_eq!(t.open_count(), 0);
+    }
+
+    #[test]
+    fn expires_transactions_that_never_complete() {
+        let mut t = Transactions::new();
+        assert!(t.push(at(0), &resp(0, false, b"aaa")).is_none());
+        // 31s later a packet for an unrelated transaction drives the clock past
+        // the 30s TRel timeout, evicting the stalled one.
+        let other = packet(Atp::response(1, 0, true, false, [0; 4], b"x".to_vec()));
+        assert_eq!(t.push(at(31), &other).unwrap().data, b"x");
+        assert_eq!(t.open_count(), 0);
+
+        // The stalled transaction is gone, so its EOM starts a fresh one that can
+        // never complete rather than resurrecting the old data.
+        assert!(t.push(at(32), &resp(1, true, b"bbb")).is_none());
+    }
+
+    #[test]
+    fn flush_discards_everything_in_flight() {
+        let mut t = Transactions::new();
+        assert!(t.push(at(0), &resp(0, false, b"aaa")).is_none());
+        assert_eq!(t.open_count(), 1);
+        t.flush();
+        assert_eq!(t.open_count(), 0);
+        assert!(t.push(at(1), &resp(1, true, b"bbb")).is_none());
+    }
+
+    #[test]
+    fn caps_the_number_of_open_transactions() {
+        let mut t = Transactions::new();
+        for tid in 0..(MAX_OPEN as u16 + 10) {
+            let p = packet(Atp::response(tid, 0, false, false, [0; 4], b"x".to_vec()));
+            t.push(at(0), &p);
+        }
+        assert!(t.open_count() <= MAX_OPEN);
     }
 }
