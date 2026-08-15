@@ -61,6 +61,27 @@ fn run_node(
             }
             Ok(())
         }
+        cli::Command::Ping { target, count } => {
+            let addr = match target.parse::<node::Target>()? {
+                node::Target::Addr(a) => a,
+                node::Target::Name { object, typ, zone } => {
+                    let zone = zone.unwrap_or_else(|| n.zone().to_string());
+                    let found = n.lookup(&object, &typ, &zone)?;
+                    let first = found.first().ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("no answer for {object}:{typ}@{zone}"),
+                        )
+                    })?;
+                    if found.len() > 1 {
+                        eprintln!("{} answered; pinging {first}", found.len());
+                    }
+                    first.addr
+                }
+            };
+            // No reply at all is a failure, the same as any other ping.
+            if n.ping(addr, *count)? { Ok(()) } else { std::process::exit(1) }
+        }
         cli::Command::Monitor { .. } => unreachable!("handled by the passive path"),
     }
 }

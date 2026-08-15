@@ -50,6 +50,14 @@ pub enum Command {
         /// Zone to look in; `*` means this cable only.
         zone: Option<String>,
     },
+    /// Echo a node, by address or by NBP name.
+    Ping {
+        /// `net.node`, or `object:type@zone`
+        target: String,
+        /// Number of echoes to send
+        #[arg(short, long, default_value_t = 4)]
+        count: u16,
+    },
 }
 
 #[derive(Args, Clone, Default)]

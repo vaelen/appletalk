@@ -21,8 +21,8 @@ use pnet::util::MacAddr;
 use crate::capture::{Event, Tx};
 use crate::session::Session;
 use crate::wire::{
-    Aarp, Addr, Body, Ddp, DdpBody, Encode, Frame, Nbp, NbpFunc, NbpTuple, Packet, Zip, AARP, DDP,
-    DDP_NBP, DDP_ZIP,
+    Aarp, Addr, Aep, Body, Ddp, DdpBody, Echo, Encode, Frame, Nbp, NbpFunc, NbpTuple, Packet, Zip,
+    AARP, DDP, DDP_AEP, DDP_NBP, DDP_ZIP,
 };
 
 /// Where ELAP sends AppleTalk broadcasts, and where AARP probes and requests
@@ -224,6 +224,11 @@ const NETINFO_INTERVAL: Duration = Duration::from_secs(1);
 /// How many times to retransmit a lookup.
 const LOOKUP_TRIES: u32 = 3;
 const LOOKUP_INTERVAL: Duration = Duration::from_secs(1);
+const PING_INTERVAL: Duration = Duration::from_secs(1);
+
+fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
+}
 
 pub struct Node {
     tx: Tx,
@@ -384,6 +389,47 @@ impl Node {
         Ok(found)
     }
 
+    /// One probe per second, each waiting up to a second. Returns whether
+    /// anything answered.
+    pub fn ping(&mut self, target: Addr, count: u16) -> io::Result<bool> {
+        // Distinguishes our echoes from any other pinger's on the same cable.
+        let magic = self.seed(0) as u32;
+        let mut rtts: Vec<Duration> = Vec::new();
+
+        for seq in 0..u32::from(count) {
+            let data = echo_data(magic, seq);
+            let body = Aep { func: Echo::Request, data }.to_bytes();
+            let sent = Instant::now();
+            self.send_ddp(target, 4, DDP_AEP, body)?;
+
+            match self.wait(sent + PING_INTERVAL, |_, p| {
+                echo_match(p, magic).filter(|(_, s)| *s == seq)
+            }) {
+                Some((from, _)) => {
+                    let rtt = sent.elapsed();
+                    println!("8 bytes from {from}: seq={seq} time={:.2} ms", ms(rtt));
+                    rtts.push(rtt);
+                }
+                None => println!("timeout seq={seq}"),
+            }
+            // Pace the next probe even when this one answered early.
+            if let Some(left) = (sent + PING_INTERVAL).checked_duration_since(Instant::now()) {
+                let _ = self.wait(Instant::now() + left, |_, _| None::<()>);
+            }
+        }
+
+        let lost = usize::from(count) - rtts.len();
+        let loss = if count == 0 { 0.0 } else { lost as f64 * 100.0 / f64::from(count) };
+        println!("\n--- {target} ping statistics ---");
+        print!("{count} sent, {} received, {loss:.0}% loss", rtts.len());
+        if let (Some(min), Some(max)) = (rtts.iter().min(), rtts.iter().max()) {
+            let avg = rtts.iter().sum::<Duration>() / rtts.len() as u32;
+            print!(", rtt min/avg/max {:.2}/{:.2}/{:.2} ms", ms(*min), ms(avg), ms(*max));
+        }
+        println!();
+        Ok(!rtts.is_empty())
+    }
+
     /// The clock mixed with the NIC's MAC. See `pick_address` for why this is
     /// enough.
     fn seed(&self, attempt: u32) -> u64 {
@@ -472,6 +518,51 @@ impl Node {
     }
 }
 
+/// What `ping` was aimed at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Addr(Addr),
+    /// Resolved through NBP before pinging. A missing zone means the local one.
+    Name { object: String, typ: String, zone: Option<String> },
+}
+
+impl std::str::FromStr for Target {
+    type Err = io::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // A name is anything wearing NBP punctuation; everything else must be
+        // an address, and fails closed if it is not.
+        if !s.contains(':') && !s.contains('@') {
+            return parse_addr(s).map(Target::Addr);
+        }
+        let (name, zone) = match s.split_once('@') {
+            Some((n, z)) => (n, Some(z.to_string())),
+            None => (s, None),
+        };
+        let (object, typ) = name.split_once(':').unwrap_or((name, "="));
+        Ok(Target::Name { object: object.to_string(), typ: typ.to_string(), zone })
+    }
+}
+
+/// AEP carries no sequence number: the replier echoes the data back unchanged,
+/// so the pinger plants its own marker and matches on that.
+pub fn echo_data(magic: u32, seq: u32) -> Vec<u8> {
+    let mut v = magic.to_be_bytes().to_vec();
+    v.extend(seq.to_be_bytes());
+    v
+}
+
+/// The responder's address and our sequence number, for a reply that is ours.
+pub fn echo_match(p: &Packet, magic: u32) -> Option<(Addr, u32)> {
+    let Body::Ddp(d, DdpBody::Aep(a)) = &p.body else { return None };
+    if a.func != Echo::Reply {
+        return None;
+    }
+    let m = u32::from_be_bytes(a.data.get(..4)?.try_into().ok()?);
+    let seq = u32::from_be_bytes(a.data.get(4..8)?.try_into().ok()?);
+    (m == magic).then_some((d.src, seq))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,8 +571,8 @@ mod tests {
     use pnet::util::MacAddr;
 
     use crate::wire::{
-        Aarp, Body, DdpBody, Encode, Nbp, NbpFunc, NbpTuple, Packet, Zip, AARP, DDP, DDP_NBP,
-        DDP_ZIP,
+        Aarp, Aep, Body, DdpBody, Echo, Encode, Nbp, NbpFunc, NbpTuple, Packet, Zip, AARP, DDP,
+        DDP_AEP, DDP_NBP, DDP_ZIP,
     };
 
     fn aarp_packet(op: u16, src: Addr, src_hw: MacAddr, dst: Addr) -> Packet {
@@ -753,6 +844,55 @@ mod tests {
         for bad in ["", "3", "3.42.1", "3.", "eth0", "65536.1", "3.256", "3.0", "-1.2"] {
             assert!(parse_addr(bad).is_err(), "{bad:?} should not parse");
         }
+    }
+
+    #[test]
+    fn targets_parse_as_an_address_or_a_name() {
+        assert_eq!("65280.137".parse::<Target>().unwrap(), Target::Addr(OURS));
+        assert_eq!(
+            "Server:AFPServer@Engineering".parse::<Target>().unwrap(),
+            Target::Name {
+                object: "Server".to_string(),
+                typ: "AFPServer".to_string(),
+                zone: Some("Engineering".to_string()),
+            }
+        );
+        // No zone means "wherever I am".
+        assert_eq!(
+            "Server:AFPServer".parse::<Target>().unwrap(),
+            Target::Name {
+                object: "Server".to_string(),
+                typ: "AFPServer".to_string(),
+                zone: None,
+            }
+        );
+        // Anything with neither a colon nor an at-sign must be an address.
+        assert!("eth0".parse::<Target>().is_err());
+        assert!("".parse::<Target>().is_err());
+    }
+
+    #[test]
+    fn echoes_are_matched_by_our_own_marker() {
+        // AEP has no sequence number, so the pinger plants one in the data.
+        let data = echo_data(0xdead_beef, 3);
+        let a = Aep { func: Echo::Reply, data: data.clone() };
+        let d = datagram(Addr { net: 3, node: 42 }, 4, OURS, OUR_SOCKET, DDP_AEP, a.to_bytes());
+        let p = Packet {
+            frame: frame(THEIR_MAC, OUR_MAC, DDP, Vec::new()),
+            body: Body::Ddp(d, DdpBody::Aep(a)),
+        };
+        assert_eq!(echo_match(&p, 0xdead_beef), Some((Addr { net: 3, node: 42 }, 3)));
+        // Someone else's ping.
+        assert_eq!(echo_match(&p, 0x1234_5678), None);
+
+        // Our own outgoing request, seen because the NIC is promiscuous.
+        let req = Aep { func: Echo::Request, data };
+        let d = datagram(OURS, OUR_SOCKET, Addr { net: 3, node: 42 }, 4, DDP_AEP, req.to_bytes());
+        let p = Packet {
+            frame: frame(OUR_MAC, THEIR_MAC, DDP, Vec::new()),
+            body: Body::Ddp(d, DdpBody::Aep(req)),
+        };
+        assert_eq!(echo_match(&p, 0xdead_beef), None);
     }
 
     #[test]
