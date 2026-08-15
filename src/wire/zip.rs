@@ -7,7 +7,7 @@ use std::fmt;
 
 use pnet::util::MacAddr;
 
-use super::{mac, pstring};
+use super::{mac, mac_bytes, put_pstring, pstring, Encode};
 
 /// A ZIP packet sent directly over DDP. The GetZoneList / GetLocalZones /
 /// GetMyZone calls are a separate thing entirely — those ride on ATP with the
@@ -118,6 +118,46 @@ impl fmt::Display for Zip {
     }
 }
 
+impl Encode for Zip {
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            Zip::Query { nets } => {
+                out.push(1);
+                out.push(nets.len().min(255) as u8);
+                for n in nets {
+                    out.extend(n.to_be_bytes());
+                }
+            }
+            Zip::Reply { zones, extended } => {
+                out.push(if *extended { 8 } else { 2 });
+                out.push(zones.len().min(255) as u8);
+                for (net, name) in zones {
+                    out.extend(net.to_be_bytes());
+                    put_pstring(out, name);
+                }
+            }
+            Zip::GetNetInfo { zone } => {
+                out.push(5);
+                out.extend([0; 5]); // flags byte plus 4 reserved zero bytes
+                put_pstring(out, zone);
+            }
+            Zip::NetInfoReply { flags, range, zone, multicast, default_zone } => {
+                out.push(6);
+                out.push(*flags);
+                out.extend(range.0.to_be_bytes());
+                out.extend(range.1.to_be_bytes());
+                put_pstring(out, zone);
+                out.push(6);
+                out.extend(mac_bytes(*multicast));
+                if let Some(z) = default_zone {
+                    put_pstring(out, z);
+                }
+            }
+            Zip::Notify => out.push(7),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +217,45 @@ mod tests {
         assert!(Zip::parse(&[99, 0]).is_none());
         assert!(Zip::parse(&[1]).is_none()); // no count byte
         assert!(Zip::parse(&[1, 4, 0, 3]).is_none()); // count exceeds body
+    }
+
+    #[test]
+    fn zip_encodes_query_and_recomputes_count() {
+        let mut z = Zip::parse(&[1, 2, 0, 3, 0, 5]).unwrap();
+        assert_eq!(z.to_bytes(), vec![1, 2, 0, 3, 0, 5]);
+        if let Zip::Query { nets } = &mut z {
+            nets.push(9);
+        }
+        assert_eq!(z.to_bytes(), vec![1, 3, 0, 3, 0, 5, 0, 9]);
+    }
+
+    #[test]
+    fn zip_round_trips_reply_and_net_info() {
+        use crate::wire::testkit::ps;
+
+        let mut reply = vec![2, 2];
+        reply.extend([0, 3]);
+        reply.extend(ps("Engineering"));
+        reply.extend([0, 5]);
+        reply.extend(ps("Marketing"));
+        let z = Zip::parse(&reply).unwrap();
+        assert_eq!(Zip::parse(&z.to_bytes()), Some(z));
+
+        let mut info = vec![6, 0x20, 0, 3, 0, 5];
+        info.extend(ps("Engineering"));
+        info.extend([6, 0x09, 0x00, 0x07, 0x00, 0x00, 0x01]);
+        let z = Zip::parse(&info).unwrap();
+        assert_eq!(Zip::parse(&z.to_bytes()), Some(z));
+    }
+
+    #[test]
+    fn zip_round_trips_net_info_with_default_zone() {
+        use crate::wire::testkit::ps;
+        let mut info = vec![6, 0x80, 0, 3, 0, 5];
+        info.extend(ps("Nonexistent"));
+        info.extend([6, 0x09, 0x00, 0x07, 0x00, 0x00, 0x01]);
+        info.extend(ps("Engineering"));
+        let z = Zip::parse(&info).unwrap();
+        assert_eq!(Zip::parse(&z.to_bytes()), Some(z));
     }
 }

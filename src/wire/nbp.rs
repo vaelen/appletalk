@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use super::{pstring, Addr};
+use super::{put_pstring, pstring, Addr, Encode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NbpFunc {
@@ -116,6 +116,35 @@ impl fmt::Display for Nbp {
     }
 }
 
+impl Encode for NbpTuple {
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend(self.addr.net.to_be_bytes());
+        out.push(self.addr.node);
+        out.push(self.socket);
+        out.push(self.enumerator);
+        put_pstring(out, &self.object);
+        put_pstring(out, &self.typ);
+        put_pstring(out, &self.zone);
+    }
+}
+
+impl Encode for Nbp {
+    fn encode(&self, out: &mut Vec<u8>) {
+        let func = match self.func {
+            NbpFunc::BrRq => 1,
+            NbpFunc::LkUp => 2,
+            NbpFunc::LkUpReply => 3,
+            NbpFunc::FwdReq => 4,
+        };
+        // High nibble function, low nibble the recomputed tuple count.
+        out.push((func << 4) | (self.tuples.len().min(15) as u8));
+        out.push(self.id);
+        for t in &self.tuples {
+            t.encode(out);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,5 +185,53 @@ mod tests {
     fn nbp_rejects_bad_function_and_truncated_tuple() {
         assert!(Nbp::parse(&[0x00, 1]).is_none()); // function 0
         assert!(Nbp::parse(&[(2 << 4) | 1, 1, 0xff, 0x00]).is_none()); // tuple cut short
+    }
+
+    #[test]
+    fn nbp_encodes_known_bytes() {
+        use crate::wire::testkit::ps;
+        let n = Nbp {
+            func: NbpFunc::LkUp,
+            id: 42,
+            tuples: vec![NbpTuple {
+                addr: Addr { net: 65280, node: 128 },
+                socket: 253,
+                enumerator: 0,
+                object: "=".into(),
+                typ: "AFPServer".into(),
+                zone: "*".into(),
+            }],
+        };
+        let mut want = vec![(2 << 4) | 1, 42, 0xff, 0x00, 128, 253, 0];
+        want.extend(ps("="));
+        want.extend(ps("AFPServer"));
+        want.extend(ps("*"));
+        assert_eq!(n.to_bytes(), want);
+    }
+
+    #[test]
+    fn nbp_recomputes_the_tuple_count() {
+        use crate::wire::testkit::ps;
+        let mut p = vec![(3 << 4) | 2, 7];
+        for node in [128u8, 129] {
+            p.extend([0xff, 0x00, node, 253, 0]);
+            p.extend(ps("Mac"));
+            p.extend(ps("AFPServer"));
+            p.extend(ps("Eng"));
+        }
+        let mut n = Nbp::parse(&p).unwrap();
+        n.tuples.pop(); // one tuple left; the count nibble must follow
+        assert_eq!(n.to_bytes()[0], (3 << 4) | 1);
+    }
+
+    #[test]
+    fn nbp_round_trips() {
+        use crate::wire::testkit::ps;
+        let mut p = vec![(2 << 4) | 1, 42, 0xff, 0x00, 128, 253, 3];
+        p.extend(ps("Mac IIci"));
+        p.extend(ps("AFPServer"));
+        p.extend(ps("Engineering"));
+        let n = Nbp::parse(&p).unwrap();
+        assert_eq!(Nbp::parse(&n.to_bytes()), Some(n));
     }
 }

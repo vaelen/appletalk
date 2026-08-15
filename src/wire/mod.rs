@@ -78,6 +78,15 @@ fn pstring(p: &[u8]) -> Option<(String, &[u8])> {
     Some((text, &p[1 + len..]))
 }
 
+/// Writes a length-prefixed (Pascal) string. Names are capped at 32 bytes by
+/// the protocol; anything longer is truncated rather than corrupting the
+/// length byte.
+pub(crate) fn put_pstring(out: &mut Vec<u8>, s: &str) {
+    let bytes = &s.as_bytes()[..s.len().min(32)];
+    out.push(bytes.len() as u8);
+    out.extend(bytes);
+}
+
 /// An AppleTalk network address: 16-bit network, 8-bit node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Addr {
