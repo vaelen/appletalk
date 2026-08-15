@@ -49,6 +49,11 @@ pub use zip::Zip;
 pub const DDP: u16 = 0x809b; // AppleTalk Datagram Delivery Protocol
 pub const AARP: u16 = 0x80f3; // AppleTalk Address Resolution Protocol
 
+/// The two SNAP protocol discriminators AppleTalk uses (Inside AppleTalk,
+/// PDF 94 and 96). Anything else is another protocol family's SNAP frame.
+const SNAP_DDP: [u8; 5] = [0x08, 0x00, 0x07, 0x80, 0x9b];
+const SNAP_AARP: [u8; 5] = [0x00, 0x00, 0x00, 0x80, 0xf3];
+
 // DDP protocol types.
 pub const DDP_NBP: u8 = 2;
 pub const DDP_ATP: u8 = 3;
@@ -130,15 +135,39 @@ impl Frame {
         }
         // 802.3: trim the padding Ethernet added to reach the 60-byte minimum.
         match body.get(..typelen as usize)? {
-            // DSAP AA, SSAP AA, control 03, 3-byte OUI, 2-byte protocol.
-            [0xaa, 0xaa, 0x03, _, _, _, hi, lo, rest @ ..] => Some(Frame {
-                dst,
-                src,
-                proto: u16::from_be_bytes([*hi, *lo]),
-                snap: true,
-                payload: rest.to_vec(),
-            }),
+            // DSAP AA, SSAP AA, control 03, then the 5-byte SNAP discriminator.
+            [0xaa, 0xaa, 0x03, rest @ ..] => {
+                let disc = rest.get(..5)?;
+                let proto = if disc == SNAP_DDP {
+                    DDP
+                } else if disc == SNAP_AARP {
+                    AARP
+                } else {
+                    return None;
+                };
+                Some(Frame { dst, src, proto, snap: true, payload: rest[5..].to_vec() })
+            }
             _ => None,
+        }
+    }
+}
+
+impl Encode for Frame {
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend(mac_bytes(self.dst));
+        out.extend(mac_bytes(self.src));
+        if self.snap {
+            // 802.3: the length covers LLC + SNAP + payload. Padding is added
+            // afterwards and is deliberately not counted (PDF 93).
+            out.extend(((8 + self.payload.len()) as u16).to_be_bytes());
+            out.extend([0xaa, 0xaa, 0x03]);
+            out.extend(if self.proto == AARP { SNAP_AARP } else { SNAP_DDP });
+        } else {
+            out.extend(self.proto.to_be_bytes());
+        }
+        out.extend(&self.payload);
+        if out.len() < 60 {
+            out.resize(60, 0);
         }
     }
 }
@@ -353,6 +382,85 @@ mod tests {
         match p.body {
             Body::Ddp(d, DdpBody::Unknown) => assert_eq!(d.data, [1, 2, 3, 4]),
             other => panic!("expected undecoded DDP body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frame_rejects_foreign_snap_discriminators() {
+        // OUI 00:00:00 with the DDP protocol number is not AppleTalk's
+        // $080007809B, and must not decode as DDP.
+        let body = [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x80, 0x9b, 1, 2];
+        assert!(Frame::parse(&testkit::frame(body.len() as u16, &body)).is_none());
+
+        // IPX over SNAP: OUI 00:00:00, protocol 0x8137.
+        let ipx = [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x81, 0x37, 1, 2];
+        assert!(Frame::parse(&testkit::frame(ipx.len() as u16, &ipx)).is_none());
+    }
+
+    #[test]
+    fn frame_encodes_the_right_oui_per_protocol() {
+        let ddp = Frame {
+            dst: MacAddr::new(0x09, 0x00, 0x07, 0xff, 0xff, 0xff),
+            src: MacAddr::new(0x00, 0x05, 0x02, 0xaa, 0xbb, 0xcc),
+            proto: DDP,
+            snap: true,
+            payload: vec![1, 2, 3, 4],
+        };
+        let out = ddp.to_bytes();
+        assert_eq!(&out[14..22], &[0xaa, 0xaa, 0x03, 0x08, 0x00, 0x07, 0x80, 0x9b]);
+        assert_eq!(u16::from_be_bytes([out[12], out[13]]), 12); // 8 LLC/SNAP + 4
+        assert_eq!(out.len(), 60); // padded to the Ethernet minimum
+
+        let aarp = Frame { proto: AARP, payload: vec![7], ..ddp };
+        let out = aarp.to_bytes();
+        assert_eq!(&out[14..22], &[0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x80, 0xf3]);
+    }
+
+    #[test]
+    fn frame_padding_is_excluded_from_the_802_3_length() {
+        let f = Frame {
+            dst: MacAddr::new(0, 0, 0, 0, 0, 0),
+            src: MacAddr::new(0, 0, 0, 0, 0, 0),
+            proto: DDP,
+            snap: true,
+            payload: vec![1],
+        };
+        let out = f.to_bytes();
+        assert_eq!(out.len(), 60);
+        assert_eq!(u16::from_be_bytes([out[12], out[13]]), 9); // 8 + 1, not 46
+        assert_eq!(Frame::parse(&out).unwrap().payload, [1]);
+    }
+
+    #[test]
+    fn frame_round_trips_a_full_ddp_atp_stack() {
+        let atp = Atp::request(4660, 0x07, None, [1, 2, 3, 4], vec![9, 9]);
+        let ddp = Ddp {
+            hops: 0,
+            length: 0,
+            checksum: 0,
+            dst: Addr { net: 3, node: 42 },
+            dst_socket: 253,
+            src: Addr { net: 65280, node: 128 },
+            src_socket: 6,
+            typ: DDP_ATP,
+            data: atp.to_bytes(),
+        };
+        let frame = Frame {
+            dst: MacAddr::new(0x09, 0x00, 0x07, 0xff, 0xff, 0xff),
+            src: MacAddr::new(0x00, 0x05, 0x02, 0xaa, 0xbb, 0xcc),
+            proto: DDP,
+            snap: true,
+            payload: ddp.to_bytes(),
+        };
+
+        let p = decode(&frame.to_bytes()).unwrap();
+        match p.body {
+            Body::Ddp(d, DdpBody::Atp(a)) => {
+                assert_eq!(d.dst, Addr { net: 3, node: 42 });
+                assert_eq!((a.func, a.tid), (Func::Req, 4660));
+                assert_eq!(a.data, [9, 9]);
+            }
+            other => panic!("expected ATP over DDP, got {other:?}"),
         }
     }
 }
