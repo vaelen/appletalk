@@ -133,6 +133,13 @@ pub fn netinfo_verdict(p: &Packet, provisional: Addr) -> Option<(NetInfo, String
     else {
         return None;
     };
+    // A range whose end precedes its start is not something we recognise, and
+    // the span arithmetic downstream would underflow on it. Fail closed: with
+    // no verdict the caller falls through to the routerless path and keeps its
+    // provisional address, exactly as if no router had answered.
+    if range.1 < range.0 {
+        return None;
+    }
     // The reply echoes the zone we asked for; a default zone means that one
     // was not valid here and this is the name to use instead.
     let zone = default_zone.clone().unwrap_or_else(|| zone.clone());
@@ -543,10 +550,25 @@ mod tests {
     }
 
     #[test]
+    fn a_provisional_net_at_the_top_of_the_cable_range_is_kept() {
+        // range.0..range.1 alone would exclude this end; pin it explicitly.
+        // OURS.net is 0xff00, placed at range.1 here rather than range.0.
+        let p = netinfo((0xfef0, 0xff00), "Engineering", None);
+        let (verdict, _, _) = netinfo_verdict(&p, OURS).unwrap();
+        assert_eq!(verdict, NetInfo::Keep);
+    }
+
+    #[test]
     fn a_provisional_net_outside_the_cable_range_forces_a_repick() {
         let p = netinfo((3, 5), "Engineering", None);
         let (verdict, _, _) = netinfo_verdict(&p, OURS).unwrap();
         assert_eq!(verdict, NetInfo::Repick { range: (3, 5) });
+    }
+
+    #[test]
+    fn an_inverted_cable_range_is_rejected_rather_than_underflowing() {
+        let p = netinfo((0xff0a, 0xff00), "Engineering", None);
+        assert!(netinfo_verdict(&p, OURS).is_none());
     }
 
     #[test]
