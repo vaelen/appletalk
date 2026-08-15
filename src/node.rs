@@ -12,10 +12,15 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::io;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pnet::util::MacAddr;
 
-use crate::wire::{Aarp, Addr, Body, Ddp, Frame, Packet};
+use crate::capture::{Event, Tx};
+use crate::session::Session;
+use crate::wire::{Aarp, Addr, Body, Ddp, DdpBody, Encode, Frame, Packet, Zip, AARP, DDP, DDP_ZIP};
 
 /// Where ELAP sends AppleTalk broadcasts, and where AARP probes and requests
 /// belong too (PDF 98). Non-AppleTalk nodes never register on it.
@@ -112,6 +117,255 @@ pub fn glean(amt: &mut HashMap<Addr, MacAddr>, p: &Packet) {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum NetInfo {
+    /// Our provisional network number is valid on this cable.
+    Keep,
+    /// It is not; pick again inside this range.
+    Repick { range: (u16, u16) },
+}
+
+/// Reads a ZIP GetNetInfo reply: whether our provisional address survives, the
+/// zone name to adopt, and the address of the router that answered — which is
+/// the only way we learn of a router (PDF 181).
+pub fn netinfo_verdict(p: &Packet, provisional: Addr) -> Option<(NetInfo, String, Addr)> {
+    let Body::Ddp(d, DdpBody::Zip(Zip::NetInfoReply { range, zone, default_zone, .. })) = &p.body
+    else {
+        return None;
+    };
+    // The reply echoes the zone we asked for; a default zone means that one
+    // was not valid here and this is the name to use instead.
+    let zone = default_zone.clone().unwrap_or_else(|| zone.clone());
+    let verdict = if (range.0..=range.1).contains(&provisional.net) {
+        NetInfo::Keep
+    } else {
+        NetInfo::Repick { range: *range }
+    };
+    Some((verdict, zone, d.src))
+}
+
+/// PDF 98: ten retransmissions, one fifth of a second apart.
+const PROBE_TRIES: u32 = 10;
+const PROBE_INTERVAL: Duration = Duration::from_millis(200);
+/// How many different addresses to try before giving up entirely.
+const ADDRESS_TRIES: u32 = 5;
+/// PDF 181: "retransmitted several times to insure that a response is received".
+const NETINFO_TRIES: u32 = 3;
+const NETINFO_INTERVAL: Duration = Duration::from_secs(1);
+
+pub struct Node {
+    tx: Tx,
+    rx: Receiver<Event>,
+    addr: Addr,
+    /// None means no router answered: no zone, and `*` in every lookup.
+    zone: Option<String>,
+    router: Option<Addr>,
+    /// Address-to-MAC mappings gleaned from traffic.
+    amt: HashMap<Addr, MacAddr>,
+    /// Reused wholesale for ATP reassembly.
+    session: Session,
+    /// True until the address is claimed; suppresses AARP answers.
+    probing: bool,
+    next_id: u16,
+}
+
+impl Node {
+    /// Runs the book's two-step startup and returns a node ready to ask
+    /// questions. Narrates to stderr, because stdout is for results.
+    pub fn claim(tx: Tx, rx: Receiver<Event>, want: Option<Addr>) -> io::Result<Node> {
+        let mut n = Node {
+            tx,
+            rx,
+            addr: Addr { net: 0, node: 0 },
+            zone: None,
+            router: None,
+            amt: HashMap::new(),
+            session: Session::new(),
+            probing: true,
+            next_id: 1,
+        };
+
+        n.addr = match want {
+            Some(a) => {
+                n.claim_one(a)?;
+                a
+            }
+            None => n.claim_any()?,
+        };
+
+        // Step two: ask a router what this cable actually is.
+        if let Some((verdict, zone, router)) = n.get_net_info() {
+            n.router = Some(router);
+            n.zone = Some(zone);
+            if let NetInfo::Repick { range } = verdict {
+                let addr = n.claim_in_range(range)?;
+                n.addr = addr;
+            }
+            eprintln!(
+                "claimed {}, zone {:?}, router {}",
+                n.addr,
+                n.zone.as_deref().unwrap_or("*"),
+                router
+            );
+        } else {
+            // PDF 181: no reply means no router. The provisional address is
+            // final and `*` is the only zone name valid in lookups.
+            eprintln!("claimed {}, no router on this network", n.addr);
+        }
+        n.probing = false;
+        Ok(n)
+    }
+
+    fn claim_any(&mut self) -> io::Result<Addr> {
+        for attempt in 0..ADDRESS_TRIES {
+            let addr = pick_address(self.seed(attempt));
+            if self.claim_one(addr).is_ok() {
+                return Ok(addr);
+            }
+        }
+        Err(io::Error::new(io::ErrorKind::AddrInUse, "could not claim an address"))
+    }
+
+    fn claim_in_range(&mut self, range: (u16, u16)) -> io::Result<Addr> {
+        for attempt in 0..ADDRESS_TRIES {
+            let seed = self.seed(attempt);
+            let span = (range.1 - range.0) as u64 + 1;
+            let addr = Addr {
+                net: range.0 + (seed % span) as u16,
+                node: pick_address(seed).node,
+            };
+            if self.claim_one(addr).is_ok() {
+                return Ok(addr);
+            }
+        }
+        Err(io::Error::new(io::ErrorKind::AddrInUse, "could not claim an address in range"))
+    }
+
+    /// Probes one address. Ok means nobody objected.
+    fn claim_one(&mut self, addr: Addr) -> io::Result<()> {
+        let our_mac = self.tx.mac;
+        for _ in 0..PROBE_TRIES {
+            let p = probe(addr, our_mac);
+            let f = frame(our_mac, BROADCAST_MAC, AARP, p.to_bytes());
+            self.tx.send(&f)?;
+            let taken = self.wait(Instant::now() + PROBE_INTERVAL, |_, pkt| {
+                match aarp_action(pkt, addr, our_mac, true) {
+                    AarpAction::Conflict => Some(()),
+                    _ => None,
+                }
+            });
+            if taken.is_some() {
+                return Err(io::Error::new(io::ErrorKind::AddrInUse, format!("{addr} is taken")));
+            }
+        }
+        Ok(())
+    }
+
+    fn get_net_info(&mut self) -> Option<(NetInfo, String, Addr)> {
+        // An empty zone name is the "no saved zone" case (PDF 181).
+        let body = Zip::GetNetInfo { zone: String::new() }.to_bytes();
+        let provisional = self.addr;
+        for _ in 0..NETINFO_TRIES {
+            // ZIP is a socket-6 protocol at both ends.
+            self.send_from(6, Addr { net: 0, node: 255 }, 6, DDP_ZIP, body.clone()).ok()?;
+            let got = self.wait(Instant::now() + NETINFO_INTERVAL, move |_, p| {
+                netinfo_verdict(p, provisional)
+            });
+            if got.is_some() {
+                return got;
+            }
+        }
+        None
+    }
+
+    /// The clock mixed with the NIC's MAC. See `pick_address` for why this is
+    /// enough.
+    fn seed(&self, attempt: u32) -> u64 {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
+        let m = self.tx.mac;
+        let mac = u64::from(m.3) << 16 | u64::from(m.4) << 8 | u64::from(m.5);
+        u64::from(nanos) ^ (mac << 8) ^ u64::from(attempt) << 32
+    }
+
+    pub fn addr(&self) -> Addr {
+        self.addr
+    }
+
+    pub fn zone(&self) -> &str {
+        self.zone.as_deref().unwrap_or("*")
+    }
+
+    pub fn router(&self) -> Option<Addr> {
+        self.router
+    }
+
+    /// Transaction and lookup identifiers, so a late reply to a previous
+    /// request cannot be mistaken for an answer to this one.
+    pub fn next_id(&mut self) -> u16 {
+        self.next_id = self.next_id.wrapping_add(1);
+        self.next_id
+    }
+
+    fn mac_for(&self, addr: Addr) -> MacAddr {
+        // Unknown means broadcast: everyone on the cable hears it, and the one
+        // it is for answers. Costs an interrupt on other AppleTalk nodes only.
+        self.amt.get(&addr).copied().unwrap_or(BROADCAST_MAC)
+    }
+
+    fn send_ddp(&mut self, dst: Addr, dst_socket: u8, typ: u8, data: Vec<u8>) -> io::Result<()> {
+        self.send_from(OUR_SOCKET, dst, dst_socket, typ, data)
+    }
+
+    fn send_from(
+        &mut self,
+        src_socket: u8,
+        dst: Addr,
+        dst_socket: u8,
+        typ: u8,
+        data: Vec<u8>,
+    ) -> io::Result<()> {
+        let d = datagram(self.addr, src_socket, dst, dst_socket, typ, data);
+        // A broadcast node number always goes to the multicast address.
+        let mac = if dst.node == 255 { BROADCAST_MAC } else { self.mac_for(dst) };
+        let f = frame(self.tx.mac, mac, DDP, d.to_bytes());
+        self.tx.send(&f)
+    }
+
+    /// Drains capture events until `f` yields a value or `deadline` passes.
+    /// Answers AARP for our address, gleans mappings, and feeds `Session`
+    /// along the way — this is the only loop in the program.
+    fn wait<T>(
+        &mut self,
+        deadline: Instant,
+        mut f: impl FnMut(&mut Node, &Packet) -> Option<T>,
+    ) -> Option<T> {
+        loop {
+            let left = deadline.checked_duration_since(Instant::now())?;
+            match self.rx.recv_timeout(left) {
+                Ok(Event::Packet { at, packet }) => {
+                    glean(&mut self.amt, &packet);
+                    self.session.push(at, &packet);
+                    if let AarpAction::AnswerTo(mac) =
+                        aarp_action(&packet, self.addr, self.tx.mac, self.probing)
+                        && let Body::Aarp(a) = &packet.body
+                    {
+                        let r = aarp_response(self.addr, self.tx.mac, a.src, mac);
+                        let out = frame(self.tx.mac, mac, AARP, r.to_bytes());
+                        let _ = self.tx.send(&out);
+                    }
+                    if let Some(v) = f(self, &packet) {
+                        return Some(v);
+                    }
+                }
+                Ok(Event::Dropped(_)) => self.session.flush(),
+                Ok(Event::Error(e)) => eprintln!("rx: {e}"),
+                Err(RecvTimeoutError::Timeout) => return None,
+                Err(RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,7 +373,7 @@ mod tests {
 
     use pnet::util::MacAddr;
 
-    use crate::wire::{Aarp, Body, DdpBody, Encode, Packet, AARP, DDP, DDP_ZIP};
+    use crate::wire::{Aarp, Body, DdpBody, Encode, Packet, Zip, AARP, DDP, DDP_ZIP};
 
     fn aarp_packet(op: u16, src: Addr, src_hw: MacAddr, dst: Addr) -> Packet {
         let body = Body::Aarp(Aarp {
@@ -253,6 +507,65 @@ mod tests {
         assert_eq!(&b[4..8], &[0x00, 0x00, 0xff, 0x00]);
         assert_eq!((b[8], b[9]), (255, 128));
         assert_eq!((b[10], b[11], b[12]), (6, 6, DDP_ZIP));
+    }
+
+    /// A ZIP GetNetInfo reply from router 3.1, for cable range 3–5, zone
+    /// "Engineering", optionally correcting an invalid requested zone.
+    fn netinfo(range: (u16, u16), zone: &str, default_zone: Option<&str>) -> Packet {
+        let z = Zip::NetInfoReply {
+            flags: 0,
+            range,
+            zone: zone.to_string(),
+            multicast: MacAddr(0x09, 0x00, 0x07, 0x00, 0x00, 0x0f),
+            default_zone: default_zone.map(str::to_string),
+        };
+        let d = datagram(
+            Addr { net: 3, node: 1 },
+            6,
+            Addr { net: 0xff00, node: 137 },
+            6,
+            DDP_ZIP,
+            z.to_bytes(),
+        );
+        Packet {
+            frame: frame(THEIR_MAC, OUR_MAC, DDP, Vec::new()),
+            body: Body::Ddp(d, DdpBody::Zip(z)),
+        }
+    }
+
+    #[test]
+    fn a_provisional_net_inside_the_cable_range_is_kept() {
+        let p = netinfo((0xff00, 0xff0a), "Engineering", None);
+        let (verdict, zone, router) = netinfo_verdict(&p, OURS).unwrap();
+        assert_eq!(verdict, NetInfo::Keep);
+        assert_eq!(zone, "Engineering");
+        assert_eq!(router, Addr { net: 3, node: 1 });
+    }
+
+    #[test]
+    fn a_provisional_net_outside_the_cable_range_forces_a_repick() {
+        let p = netinfo((3, 5), "Engineering", None);
+        let (verdict, _, _) = netinfo_verdict(&p, OURS).unwrap();
+        assert_eq!(verdict, NetInfo::Repick { range: (3, 5) });
+    }
+
+    #[test]
+    fn an_invalid_requested_zone_is_replaced_by_the_default_zone() {
+        // The reply echoes the zone we asked for and appends the real default.
+        let p = netinfo((3, 5), "Nonesuch", Some("Engineering"));
+        let (_, zone, _) = netinfo_verdict(&p, OURS).unwrap();
+        assert_eq!(zone, "Engineering");
+    }
+
+    #[test]
+    fn other_zip_traffic_is_not_a_netinfo_verdict() {
+        let z = Zip::Query { nets: vec![3] };
+        let d = datagram(Addr { net: 3, node: 1 }, 6, OURS, 6, DDP_ZIP, z.to_bytes());
+        let p = Packet {
+            frame: frame(THEIR_MAC, OUR_MAC, DDP, Vec::new()),
+            body: Body::Ddp(d, DdpBody::Zip(z)),
+        };
+        assert!(netinfo_verdict(&p, OURS).is_none());
     }
 
     #[test]
