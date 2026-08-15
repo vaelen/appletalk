@@ -8,7 +8,7 @@ protocol overview and the planned build order.
 
 | File             | Holds                                                     |
 |------------------|------------------------------------------------------------|
-| `src/wire.rs`    | Protocol parsers, `Display` impls, `decode()`. No I/O.      |
+| `src/wire/`      | Protocol parsers, one file per protocol; `decode()`. No I/O.|
 | `src/capture.rs` | Capture thread: NIC to `Event`s on a bounded channel.       |
 | `src/text.rs`    | Plain-text frontend. Timestamps and hexdump.                |
 | `src/main.rs`    | Glue: pick an interface, pick a frontend, start it.         |
