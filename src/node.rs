@@ -6,10 +6,6 @@
 //! Everything that decides something is a free function over a `&Packet`, so
 //! it can be tested without a NIC. The `Node` methods are the socket-and-timer
 //! glue around them.
-//!
-//! Nothing here is reachable from `main` yet, and some of it depends on
-//! pieces added in later tasks. Drop the allow below once Task 6 wires it in.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::io;
@@ -19,10 +15,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use pnet::util::MacAddr;
 
 use crate::capture::{Event, Tx};
-use crate::session::Session;
+use crate::session::{Message, Session};
 use crate::wire::{
-    Aarp, Addr, Aep, Body, Ddp, DdpBody, Echo, Encode, Frame, Nbp, NbpFunc, NbpTuple, Packet, Zip,
-    AARP, DDP, DDP_AEP, DDP_NBP, DDP_ZIP,
+    Aarp, Addr, Aep, Atp, Body, Ddp, DdpBody, Echo, Encode, Frame, Nbp, NbpFunc, NbpTuple, Packet,
+    Zip, ZipAtp, AARP, DDP, DDP_AEP, DDP_ATP, DDP_NBP, DDP_ZIP,
 };
 
 /// Where ELAP sends AppleTalk broadcasts, and where AARP probes and requests
@@ -225,6 +221,8 @@ const NETINFO_INTERVAL: Duration = Duration::from_secs(1);
 const LOOKUP_TRIES: u32 = 3;
 const LOOKUP_INTERVAL: Duration = Duration::from_secs(1);
 const PING_INTERVAL: Duration = Duration::from_secs(1);
+const ZONE_TRIES: u32 = 3;
+const ZONE_INTERVAL: Duration = Duration::from_secs(2);
 
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
@@ -246,6 +244,8 @@ pub struct Node {
     next_id: u16,
     /// Scratch for `wait` closures that accumulate across callbacks.
     pending: Vec<NbpTuple>,
+    /// Messages `Session` completed since the last request looked.
+    messages: Vec<Message>,
 }
 
 impl Node {
@@ -263,6 +263,7 @@ impl Node {
             probing: true,
             next_id: 1,
             pending: Vec::new(),
+            messages: Vec::new(),
         };
 
         n.addr = match want {
@@ -430,6 +431,50 @@ impl Node {
         Ok(!rtts.is_empty())
     }
 
+    /// Walks the router's zone list, one ATP transaction per page.
+    ///
+    /// Every request in a series must go to the same router: routers order
+    /// their lists differently, so mixing them would drop or repeat names.
+    pub fn zone_list(&mut self) -> io::Result<Vec<String>> {
+        let Some(router) = self.router() else { return Ok(Vec::new()) };
+        let mut zones: Vec<String> = Vec::new();
+        let mut start = 1u16;
+
+        loop {
+            let tid = self.next_id();
+            let body = zone_list_request(tid, start).to_bytes();
+            let mut reply = None;
+            for _ in 0..ZONE_TRIES {
+                self.send_ddp(router, 6, DDP_ATP, body.clone())?;
+                reply = self.wait(Instant::now() + ZONE_INTERVAL, |n, _| {
+                    n.messages.drain(..).find_map(|m| match m {
+                        Message::Zip(z @ ZipAtp::Reply { .. }) => Some(z),
+                        _ => None,
+                    })
+                });
+                if reply.is_some() {
+                    break;
+                }
+            }
+            let Some(reply) = reply else {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "router stopped answering"));
+            };
+            if let ZipAtp::Reply { zones: names, .. } = &reply {
+                // A router may repeat a name while zones are being renamed.
+                for n in names {
+                    if !zones.contains(n) {
+                        zones.push(n.clone());
+                    }
+                }
+            }
+            match next_start(start, &reply) {
+                Some(next) => start = next,
+                None => break,
+            }
+        }
+        Ok(zones)
+    }
+
     /// The clock mixed with the NIC's MAC. See `pick_address` for why this is
     /// enough.
     fn seed(&self, attempt: u32) -> u64 {
@@ -437,10 +482,6 @@ impl Node {
         let m = self.tx.mac;
         let mac = u64::from(m.3) << 16 | u64::from(m.4) << 8 | u64::from(m.5);
         u64::from(nanos) ^ (mac << 8) ^ u64::from(attempt) << 32
-    }
-
-    pub fn addr(&self) -> Addr {
-        self.addr
     }
 
     pub fn zone(&self) -> &str {
@@ -496,7 +537,7 @@ impl Node {
             match self.rx.recv_timeout(left) {
                 Ok(Event::Packet { at, packet }) => {
                     glean(&mut self.amt, &packet);
-                    self.session.push(at, &packet);
+                    self.messages.extend(self.session.push(at, &packet));
                     if let AarpAction::AnswerTo(mac) =
                         aarp_action(&packet, self.addr, self.tx.mac, self.probing)
                         && let Body::Aarp(a) = &packet.body
@@ -563,6 +604,23 @@ pub fn echo_match(p: &Packet, magic: u32) -> Option<(Addr, u32)> {
     (m == magic).then_some((d.src, seq))
 }
 
+/// ZIP's GetZoneList rides ATP with the function in the user bytes: code 8,
+/// then the 1-based index of the first zone name wanted (PDF 187). At-least-
+/// once, and a bitmap of one because the reply is always a single packet.
+pub fn zone_list_request(tid: u16, start: u16) -> Atp {
+    let [hi, lo] = start.to_be_bytes();
+    Atp::request(tid, 0x01, None, [8, 0, hi, lo], Vec::new())
+}
+
+/// Where the next request in the series starts, or None when the list is
+/// complete. The next index is this one plus however many names came back.
+pub fn next_start(start: u16, reply: &ZipAtp) -> Option<u16> {
+    match reply {
+        ZipAtp::Reply { last: false, zones } => Some(start + zones.len() as u16),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,8 +629,8 @@ mod tests {
     use pnet::util::MacAddr;
 
     use crate::wire::{
-        Aarp, Aep, Body, DdpBody, Echo, Encode, Nbp, NbpFunc, NbpTuple, Packet, Zip, AARP, DDP,
-        DDP_AEP, DDP_NBP, DDP_ZIP,
+        Aarp, Aep, Body, DdpBody, Echo, Encode, Func, Nbp, NbpFunc, NbpTuple, Packet, Zip, ZipAtp,
+        AARP, DDP, DDP_AEP, DDP_NBP, DDP_ZIP,
     };
 
     fn aarp_packet(op: u16, src: Addr, src_hw: MacAddr, dst: Addr) -> Packet {
@@ -893,6 +951,40 @@ mod tests {
             body: Body::Ddp(d, DdpBody::Aep(req)),
         };
         assert_eq!(echo_match(&p, 0xdead_beef), None);
+    }
+
+    #[test]
+    fn a_zone_list_request_asks_for_one_response_packet() {
+        let a = zone_list_request(4660, 1);
+        assert_eq!(a.func, Func::Req);
+        // "These requests always ask for a single response packet" (PDF 187).
+        assert_eq!(a.bitmap, 0x01);
+        assert!(!a.xo()); // at-least-once
+        assert_eq!(a.user_bytes, [8, 0, 0, 1]); // GetZoneList, start index 1
+        assert!(a.data.is_empty());
+        assert_eq!(a.tid, 4660);
+
+        // The index is 1-based and carried big-endian.
+        assert_eq!(zone_list_request(1, 300).user_bytes, [8, 0, 0x01, 0x2c]);
+    }
+
+    #[test]
+    fn paging_continues_from_the_index_plus_the_names_returned() {
+        let more = ZipAtp::Reply {
+            last: false,
+            zones: vec!["Engineering".into(), "Marketing".into(), "Sales".into()],
+        };
+        assert_eq!(next_start(1, &more), Some(4));
+
+        let done = ZipAtp::Reply { last: true, zones: vec!["Accounts".into()] };
+        assert_eq!(next_start(4, &done), None);
+
+        // A router returns an empty, final response past the end of the list.
+        let past_end = ZipAtp::Reply { last: true, zones: vec![] };
+        assert_eq!(next_start(9, &past_end), None);
+
+        // Anything that is not a reply ends the series rather than looping.
+        assert_eq!(next_start(1, &ZipAtp::GetMyZone), None);
     }
 
     #[test]

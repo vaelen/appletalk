@@ -116,7 +116,6 @@ impl Atp {
 
     /// `xo` carries the release timer; Phase 1 nodes ignore it and always use
     /// 30 seconds.
-    #[allow(dead_code)] // only tests construct this; no encode path is exercised until a node transmits
     pub fn request(
         tid: u16,
         bitmap: u8,

@@ -82,6 +82,20 @@ fn run_node(
             // No reply at all is a failure, the same as any other ping.
             if n.ping(addr, *count)? { Ok(()) } else { std::process::exit(1) }
         }
+        cli::Command::Zones => {
+            if n.router().is_none() {
+                // Not a failure: a routerless network genuinely has no zones.
+                eprintln!("no router: this network has no zones");
+                return Ok(());
+            }
+            let ours = n.zone().to_string();
+            for z in n.zone_list()? {
+                // Mark the zone we are actually in.
+                let mark = if z == ours { " *" } else { "" };
+                println!("{z}{mark}");
+            }
+            Ok(())
+        }
         cli::Command::Monitor { .. } => unreachable!("handled by the passive path"),
     }
 }

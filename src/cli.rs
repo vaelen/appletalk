@@ -58,6 +58,8 @@ pub enum Command {
         #[arg(short, long, default_value_t = 4)]
         count: u16,
     },
+    /// List the zones on the internet.
+    Zones,
 }
 
 #[derive(Args, Clone, Default)]

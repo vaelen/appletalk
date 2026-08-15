@@ -31,14 +31,9 @@ mod nbp;
 mod zip;
 
 pub use aarp::Aarp;
-// Nothing in this crate names Echo/NbpFunc/NbpTuple directly yet — they are
-// matched through Display and the Body/DdpBody enums instead — so the
-// re-export otherwise trips unused_imports.
-#[allow(unused_imports)]
 pub use aep::{Aep, Echo};
 pub use atp::{Atp, Func};
 pub use ddp::Ddp;
-#[allow(unused_imports)]
 pub use nbp::{Nbp, NbpFunc, NbpTuple};
 pub use zip::{Zip, ZipAtp};
 
