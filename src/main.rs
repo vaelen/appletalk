@@ -5,6 +5,7 @@
 //!
 //! Usage: sudo ./appletalk [-i interface] [monitor] [flags]
 
+mod bridge;
 mod capture;
 mod cli;
 mod ltoudp;
