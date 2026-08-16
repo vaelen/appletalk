@@ -2,8 +2,8 @@
 
 A Rust implementation of the AppleTalk protocol stack. It dumps EtherTalk
 traffic passively by default, and can also claim an AppleTalk address and act
-as a node: `zones`, `nodes` and `ping`. `appletalk.md` has the protocol
-overview and the planned build order.
+as a node: `zones`, `nodes`, `ping` and `bridge`. `appletalk.md` has the
+protocol overview and the planned build order.
 
 ## Layout
 
@@ -13,10 +13,14 @@ overview and the planned build order.
 | `src/session.rs` | Reassembles multi-packet ATP transactions. The only stateful module, driven by the frontend. |
 | `src/capture.rs` | Capture thread: NIC to `Event`s on a bounded channel.                                        |
 | `src/node.rs`    | Node runtime: claims an address, defends it, sends requests, awaits replies.                 |
+| `src/ltoudp.rs`  | LToUDP transport: the multicast socket and its reader thread.                                |
+| `src/bridge.rs`  | Bridge runtime: repeats AppleTalk between EtherTalk and a LocalTalk link.                    |
 | `src/text.rs`    | Plain-text frontend. Timestamps and hexdump.                                                 |
 | `src/cli.rs`     | `clap` command line: subcommands, and the output/filter flags a frontend obeys.              |
 | `src/main.rs`    | Glue: pick an interface, pick a frontend, start it.                                          |
 | `appletalk.md`   | Protocol reference: layers, addressing, Phase 1 vs 2.                                        |
+| `LToUDP.md`      | The LToUDP protocol, for someone implementing it elsewhere.                                  |
+| `bridge.md`      | The bridge's behaviour, for whoever has to debug it.                                         |
 
 Keep parsing pure and in `wire/` — it stays testable without a NIC.
 
@@ -113,9 +117,12 @@ and `zones` reports that the network has none.
 
 Not yet exercised, so do not assume these work: retrying after a collision (as
 opposed to detecting one, which is confirmed), a zone list long enough to page
-more than once, a reply with no zone multicast address, and Phase 1. The book settles
-byte layouts, not behavior — cross-check with `tcpdump -e -x` before trusting
-anything on that second list.
+more than once, a reply with no zone multicast address, and Phase 1. **The
+bridge as a whole is unverified** — it has never run against real hardware, so
+nothing in `bridge.md` is confirmed behavior; least of all a node moving between
+the two links, a genuine duplicate node ID across the bridge, and a second
+bridge on the same pair. The book settles byte layouts, not behavior —
+cross-check with `tcpdump -e -x` before trusting anything on that second list.
 
 ```sh
 sudo setcap cap_net_raw+ep target/debug/appletalk   # or run as root
@@ -123,4 +130,5 @@ sudo setcap cap_net_raw+ep target/debug/appletalk   # or run as root
 ./target/debug/appletalk zones                                     # list zones on the internet
 ./target/debug/appletalk nodes [zone]                               # list entities in a zone
 ./target/debug/appletalk ping <net.node | object:type@zone>         # echo a node
+./target/debug/appletalk bridge udp                                 # join LToUDP and bridge it
 ```
