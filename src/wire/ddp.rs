@@ -57,6 +57,39 @@ impl Ddp {
         })
     }
 
+    /// Lifts LocalTalk's 5-byte short header (PDF 118) into the extended form
+    /// the rest of the stack speaks.
+    ///
+    /// A short header omits what its context already supplies: the node IDs come
+    /// from the LLAP header, and both network numbers from the single network a
+    /// short header is only legal on. There is no inverse — PDF 118 permits
+    /// extended headers even when both sockets share a network, so nothing here
+    /// ever needs to write one back.
+    #[allow(dead_code)]
+    pub fn from_short(p: &[u8], net: u16, dst_node: u8, src_node: u8) -> Option<Ddp> {
+        let h = p.get(..5)?;
+        // The upper 6 bits of the length are not significant (PDF 118).
+        let length = u16::from_be_bytes([h[0] & 0x03, h[1]]) as usize;
+        if length != p.len() {
+            return None;
+        }
+        let data = p[5..].to_vec();
+        Some(Ddp {
+            hops: 0,
+            // The extended length, not the short one: `Display` checks this
+            // against the extended header it is describing.
+            length: (13 + data.len()) as u16,
+            // Zero means "sender computed none", which is legal and true.
+            checksum: 0,
+            dst: Addr { net, node: dst_node },
+            dst_socket: h[2],
+            src: Addr { net, node: src_node },
+            src_socket: h[3],
+            typ: h[4],
+            data,
+        })
+    }
+
     pub fn type_name(&self) -> &'static str {
         match self.typ {
             1 => "RTMP-data",
@@ -230,5 +263,58 @@ mod tests {
         assert_eq!(d.compute_checksum(), checksum(&bytes[4..]));
         // Prove the offset matters: checksum over wrong range must differ
         assert_ne!(d.compute_checksum(), checksum(&bytes));
+    }
+
+    /// A short header: length 9, sockets 253 and 252, DDP type 3 (ATP), then
+    /// 4 bytes of data.
+    fn short() -> Vec<u8> {
+        vec![0x00, 0x09, 253, 252, 3, 0xde, 0xad, 0xbe, 0xef]
+    }
+
+    #[test]
+    fn from_short_fills_in_what_llap_already_said() {
+        let d = Ddp::from_short(&short(), 6800, 12, 3).unwrap();
+        assert_eq!(d.dst, Addr { net: 6800, node: 12 });
+        assert_eq!(d.src, Addr { net: 6800, node: 3 });
+        assert_eq!((d.dst_socket, d.src_socket, d.typ), (253, 252, 3));
+        assert_eq!(d.data, [0xde, 0xad, 0xbe, 0xef]);
+        // No checksum: 0 on the wire means the sender computed none, which is
+        // legal and is what a synthesised header should say.
+        assert_eq!(d.checksum, 0);
+        // A bridge is not a router and does not count hops.
+        assert_eq!(d.hops, 0);
+        assert_eq!(
+            d.to_string(),
+            "6800.3:252 > 6800.12:253  type 3 (ATP) hops 0 len 17 cksum none"
+        );
+    }
+
+    #[test]
+    fn from_short_stores_the_extended_length() {
+        // 13-byte extended header plus 4 bytes of data, not the short header's 9.
+        let d = Ddp::from_short(&short(), 6800, 12, 3).unwrap();
+        assert_eq!(d.length, 17);
+        assert_eq!(d.to_bytes().len(), 17);
+    }
+
+    #[test]
+    fn from_short_ignores_the_reserved_high_bits_of_the_length() {
+        let mut p = short();
+        p[0] = 0xfc; // upper 6 bits set; only the low 2 are length
+        assert_eq!(Ddp::from_short(&p, 6800, 12, 3).unwrap().data.len(), 4);
+    }
+
+    #[test]
+    fn from_short_rejects_a_runt() {
+        assert!(Ddp::from_short(&[0x00, 0x04, 253, 252], 6800, 12, 3).is_none());
+    }
+
+    #[test]
+    fn from_short_rejects_a_length_that_disagrees() {
+        let mut p = short();
+        p[1] = 0x0a; // claims 10 bytes, carries 9
+        assert!(Ddp::from_short(&p, 6800, 12, 3).is_none());
+        p[1] = 0x05; // claims 5
+        assert!(Ddp::from_short(&p, 6800, 12, 3).is_none());
     }
 }
