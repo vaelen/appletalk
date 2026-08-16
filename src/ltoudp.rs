@@ -23,8 +23,10 @@ use crate::wire::{Encode, Llap};
 pub const GROUP: Ipv4Addr = Ipv4Addr::new(239, 192, 76, 84);
 pub const PORT: u16 = 1954;
 
-/// The largest datagram worth reading: 4 bytes of sender ID, a 3-byte LLAP
-/// header, and the 600-byte maximum data field.
+/// The largest *legal* datagram: 4 bytes of sender ID, a 3-byte LLAP header,
+/// and the 600-byte maximum data field. The read buffer is one byte larger
+/// than this (see `read_loop`) so that filling it is an unambiguous
+/// truncation signal rather than this size.
 const MAX: usize = 4 + 3 + 600;
 
 /// Prefixes a frame with the sender ID, which is the whole of the framing.
@@ -35,10 +37,14 @@ fn datagram(id: [u8; 4], f: &Llap) -> Vec<u8> {
 }
 
 /// Decides what an arriving datagram means. Returns None for anything too
-/// short to be a frame, anything we sent ourselves, and anything that does not
-/// parse — the same "not ours, skip it" contract the capture thread has.
+/// short to be a frame, anything larger than a legal frame could ever be
+/// (`recv_from` truncates silently with no signal, so a datagram filling the
+/// oversized read buffer means it did not fit — never trust length alone to
+/// mean "genuine maximum-size frame"), anything we sent ourselves, and
+/// anything that does not parse — the same "not ours, skip it" contract the
+/// capture thread has.
 fn inbound(buf: &[u8], id: [u8; 4]) -> Option<Llap> {
-    if buf.len() < 7 || buf[..4] == id {
+    if buf.len() < 7 || buf.len() > MAX || buf[..4] == id {
         return None;
     }
     Llap::parse(&buf[4..])
@@ -91,24 +97,28 @@ impl Ltoudp {
 }
 
 fn read_loop(sock: UdpSocket, id: [u8; 4], tx: SyncSender<Event>) {
-    let mut buf = [0u8; MAX];
+    // One byte larger than the largest legal datagram (MAX), so that a
+    // datagram filling the buffer to capacity is unambiguous truncation
+    // rather than being confused with a coincidentally maximum-size frame.
+    let mut buf = [0u8; MAX + 1];
     let mut dropped = 0u64;
     loop {
-        let n = match sock.recv_from(&mut buf) {
-            Ok((n, _)) => n,
-            Err(e) => {
-                if let Err(TrySendError::Disconnected(_)) = tx.try_send(Event::Error(e.to_string()))
-                {
-                    return;
-                }
-                continue;
-            }
+        let event = match sock.recv_from(&mut buf) {
+            Ok((n, _)) => match inbound(&buf[..n], id) {
+                Some(llap) => Event::Ltoudp { at: SystemTime::now(), llap },
+                None => continue,
+            },
+            // ponytail: no backoff, so a recv_from error that keeps recurring
+            // busy-spins this loop; same shape as capture_loop today, add a
+            // shared backoff to both if a real error ever does this.
+            Err(e) => Event::Error(e.to_string()),
         };
-        let Some(llap) = inbound(&buf[..n], id) else { continue };
+
+        // Report accumulated drops as soon as there is room to say so.
         if dropped > 0 && tx.try_send(Event::Dropped(dropped)).is_ok() {
             dropped = 0;
         }
-        match tx.try_send(Event::Ltoudp { at: SystemTime::now(), llap }) {
+        match tx.try_send(event) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => dropped += 1,
             Err(TrySendError::Disconnected(_)) => return,
@@ -154,5 +164,15 @@ mod tests {
     fn a_frame_that_does_not_parse_is_skipped() {
         // $83 is a reserved control type and must be discarded.
         assert_eq!(inbound(&[9, 9, 9, 9, 1, 2, 0x83], [1, 2, 3, 4]), None);
+    }
+
+    #[test]
+    fn a_truncated_oversized_datagram_is_rejected() {
+        // recv_from truncates silently at the buffer size with no signal;
+        // MAX + 1 bytes is what a bigger-than-legal datagram looks like once
+        // truncated to the read buffer, and must not be mistaken for a
+        // genuine maximum-size frame.
+        let buf = vec![9u8; MAX + 1];
+        assert_eq!(inbound(&buf, [1, 2, 3, 4]), None);
     }
 }
