@@ -650,6 +650,9 @@ impl Node {
                         return Some(v);
                     }
                 }
+                // Only the bridge opens a LocalTalk link; a node command
+                // never sees one.
+                Ok(Event::Ltoudp { .. }) => {}
                 Ok(Event::Dropped(_)) => self.session.flush(),
                 Ok(Event::Error(e)) => eprintln!("rx: {e}"),
                 Err(RecvTimeoutError::Timeout) => return None,

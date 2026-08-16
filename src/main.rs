@@ -20,20 +20,20 @@ fn main() {
         eprintln!("appletalk: output flags before a subcommand name are ambiguous; put them after it");
         std::process::exit(2);
     }
-    let (iface, tx, events) = match capture::spawn(args.interface.as_deref()) {
+    let cap = match capture::spawn(args.interface.as_deref()) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("appletalk: {e}");
             std::process::exit(1);
         }
     };
-    eprintln!("listening on {iface}");
+    eprintln!("listening on {}", cap.iface);
 
     match &args.command {
         // Only the passive path; a dumper needs no address.
-        None | Some(cli::Command::Monitor { .. }) => text::run(events, args.output()),
+        None | Some(cli::Command::Monitor { .. }) => text::run(cap.events, args.output()),
         Some(cmd) => {
-            if let Err(e) = run_node(cmd, tx, events, args.node.as_deref(), args.net) {
+            if let Err(e) = run_node(cmd, cap, args.node.as_deref(), args.net) {
                 eprintln!("appletalk: {e}");
                 std::process::exit(1);
             }
@@ -44,11 +44,11 @@ fn main() {
 /// Everything that needs a claimed address.
 fn run_node(
     cmd: &cli::Command,
-    tx: capture::Tx,
-    events: std::sync::mpsc::Receiver<capture::Event>,
+    cap: capture::Capture,
     node_arg: Option<&str>,
     net_arg: Option<u16>,
 ) -> std::io::Result<()> {
+    let capture::Capture { tx, events, .. } = cap;
     // clap already rejects --node alongside --net, so at most one is set.
     let want = match (node_arg, net_arg) {
         (Some(s), _) => node::Want::Addr(node::parse_addr(s)?),

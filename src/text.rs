@@ -97,6 +97,9 @@ pub fn run(events: Receiver<Event>, output: &Output) {
                     }
                 }
             }
+            // The text frontend never opens a LocalTalk link, so it never
+            // sees one of these.
+            Event::Ltoudp { .. } => {}
             Event::Dropped(n) => {
                 // Any gap could have hit any transaction in flight.
                 session.flush();

@@ -5,6 +5,7 @@
 //! results as events. Knows nothing about how they are displayed.
 
 use std::io;
+use std::net::Ipv4Addr;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread;
 use std::time::SystemTime;
@@ -27,6 +28,15 @@ pub enum Event {
         /// long the frame sat in the kernel buffer.
         at: SystemTime,
         packet: wire::Packet,
+    },
+    /// An LLAP frame off a LocalTalk-shaped link. Posted by `ltoudp`, which
+    /// holds a clone of the same sender the capture thread uses.
+    // ponytail: only this module's own test constructs one until Task 8 wires
+    // the bridge in.
+    #[allow(dead_code)]
+    Ltoudp {
+        at: SystemTime,
+        llap: wire::Llap,
     },
     /// Frames discarded because the queue was full, counted since the last
     /// report. A frontend that ignores this shows a gap with no explanation.
@@ -53,13 +63,31 @@ impl Tx {
     }
 }
 
+/// Everything opening a NIC yields. A struct rather than a tuple because a
+/// bridge needs the interface's address to join a multicast group on the right
+/// NIC, and a second producer for the queue.
+pub struct Capture {
+    /// The interface actually opened, which may not be the one asked for.
+    pub iface: String,
+    /// Its first IPv4 address, if it has one.
+    // ponytail: unread until Task 8's bridge joins a multicast group on it.
+    #[allow(dead_code)]
+    pub ip: Option<Ipv4Addr>,
+    pub tx: Tx,
+    /// A second handle on the event queue, for another link's reader thread.
+    // ponytail: unread until Task 8's bridge reader thread takes a clone.
+    #[allow(dead_code)]
+    pub sender: SyncSender<Event>,
+    pub events: Receiver<Event>,
+}
+
 /// Opens `want` (or the first sensible interface) and starts capturing.
 ///
 /// Returns the interface name, a transmit handle, and the event stream.
 /// Opening happens before the thread starts, so the common failure — no
 /// CAP_NET_RAW — surfaces here rather than killing a thread nobody is
 /// watching.
-pub fn spawn(want: Option<&str>) -> io::Result<(String, Tx, Receiver<Event>)> {
+pub fn spawn(want: Option<&str>) -> io::Result<Capture> {
     let iface = datalink::interfaces()
         .into_iter()
         .find(|i| match want {
@@ -72,7 +100,7 @@ pub fn spawn(want: Option<&str>) -> io::Result<(String, Tx, Receiver<Event>)> {
         })?;
 
     let cfg = Config { promiscuous: true, ..Default::default() };
-    let (sender, rx) = match datalink::channel(&iface, cfg) {
+    let (sender_half, rx) = match datalink::channel(&iface, cfg) {
         Ok(Ethernet(tx, rx)) => (tx, rx),
         Ok(_) => {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "not an Ethernet channel"));
@@ -88,9 +116,17 @@ pub fn spawn(want: Option<&str>) -> io::Result<(String, Tx, Receiver<Event>)> {
         io::Error::new(io::ErrorKind::NotFound, format!("{} has no MAC address", iface.name))
     })?;
 
+    // A NIC may have no IPv4 address; a multicast join then falls back to
+    // letting the kernel pick the interface.
+    let ip = iface.ips.iter().find_map(|n| match n.ip() {
+        std::net::IpAddr::V4(v4) => Some(v4),
+        _ => None,
+    });
+
     let (tx, events) = sync_channel(QUEUE);
+    let sender = tx.clone();
     thread::spawn(move || capture_loop(rx, tx));
-    Ok((iface.name, Tx { inner: sender, mac }, events))
+    Ok(Capture { iface: iface.name, ip, tx: Tx { inner: sender_half, mac }, sender, events })
 }
 
 fn capture_loop(mut rx: Box<dyn DataLinkReceiver>, tx: SyncSender<Event>) {
@@ -113,6 +149,26 @@ fn capture_loop(mut rx: Box<dyn DataLinkReceiver>, tx: SyncSender<Event>) {
             Err(TrySendError::Full(_)) => dropped += 1,
             // The frontend hung up; nothing left to capture for.
             Err(TrySendError::Disconnected(_)) => return,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wire::Llap;
+
+    /// The LToUDP reader posts into the same queue as the capture thread, so
+    /// one loop can serve both links without a select.
+    #[test]
+    fn a_second_producer_shares_the_queue() {
+        let (tx, rx) = sync_channel(QUEUE);
+        let second = tx.clone();
+        let llap = Llap::control(42, 42, 0x81);
+        second.try_send(Event::Ltoudp { at: SystemTime::now(), llap: llap.clone() }).unwrap();
+        match rx.recv().unwrap() {
+            Event::Ltoudp { llap: got, .. } => assert_eq!(got, llap),
+            other => panic!("wrong event: {other:?}"),
         }
     }
 }
