@@ -11,14 +11,40 @@
 //! All decisions live in `Bridge::step`, which is pure — it takes what
 //! arrived and the time, and returns what to send. `run` is the only part
 //! that touches a socket.
+//!
+//! ponytail: broadcasts flood both ways. Two bridges between the same
+//! Ethernet and the same group will storm on broadcast traffic — the
+//! contradiction check only catches unicast reflections. One bridge per pair;
+//! a real answer needs a spanning tree.
+//!
+//! ponytail: one network number. LocalTalk nodes live on our own net alone, so
+//! a cable range spanning several nets bridges only into the first. Split this
+//! into a half-router if that ever matters.
+//!
+//! ponytail: every AARP Request for an ID we do not know costs one lapENQ,
+//! even when an Ethernet node is about to answer it itself. Hold the query
+//! briefly and see if Ethernet answers first, if the group ever gets noisy.
+//!
+//! ponytail: an ENQ is answered a round trip late, never from cache, so a
+//! LocalTalk node whose ENQ series is shorter than one AARP round trip could
+//! take an ID that is in fact held on Ethernet. The contradiction check then
+//! reports it, so it is loud rather than silent. Cache fresh entries if a real
+//! emulator turns out to give up that fast.
+//!
+//! ponytail: a move is only noticed when the moved node transmits. One that
+//! moves and stays silent waits out ENTRY_TTL. Nothing cheaper exists; the TTL
+//! is the backstop.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use pnet::util::MacAddr;
 
-use crate::node::{aarp_request, aarp_response, frame, probe, BROADCAST_MAC};
-use crate::wire::{Addr, Encode, Frame, Llap, AARP, LLAP_ACK, LLAP_ENQ};
+use crate::node::{aarp_action, aarp_request, aarp_response, frame, mac_for, probe, AarpAction, BROADCAST_MAC};
+use crate::wire::{
+    Aarp, Addr, Body, Ddp, Encode, Frame, Llap, Packet, AARP, DDP, LLAP_ACK, LLAP_ENQ,
+    LLAP_LONG_DDP, LLAP_SHORT_DDP,
+};
 
 /// How long a node stays believed-in without being heard from. PDF 2-10 ages
 /// AMT entries the same way — confirm on traffic, delete on expiry,
@@ -133,6 +159,15 @@ pub enum Action {
     ToLocal(Llap),
     /// Something an operator needs to know. Rare by construction.
     Report(String),
+}
+
+/// What arrived, or a bare tick when nothing did.
+// ponytail: nothing constructs a Bridge until Task 8 wires the bridge in.
+#[allow(dead_code)]
+pub enum In<'a> {
+    Ether(&'a Packet),
+    Local(&'a Llap),
+    Tick,
 }
 
 // ponytail: nothing constructs a Bridge until Task 8 wires the bridge in.
@@ -312,6 +347,199 @@ impl Bridge {
                 self.nodes.insert(n, Entry { side, confirmed: now, doubted: false });
             }
         }
+        out
+    }
+
+    /// A destination nobody has claimed: ask both links at once, under one
+    /// pending entry, since either answer settles the question.
+    fn ask_both(&mut self, node: u8, now: Instant) -> Vec<Action> {
+        if self.pending.contains_key(&node) {
+            return Vec::new();
+        }
+        self.pending.insert(node, Pending { asked: now, owed: Owed::Nothing, moved_to: None });
+        let target = Addr { net: self.addr.net, node };
+        let a = aarp_request(self.addr, self.mac, target);
+        vec![
+            Action::ToEther(frame(self.mac, BROADCAST_MAC, AARP, a.to_bytes())),
+            Action::ToLocal(Llap::control(node, node, LLAP_ENQ)),
+        ]
+    }
+
+    /// What arrived, or nothing at all. `Tick` exists so entries expire and
+    /// unanswered questions resolve on a quiet link as well as a busy one.
+    pub fn step(&mut self, input: In, now: Instant) -> Vec<Action> {
+        let mut out = self.expire(now);
+        match input {
+            In::Tick => {}
+            In::Ether(p) => out.extend(self.on_ether(p, now)),
+            In::Local(l) => out.extend(self.on_local(l, now)),
+        }
+        out
+    }
+
+    // Named `on_ether`/`on_local`, not `from_ether`/`from_local` as the brief
+    // spelled them: clippy's `wrong_self_convention` reads a `from_*` method
+    // as a conversion constructor and flags one that takes `&mut self`.
+    fn on_ether(&mut self, p: &Packet, now: Instant) -> Vec<Action> {
+        // A promiscuous capture hears our own transmissions.
+        if p.frame.src == self.mac {
+            return Vec::new();
+        }
+        match &p.body {
+            Body::Aarp(a) => self.ether_aarp(p, a, now),
+            Body::Ddp(d, _) => self.ether_ddp(p, d, now),
+            Body::Unknown => Vec::new(),
+        }
+    }
+
+    fn ether_aarp(&mut self, p: &Packet, a: &Aarp, now: Instant) -> Vec<Action> {
+        // Defend our own address exactly as a node does.
+        if let AarpAction::AnswerTo(to) = aarp_action(p, self.addr, self.mac, false) {
+            let r = aarp_response(self.addr, self.mac, a.src, to);
+            return vec![Action::ToEther(frame(self.mac, to, AARP, r.to_bytes()))];
+        }
+        // A Response proves where its sender is. A Probe proves nothing: its
+        // source address is only tentative (PDF 87).
+        if a.op == 2 {
+            if a.src.net != self.addr.net {
+                self.amt.insert(a.src, a.src_hw);
+                return Vec::new();
+            }
+            let side = Side::Ether(a.src_hw);
+            let mut out = self.confirm(a.src.node, side, now);
+            out.extend(self.settle(a.src.node, side, now));
+            return out;
+        }
+        // Requests and Probes, for an address on our own cable.
+        if (a.op == 1 || a.op == 3) && a.dst.net == self.addr.net && a.dst.node != self.addr.node {
+            let n = a.dst.node;
+            let owed = Owed::EtherResponse { to: a.src, to_mac: a.src_hw };
+            return match self.live(n) {
+                // A resolve only routes traffic, and the data path re-verifies,
+                // so the table is good enough to answer from.
+                Some(Side::Local) if a.op == 1 => {
+                    let src = Addr { net: self.addr.net, node: n };
+                    let r = aarp_response(src, self.mac, a.src, a.src_hw);
+                    vec![Action::ToEther(frame(self.mac, a.src_hw, AARP, r.to_bytes()))]
+                }
+                // A claim denies an address, so it is never answered from
+                // memory: that is how a returning node gets locked out of its
+                // own ID forever.
+                Some(Side::Local) => self.ask(n, Ask::Local, owed, None, now),
+                // Demonstrably on Ethernet: it will answer for itself.
+                Some(Side::Ether(_)) => Vec::new(),
+                None => self.ask(n, Ask::Local, owed, None, now),
+            };
+        }
+        Vec::new()
+    }
+
+    fn ether_ddp(&mut self, p: &Packet, d: &Ddp, now: Instant) -> Vec<Action> {
+        let mut out = Vec::new();
+        if d.src.net == self.addr.net {
+            out.extend(self.confirm(d.src.node, Side::Ether(p.frame.src), now));
+            // A datagram from a node we believed was on LocalTalk is either a
+            // reflection or a node that moved. Repeat nothing until we know.
+            if self.live(d.src.node).is_none() && self.nodes.contains_key(&d.src.node) {
+                return out;
+            }
+        } else {
+            // The router relaying for a distant network: a MAC we may need,
+            // but not a node on this cable.
+            self.amt.insert(d.src, p.frame.src);
+        }
+
+        // Ours, not something to repeat.
+        if d.dst.net == self.addr.net && d.dst.node == self.addr.node {
+            return out;
+        }
+        // Off-cable unicast is the router's business. A broadcast is not:
+        // every node on the cable is meant to hear one.
+        if d.dst.net != self.addr.net && d.dst.node != 255 {
+            return out;
+        }
+
+        let cross = |out: &mut Vec<Action>| {
+            out.push(Action::ToLocal(Llap {
+                dst: d.dst.node,
+                src: d.src.node,
+                typ: LLAP_LONG_DDP,
+                // Verbatim: re-encoding would put the hop count and any
+                // checksum at risk for no gain.
+                data: p.frame.payload.clone(),
+            }));
+        };
+
+        if d.dst.node == 255 {
+            cross(&mut out);
+            return out;
+        }
+        match self.live(d.dst.node) {
+            Some(Side::Local) => cross(&mut out),
+            Some(Side::Ether(_)) => {}
+            None if self.nodes.contains_key(&d.dst.node) => {} // doubted; hold off
+            None => {
+                // Forward optimistically — an answer cannot arrive before the
+                // datagram it would have filtered — then find out for next time.
+                cross(&mut out);
+                let q = self.ask_both(d.dst.node, now);
+                out.extend(q);
+            }
+        }
+        out
+    }
+
+    fn on_local(&mut self, l: &Llap, now: Instant) -> Vec<Action> {
+        match l.typ {
+            LLAP_SHORT_DDP | LLAP_LONG_DDP => self.local_ddp(l, now),
+            // Never answered from cache: an ACK denies an address, and a
+            // memory of a node that has since left would deny it wrongly.
+            LLAP_ENQ => self.ask(l.dst, Ask::Ether, Owed::LocalAck, None, now),
+            LLAP_ACK => {
+                let mut out = self.confirm(l.src, Side::Local, now);
+                out.extend(self.settle(l.src, Side::Local, now));
+                out
+            }
+            // RTS and CTS arbitrate a shared medium Ethernet does not have,
+            // and any other data type belongs to another LLAP client.
+            _ => Vec::new(),
+        }
+    }
+
+    fn local_ddp(&mut self, l: &Llap, now: Instant) -> Vec<Action> {
+        let mut out = self.confirm(l.src, Side::Local, now);
+        // A frame from a node we believed was on Ethernet is either a
+        // reflection or a node that moved. Repeat nothing until we know.
+        if self.live(l.src).is_none() && self.nodes.contains_key(&l.src) {
+            return out;
+        }
+        let (dst, bytes) = match l.typ {
+            // LocalTalk omits the network numbers when both ends share a net;
+            // the bridge's own net is what was being omitted (PDF 118).
+            LLAP_SHORT_DDP => match Ddp::from_short(&l.data, self.addr.net, l.dst, l.src) {
+                Some(d) => (d.dst, d.to_bytes()),
+                None => return out,
+            },
+            // Already extended: pass the bytes through untouched.
+            _ => match Ddp::parse(&l.data) {
+                Some(d) => (d.dst, l.data.clone()),
+                None => return out,
+            },
+        };
+        let mac = if l.dst == 255 || dst.node == 255 {
+            BROADCAST_MAC
+        } else if dst.net == self.addr.net {
+            match self.live(dst.node) {
+                Some(Side::Ether(m)) => m,
+                // Unknown, doubted, or on LocalTalk already: broadcast and let
+                // the cable sort it out.
+                _ => BROADCAST_MAC,
+            }
+        } else {
+            // Off-cable: the router's MAC, if we have gleaned it.
+            mac_for(&self.amt, dst)
+        };
+        out.push(Action::ToEther(frame(self.mac, mac, DDP, bytes)));
         out
     }
 }
@@ -575,5 +803,322 @@ mod tests {
         // all. The old guard (`live() != Some(Ether(_))`) let that gap
         // through and proxied anyway; the fix tells the two `None`s apart.
         assert!(b.settle(12, Side::Local, t).is_empty());
+    }
+
+    // `Body`, `Ddp`, `Packet` and `DDP` already arrive through `use super::*`
+    // once Step 3 extends the module's imports; only `DdpBody` is new here.
+    use crate::wire::DdpBody;
+
+    /// An Ethernet frame carrying a DDP datagram, as it would arrive.
+    fn ether_ddp(src_mac: MacAddr, src: Addr, dst: Addr, typ: u8) -> Packet {
+        let d = Ddp {
+            hops: 0,
+            length: 17,
+            checksum: 0,
+            dst,
+            dst_socket: 253,
+            src,
+            src_socket: 252,
+            typ,
+            data: vec![1, 2, 3, 4],
+        };
+        let payload = d.to_bytes();
+        Packet {
+            frame: Frame { dst: BROADCAST_MAC, src: src_mac, proto: DDP, snap: true, payload },
+            body: Body::Ddp(d, DdpBody::Unknown),
+        }
+    }
+
+    /// An Ethernet frame carrying AARP.
+    fn ether_aarp(src_mac: MacAddr, op: u16, src: Addr, dst: Addr) -> Packet {
+        let a = crate::wire::Aarp { op, src_hw: src_mac, src, dst_hw: MacAddr::zero(), dst };
+        let payload = a.to_bytes();
+        Packet {
+            frame: Frame { dst: BROADCAST_MAC, src: src_mac, proto: AARP, snap: true, payload },
+            body: Body::Aarp(a),
+        }
+    }
+
+    /// An LLAP long-DDP frame, as it would arrive off the group.
+    fn local_ddp(src: u8, dst: u8) -> Llap {
+        let d = Ddp {
+            hops: 0,
+            length: 17,
+            checksum: 0,
+            dst: Addr { net: NET, node: dst },
+            dst_socket: 253,
+            src: Addr { net: NET, node: src },
+            src_socket: 252,
+            typ: 3,
+            data: vec![1, 2, 3, 4],
+        };
+        Llap { dst, src, typ: LLAP_LONG_DDP, data: d.to_bytes() }
+    }
+
+    #[test]
+    fn our_own_frames_are_never_repeated() {
+        let mut b = bridge();
+        let p = ether_ddp(our_mac(), Addr { net: NET, node: 3 }, Addr { net: NET, node: 12 }, 3);
+        assert!(b.step(In::Ether(&p), t0()).is_empty());
+    }
+
+    #[test]
+    fn an_ethernet_broadcast_reaches_localtalk_verbatim() {
+        let mut b = bridge();
+        let src = Addr { net: NET, node: 3 };
+        let p = ether_ddp(peer_mac(), src, Addr { net: NET, node: 255 }, 3);
+        let out = b.step(In::Ether(&p), t0());
+        assert_eq!(
+            out,
+            vec![Action::ToLocal(Llap {
+                dst: 255,
+                src: 3,
+                typ: LLAP_LONG_DDP,
+                data: p.frame.payload.clone(),
+            })]
+        );
+    }
+
+    #[test]
+    fn traffic_between_two_ethernet_nodes_stays_on_ethernet() {
+        let mut b = bridge();
+        let t = t0();
+        // Both ends demonstrably on Ethernet.
+        b.confirm(3, Side::Ether(peer_mac()), t);
+        b.confirm(12, Side::Ether(peer_mac()), t);
+        let p = ether_ddp(peer_mac(), Addr { net: NET, node: 3 }, Addr { net: NET, node: 12 }, 3);
+        assert!(b.step(In::Ether(&p), t).is_empty());
+    }
+
+    #[test]
+    fn traffic_for_a_localtalk_node_crosses() {
+        let mut b = bridge();
+        let t = t0();
+        b.confirm(12, Side::Local, t);
+        let p = ether_ddp(peer_mac(), Addr { net: NET, node: 3 }, Addr { net: NET, node: 12 }, 3);
+        let out = b.step(In::Ether(&p), t);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], Action::ToLocal(l) if l.dst == 12 && l.typ == LLAP_LONG_DDP));
+    }
+
+    #[test]
+    fn an_unknown_destination_is_forwarded_and_asked_about() {
+        let mut b = bridge();
+        let p = ether_ddp(peer_mac(), Addr { net: NET, node: 3 }, Addr { net: NET, node: 12 }, 3);
+        let out = b.step(In::Ether(&p), t0());
+        // Forwarded optimistically — the answer cannot arrive before the datagram
+        // it would have filtered — then both links are asked.
+        assert_eq!(out.len(), 3);
+        assert!(matches!(out[0], Action::ToLocal(_)));
+        assert!(matches!(out[1], Action::ToEther(_)));
+        assert!(matches!(out[2], Action::ToLocal(_)));
+    }
+
+    #[test]
+    fn datagrams_addressed_to_the_bridge_are_not_repeated() {
+        let mut b = bridge();
+        let p = ether_ddp(peer_mac(), Addr { net: NET, node: 3 }, us(), 3);
+        let out = b.step(In::Ether(&p), t0());
+        assert!(out.iter().all(|a| !matches!(a, Action::ToLocal(_))));
+    }
+
+    #[test]
+    fn a_localtalk_long_ddp_crosses_byte_for_byte() {
+        let mut b = bridge();
+        let t = t0();
+        b.confirm(3, Side::Ether(peer_mac()), t);
+        let l = local_ddp(12, 3);
+        let out = b.step(In::Local(&l), t);
+        match &out[..] {
+            [Action::ToEther(f)] => {
+                // Verbatim: a re-encode would risk the hop count and any checksum.
+                assert_eq!(f.payload, l.data);
+                assert_eq!(f.dst, peer_mac());
+                assert_eq!(f.src, our_mac());
+                assert_eq!(f.proto, DDP);
+            }
+            other => panic!("expected one Ethernet frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_localtalk_short_ddp_is_lifted_to_the_extended_form() {
+        let mut b = bridge();
+        let t = t0();
+        // Short header: length 9, sockets 253/252, DDP type 3, 4 bytes of data.
+        let l = Llap {
+            dst: 3,
+            src: 12,
+            typ: LLAP_SHORT_DDP,
+            data: vec![0x00, 0x09, 253, 252, 3, 0xde, 0xad, 0xbe, 0xef],
+        };
+        b.confirm(3, Side::Ether(peer_mac()), t);
+        let out = b.step(In::Local(&l), t);
+        match &out[..] {
+            [Action::ToEther(f)] => {
+                let d = Ddp::parse(&f.payload).unwrap();
+                // The net comes from the cable the bridge sits on; the nodes from
+                // the LLAP header.
+                assert_eq!(d.src, Addr { net: NET, node: 12 });
+                assert_eq!(d.dst, Addr { net: NET, node: 3 });
+                assert_eq!(d.data, [0xde, 0xad, 0xbe, 0xef]);
+            }
+            other => panic!("expected one Ethernet frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_localtalk_broadcast_goes_to_the_appletalk_multicast() {
+        let mut b = bridge();
+        let l = local_ddp(12, 255);
+        match &b.step(In::Local(&l), t0())[..] {
+            [Action::ToEther(f)] => assert_eq!(f.dst, BROADCAST_MAC),
+            other => panic!("expected one Ethernet frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_enq_is_probed_for_rather_than_answered_from_memory() {
+        let mut b = bridge();
+        let t = t0();
+        // Even with the ID sitting in the table as an Ethernet resident.
+        b.confirm(12, Side::Ether(peer_mac()), t);
+        let out = b.step(In::Local(&Llap::control(12, 12, LLAP_ENQ)), t);
+        match &out[..] {
+            [Action::ToEther(f)] => {
+                assert_eq!(crate::wire::Aarp::parse(&f.payload).unwrap().op, 3);
+            }
+            other => panic!("expected one AARP Probe, got {other:?}"),
+        }
+        // And the ACK only follows once Ethernet actually answers.
+        let resp = ether_aarp(peer_mac(), 2, Addr { net: NET, node: 12 }, us());
+        let out = b.step(In::Ether(&resp), t);
+        assert!(out.contains(&Action::ToLocal(Llap::control(12, 12, LLAP_ACK))));
+    }
+
+    #[test]
+    fn a_request_for_a_localtalk_node_is_proxied_from_cache() {
+        let mut b = bridge();
+        let t = t0();
+        b.confirm(12, Side::Local, t);
+        let asker = Addr { net: NET, node: 3 };
+        let req = ether_aarp(peer_mac(), 1, asker, Addr { net: NET, node: 12 });
+        match &b.step(In::Ether(&req), t)[..] {
+            [Action::ToEther(f)] => {
+                let a = crate::wire::Aarp::parse(&f.payload).unwrap();
+                assert_eq!(a.op, 2);
+                assert_eq!(a.src, Addr { net: NET, node: 12 });
+                assert_eq!(a.src_hw, our_mac());
+            }
+            other => panic!("expected one AARP Response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_probe_for_a_localtalk_node_is_re_verified_first() {
+        let mut b = bridge();
+        let t = t0();
+        b.confirm(12, Side::Local, t);
+        let probe_pkt = ether_aarp(peer_mac(), 3, Addr { net: NET, node: 12 }, Addr { net: NET, node: 12 });
+        // No Response yet: a claim is never answered from memory, or a returning
+        // node would be locked out of its own ID forever.
+        let out = b.step(In::Ether(&probe_pkt), t);
+        assert_eq!(out, vec![Action::ToLocal(Llap::control(12, 12, LLAP_ENQ))]);
+        // The ACK from LocalTalk proves it is still there, and only then do we
+        // answer the prober.
+        let out = b.step(In::Local(&Llap::control(12, 12, LLAP_ACK)), t);
+        match &out[..] {
+            [Action::ToEther(f)] => assert_eq!(crate::wire::Aarp::parse(&f.payload).unwrap().op, 2),
+            other => panic!("expected one AARP Response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn we_still_defend_our_own_address() {
+        let mut b = bridge();
+        let p = ether_aarp(peer_mac(), 3, us(), us());
+        match &b.step(In::Ether(&p), t0())[..] {
+            [Action::ToEther(f)] => {
+                let a = crate::wire::Aarp::parse(&f.payload).unwrap();
+                assert_eq!(a.op, 2);
+                assert_eq!(a.src, us());
+            }
+            other => panic!("expected one AARP Response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_node_heard_on_the_wrong_side_is_dropped_until_re_verified() {
+        let mut b = bridge();
+        let t = t0();
+        b.confirm(12, Side::Local, t);
+        // 12 turns up sourcing traffic on Ethernet.
+        let p = ether_ddp(peer_mac(), Addr { net: NET, node: 12 }, Addr { net: NET, node: 3 }, 3);
+        let out = b.step(In::Ether(&p), t);
+        // The frame is not repeated; only the question goes out.
+        assert_eq!(out, vec![Action::ToLocal(Llap::control(12, 12, LLAP_ENQ))]);
+    }
+
+    #[test]
+    fn a_moved_node_resumes_forwarding_once_the_old_side_stays_quiet() {
+        let mut b = bridge();
+        let t = t0();
+        b.confirm(12, Side::Local, t);
+        let p = ether_ddp(peer_mac(), Addr { net: NET, node: 12 }, Addr { net: NET, node: 3 }, 3);
+        b.step(In::Ether(&p), t);
+        let out = b.step(In::Tick, t + QUERY_TIMEOUT);
+        assert_eq!(out, vec![Action::Report("node 12 moved to Ethernet".into())]);
+        // And traffic *to* it now stays on Ethernet rather than crossing.
+        let to12 = ether_ddp(peer_mac(), Addr { net: NET, node: 3 }, Addr { net: NET, node: 12 }, 3);
+        assert!(b.step(In::Ether(&to12), t + QUERY_TIMEOUT).is_empty());
+    }
+
+    #[test]
+    fn a_doubted_node_is_not_proxied_for() {
+        let mut b = bridge();
+        let t = t0();
+        b.confirm(12, Side::Local, t);
+        let p = ether_ddp(peer_mac(), Addr { net: NET, node: 12 }, Addr { net: NET, node: 3 }, 3);
+        b.step(In::Ether(&p), t);
+        // While in doubt we answer no AARP on its behalf: a returning node must be
+        // able to claim its own ID.
+        let req = ether_aarp(peer_mac(), 1, Addr { net: NET, node: 3 }, Addr { net: NET, node: 12 });
+        let out = b.step(In::Ether(&req), t);
+        assert!(!out.iter().any(|a| matches!(a, Action::ToEther(_))));
+    }
+
+    #[test]
+    fn control_frames_never_cross_to_ethernet() {
+        let mut b = bridge();
+        for typ in [0x84u8, 0x85] {
+            assert!(b.step(In::Local(&Llap::control(1, 2, typ)), t0()).is_empty());
+        }
+    }
+
+    #[test]
+    fn another_llap_client_is_not_our_business() {
+        let mut b = bridge();
+        // Type $10 is a data packet for some other client entirely.
+        let l = Llap { dst: 3, src: 12, typ: 0x10, data: vec![0x00, 0x02] };
+        assert!(b.step(In::Local(&l), t0()).is_empty());
+    }
+
+    #[test]
+    fn an_unknown_destination_is_asked_about_on_both_links_at_once() {
+        let mut b = bridge();
+        let out = b.ask_both(12, t0());
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0], Action::ToEther(_)));
+        assert_eq!(out[1], Action::ToLocal(Llap::control(12, 12, LLAP_ENQ)));
+    }
+
+    #[test]
+    fn off_net_unicast_is_the_routers_business_not_ours() {
+        let mut b = bridge();
+        let t = t0();
+        b.confirm(12, Side::Local, t);
+        // Addressed to a node on the far side of the router.
+        let p = ether_ddp(peer_mac(), Addr { net: NET, node: 3 }, Addr { net: 2905, node: 9 }, 3);
+        assert!(b.step(In::Ether(&p), t).is_empty());
     }
 }
