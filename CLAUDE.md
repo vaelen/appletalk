@@ -98,14 +98,19 @@ Confirmed working:
   real cable.
 - Defending the address — peers resolve us by AARP and their replies arrive.
 - ZIP GetNetInfo, including a **broadcast** reply and adopting the default zone.
-- `zones`, `nodes` and `ping` on the local cable.
+- Refusing a taken address: `--node` at an address another node holds gets an
+  AARP Response and fails with "is taken" rather than stealing it.
+- `zones`, `nodes` and `ping` on the local cable. The internet has 36 zones,
+  which is 435 bytes of length-prefixed names — inside one ATP response, so
+  this has still never paged.
 - `nodes <zone>` against a **remote** zone: the router explodes our BrRq into
   FwdReqs across the internet and replies come back from the far network.
 - `ping` to a node on a remote network, routed over the tunnel.
 
-Not yet exercised, so do not assume these work: an address collision during the
-probe, the routerless branch, a zone list long enough to page more than once, a
-reply with no zone multicast address, `--net`, and Phase 1. The book settles
+Not yet exercised, so do not assume these work: retrying after a collision (as
+opposed to detecting one, which is confirmed), the routerless branch, a zone
+list long enough to page more than once, a reply with no zone multicast
+address, `--net`, and Phase 1. The book settles
 byte layouts, not behavior — cross-check with `tcpdump -e -x` before trusting
 anything on that second list.
 

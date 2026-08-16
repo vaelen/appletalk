@@ -16,13 +16,13 @@ These paths remain unexercised, and each one has already proven to be where the
 bugs hide:
 
 | Path | Why it matters |
-|---------------------------------------|------------------------------------------------------------|
-| An address collision during the probe | The "that address is taken, pick another" loop has never fired |
-| A network with no router              | Only ever run by accident, while a bug made a routed network look routerless |
-| A zone list needing more than one page | `next_start` paging and `MAX_ZONE_PAGES` are book-only. The internet now has at least two zones, so this may be closer than it was |
-| A reply with no zone multicast address | Accepted since the `Option<MacAddr>` change, never seen |
-| `--net`                               | Every live run so far used `--node` or no flag at all |
-| A Phase 1 network                     | We only ever transmit Phase 2 |
+|----------------------------------------|------------------------------------------------------------|
+| Retrying after a collision              | Detection works — `--node` at a taken address correctly refuses. But that path errors out by design; the *pick another and probe again* loop in `claim_any`/`claim_in_range` only runs when a random pick collides, which has not happened |
+| A network with no router                | Only ever run by accident, while a bug made a routed network look routerless |
+| A zone list needing more than one page  | Still book-only. The live internet has 36 zones, but as length-prefixed strings that is 435 bytes — inside the 578 an ATP response carries, so the router answers in one packet. Roughly 50 zones would force a second page |
+| A reply with no zone multicast address  | Accepted since the `Option<MacAddr>` change, never seen |
+| `--net`                                 | Every live run so far used `--node` or no flag at all |
+| A Phase 1 network                       | We only ever transmit Phase 2 |
 
 ## Protocols not yet parsed
 
