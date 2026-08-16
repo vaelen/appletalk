@@ -10,7 +10,9 @@ The node has met a real internet: a `jrouter v0.0.21-dev` seed router at
 `6800.1` with zone `68k Mac Club`, and a second network (2905, zone `BabCom`)
 reached over an AURP tunnel. That confirmed the full startup sequence including
 the re-pick into the cable range, AARP defense, ZIP GetNetInfo, `zones`, and
-both `nodes` and `ping` against local *and* remote networks.
+both `nodes` and `ping` against local *and* remote networks. Also confirmed:
+`--net` on and off the cable range, refusing an address another node holds, and
+the routerless branch with the router switched off.
 
 These paths remain unexercised, and each one has already proven to be where the
 bugs hide:
@@ -18,10 +20,8 @@ bugs hide:
 | Path | Why it matters |
 |----------------------------------------|------------------------------------------------------------|
 | Retrying after a collision              | Detection works — `--node` at a taken address correctly refuses. But that path errors out by design; the *pick another and probe again* loop in `claim_any`/`claim_in_range` only runs when a random pick collides, which has not happened |
-| A network with no router                | Only ever run by accident, while a bug made a routed network look routerless |
 | A zone list needing more than one page  | Still book-only. The live internet has 36 zones, but as length-prefixed strings that is 435 bytes — inside the 578 an ATP response carries, so the router answers in one packet. Roughly 50 zones would force a second page |
 | A reply with no zone multicast address  | Accepted since the `Option<MacAddr>` change, never seen |
-| `--net`                                 | Every live run so far used `--node` or no flag at all |
 | A Phase 1 network                       | We only ever transmit Phase 2 |
 
 ## Protocols not yet parsed

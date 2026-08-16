@@ -90,13 +90,19 @@ fn run_node(
             if n.ping(addr, *count)? { Ok(()) } else { std::process::exit(1) }
         }
         cli::Command::Zones => {
-            if n.router().is_none() {
+            let Some(router) = n.router() else {
                 // Not a failure: a routerless network genuinely has no zones.
                 eprintln!("no router: this network has no zones");
                 return Ok(());
-            }
+            };
             let ours = n.zone().to_string();
-            for z in n.zone_list()? {
+            let zones = n.zone_list()?;
+            if zones.is_empty() {
+                // A router that answers but lists nothing is a real answer, and
+                // saying so beats printing nothing and exiting successfully.
+                eprintln!("router {router} answered with an empty zone list");
+            }
+            for z in zones {
                 // Mark the zone we are actually in.
                 let mark = if z == ours { " *" } else { "" };
                 println!("{z}{mark}");

@@ -107,10 +107,13 @@ Confirmed working:
   FwdReqs across the internet and replies come back from the far network.
 - `ping` to a node on a remote network, routed over the tunnel.
 
+Also confirmed: `--net`, both on and off the cable range; and the **routerless
+branch**, by switching the router off — the node keeps its provisional address
+and `zones` reports that the network has none.
+
 Not yet exercised, so do not assume these work: retrying after a collision (as
-opposed to detecting one, which is confirmed), the routerless branch, a zone
-list long enough to page more than once, a reply with no zone multicast
-address, `--net`, and Phase 1. The book settles
+opposed to detecting one, which is confirmed), a zone list long enough to page
+more than once, a reply with no zone multicast address, and Phase 1. The book settles
 byte layouts, not behavior — cross-check with `tcpdump -e -x` before trusting
 anything on that second list.
 

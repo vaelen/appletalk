@@ -343,8 +343,12 @@ impl Node {
                     // The user asked for this address specifically; it is
                     // their business that it falls outside the cable range,
                     // and we say what we did rather than second-guessing it.
+                    // Worth spelling out: a router only routes to networks it
+                    // serves, so replies to an off-cable address never arrive
+                    // and every query that needs the router will time out.
                     eprintln!(
-                        "{} is outside this cable's range {}-{}; keeping it as requested",
+                        "{} is outside this cable's range {}-{}; keeping it as \
+                         requested, but the router will not route replies to it",
                         n.addr, range.0, range.1
                     );
                 } else {
