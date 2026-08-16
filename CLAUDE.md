@@ -83,9 +83,21 @@ pdftotext -f 209 -l 212 inside-appletalk-second-edition.pdf -
 a parser, not after.** Every layout in `wire/` has been verified against it;
 keep it that way.
 
-Still untested against a live AppleTalk network — the book settles the byte
-layouts, not our behavior. Cross-check with `tcpdump -e -x` before trusting a
-decode of real traffic.
+## What a live network has confirmed
+
+Verified 2026-08-16 against a real segment: a `jrouter v0.0.21-dev` seed router
+at `6800.1`, cable range 6800-6800, one zone (`68k Mac Club`), with a Mac and a
+Netatalk box on it. Confirmed working: the AARP probe and claim, defending the
+address (peers resolved us and their replies arrived), ZIP GetNetInfo including
+a **broadcast** reply and adopting the default zone, `zones`, `nodes`, and
+`ping`.
+
+Not yet exercised, so do not assume these work: an address collision during the
+probe, the routerless branch, re-picking when the cable range excludes our
+provisional net, a zone list long enough to page more than once, a reply with
+no zone multicast address, and Phase 1. The book settles byte layouts, not
+behavior — cross-check with `tcpdump -e -x` before trusting anything on that
+second list.
 
 ```sh
 sudo setcap cap_net_raw+ep target/debug/appletalk   # or run as root

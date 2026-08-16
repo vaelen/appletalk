@@ -530,7 +530,8 @@ impl Node {
                 // 6; we knowingly send from our dynamic socket (128) instead —
                 // ATP replies go back to whatever socket asked, and `Session`
                 // classifies on the responder's socket, so this works by
-                // construction. Unconfirmed against real hardware.
+                // construction — and a jrouter seed router answered it happily
+                // on 2026-08-16, so at least one real router does not care.
                 self.send_ddp(router, 6, DDP_ATP, body.clone())?;
                 reply = self.wait(Instant::now() + ZONE_INTERVAL, |n, p| {
                     if !zone_reply_matches(p, router, tid) {
