@@ -1,7 +1,8 @@
 # appletalk
 
-An AppleTalk protocol stack in Rust: a passive EtherTalk sniffer, and a node
-that claims an address and asks the network questions.
+An AppleTalk protocol stack in Rust: a passive EtherTalk sniffer, a node that
+claims an address and asks the network questions, and a bridge that puts
+emulated Macs onto your real AppleTalk network.
 
 It speaks AppleTalk Phase 2 over Ethernet (802.3 + LLC + SNAP). Point it at a
 NIC on a segment with vintage Macs, a Netatalk box, or an AppleTalk router, and
@@ -27,9 +28,10 @@ $ appletalk ping -c 2 6800.3
 
 ## What it decodes
 
-| Protocol | What it is                                        | Status              |
-|----------|---------------------------------------------------|---------------------|
+| Protocol | What it is                                         | Status              |
+|----------|----------------------------------------------------|---------------------|
 | ELAP     | AppleTalk over Ethernet framing, Phase 1 and 2     | Parsed and encoded  |
+| LLAP     | AppleTalk over LocalTalk framing, and its node IDs | Parsed and encoded  |
 | AARP     | Address resolution — claim, probe, defend          | Parsed and encoded  |
 | DDP      | Datagrams, the layer everything else rides on      | Parsed and encoded  |
 | NBP      | Name lookup: `object:type@zone` to an address      | Parsed and encoded  |
@@ -146,6 +148,53 @@ A target containing `:` or `@` is looked up through NBP first; anything else is
 parsed as `net.node`. AEP has no sequence number, so the round-trip time comes
 from a marker planted in the echo data. Exits non-zero if nothing answers.
 
+### bridge — put emulated Macs on the real network
+
+```sh
+appletalk bridge udp
+```
+
+Repeats AppleTalk between the Ethernet cable and LocalTalk-over-UDP-multicast
+(LToUDP) — the transport Mini vMac, Snow, jrouter and tashrouter all speak.
+Emulated Macs on the multicast group become ordinary nodes on your EtherTalk
+network: they show up in the Chooser, answer a `nodes` run from another machine,
+and can mount a real file server. Traffic goes both ways.
+
+```
+$ appletalk bridge udp
+listening on eth0
+claimed 6800.53, zone "68k Mac Club", router 6800.1
+bridging 6800.53 <-> LToUDP 239.192.76.84:1954
+```
+
+It is a **bridge, not a router**: one network number, one node-ID space, and no
+routing or zone protocols of its own. The cable's real router keeps that job,
+and its RTMP and ZIP traffic reaches the LocalTalk side because the bridge
+repeats it like anything else. That is what lets an emulator see zones on the
+far side of an AURP tunnel — the router answers it directly.
+
+The two sides arbitrate addresses differently, so the bridge translates rather
+than repeats:
+
+| Layer                        | What the bridge does                                    |
+|------------------------------|---------------------------------------------------------|
+| DDP datagrams                | Repeated both ways, extended headers byte for byte      |
+| Short DDP headers            | Lifted to extended form on the way out to Ethernet      |
+| AARP (Ethernet)              | Terminated. Answered on behalf of LocalTalk nodes       |
+| LLAP ENQ/ACK (LocalTalk)     | Terminated. Answered on behalf of Ethernet nodes        |
+
+It claims an AppleTalk address of its own, so it takes one node ID and accepts
+the same `-i`, `--net` and `--node` flags as the query commands. Multicast needs
+no special privilege, but the Ethernet side still wants `CAP_NET_RAW`.
+
+Run **one bridge per Ethernet segment and group**. Broadcasts flood both ways,
+and a second bridge on the same pair will storm — there is no spanning tree to
+stop it.
+
+`bridge.md` documents the forwarding rules, every message it prints, and the
+known limits, for when something does not arrive and you need to know why.
+`LToUDP.md` specifies the wire protocol itself, for implementing it elsewhere.
+
 ## Addressing
 
 Everything except `monitor` needs an AppleTalk address, because a router can
@@ -158,7 +207,7 @@ You can short-circuit that:
 
 | Flag                | Effect                                                    |
 |---------------------|-----------------------------------------------------------|
-| `--net <net>`       | Claim an address on this network; the node number is ours to pick |
+| `--net <net>`       | Claim an address on this network; we pick the node number |
 | `--node <net.node>` | Claim exactly this address                                |
 
 Neither is second-guessed if the router disagrees about the cable range — it
@@ -167,20 +216,30 @@ dropped on exit; nothing is saved between invocations.
 
 ## Status
 
-The wire layer is complete for AARP, DDP, NBP, ATP, AEP and ZIP, with
+The wire layer is complete for AARP, DDP, NBP, ATP, AEP, ZIP and LLAP, with
 round-trip tests built from byte literals. RTMP, ADSP, ASP, PAP and AFP are not
 parsed yet.
 
 Verified against a live AppleTalk internet — a seed router, a couple of vintage
 Macs, and a second network reached over an AURP tunnel. The address claim, AARP
-defense, ZIP GetNetInfo, and all three query commands work, against both the
-local cable and a remote zone across the tunnel. Not yet exercised on real
-hardware: address collisions during the probe, networks with no router, zone
-lists long enough to need a second page, and Phase 1 networks.
+defense, ZIP GetNetInfo and all three query commands work against both the local
+cable and a remote zone across the tunnel, and so does a routerless cable with
+the router switched off.
 
-This node asks questions but does not answer them. It registers no NBP name, so
+The bridge is verified against real hardware too: emulators on the multicast
+group and machines on the Ethernet cable reach each other in both directions,
+and an emulator sees every zone on the internet, including those on the far side
+of the tunnel.
+
+Not yet exercised on real hardware: retrying after an address collision — as
+opposed to detecting one, which works — zone lists long enough to need a second
+page, and Phase 1 networks. On the bridge specifically: a node moving between
+the two sides, a genuine duplicate node ID, and a second bridge on one pair.
+
+The node asks questions but does not answer them. It registers no NBP name, so
 it is invisible to a `nodes` run from another machine, and it does not reply to
-echoes.
+echoes. The bridge is the exception: it answers AARP and LLAP enquiries on
+behalf of the nodes it fronts.
 
 ## Development
 
@@ -191,7 +250,8 @@ cargo clippy --all-targets
 
 Both are expected to be clean before every commit. `CLAUDE.md` documents the
 conventions; `appletalk.md` is the protocol reference and carries an index from
-each section to its page in the book.
+each section to its page in the book. `bridge.md` and `LToUDP.md` cover the
+bridge's behaviour and the LToUDP wire protocol respectively.
 
 ## License
 

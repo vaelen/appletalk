@@ -110,6 +110,13 @@ Confirmed working:
 - `nodes <zone>` against a **remote** zone: the router explodes our BrRq into
   FwdReqs across the internet and replies come back from the far network.
 - `ping` to a node on a remote network, routed over the tunnel.
+- `bridge udp` against emulators on a real LToUDP group: unicast reaches them
+  from the Ethernet cable and reaches back the other way, so the address
+  translation works in both directions. An emulator also sees the **whole**
+  zone list, including zones across the AURP tunnel — which means RTMP and ZIP
+  cross intact and the router answers a LocalTalk node through the bridge.
+  That is the load-bearing confirmation: the bridge is transparent, not merely
+  moving packets.
 
 Also confirmed: `--net`, both on and off the cable range; and the **routerless
 branch**, by switching the router off — the node keeps its provisional address
@@ -117,12 +124,12 @@ and `zones` reports that the network has none.
 
 Not yet exercised, so do not assume these work: retrying after a collision (as
 opposed to detecting one, which is confirmed), a zone list long enough to page
-more than once, a reply with no zone multicast address, and Phase 1. **The
-bridge as a whole is unverified** — it has never run against real hardware, so
-nothing in `bridge.md` is confirmed behavior; least of all a node moving between
-the two links, a genuine duplicate node ID across the bridge, and a second
-bridge on the same pair. The book settles byte layouts, not behavior —
-cross-check with `tcpdump -e -x` before trusting anything on that second list.
+more than once, a reply with no zone multicast address, and Phase 1. On the
+bridge specifically, still unconfirmed: a node **moving** between the two links,
+a genuine duplicate node ID across the bridge, a second bridge on the same pair,
+entry aging after a node goes quiet, and that Ethernet-to-Ethernet traffic stays
+off the LToUDP group. The book settles byte layouts, not behavior — cross-check
+with `tcpdump -e -x` before trusting anything on that second list.
 
 ```sh
 sudo setcap cap_net_raw+ep target/debug/appletalk   # or run as root
