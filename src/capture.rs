@@ -8,7 +8,7 @@ use std::io;
 use std::net::Ipv4Addr;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use pnet::datalink::{self, Channel::Ethernet, Config, DataLinkReceiver, DataLinkSender};
 use pnet::util::MacAddr;
@@ -130,7 +130,14 @@ fn capture_loop(mut rx: Box<dyn DataLinkReceiver>, tx: SyncSender<Event>) {
                 Some(packet) => Event::Packet { at: SystemTime::now(), packet },
                 None => continue, // not AppleTalk
             },
-            Err(e) => Event::Error(e.to_string()),
+            // A read error that keeps recurring (the NIC going away, say)
+            // would otherwise busy-spin this loop at 100% CPU and flood
+            // stderr; back off first. `ltoudp::read_loop` does the same, so
+            // the two stay consistent.
+            Err(e) => {
+                thread::sleep(Duration::from_millis(100));
+                Event::Error(e.to_string())
+            }
         };
 
         // Report accumulated drops as soon as there is room to say so.

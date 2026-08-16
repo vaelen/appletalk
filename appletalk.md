@@ -66,7 +66,7 @@ data field itself, that length included**; the high 6 bits belong to the client
 protocol. So a data field is 2–600 bytes, and a whole packet 5–603.
 
 A real LocalTalk frame ends with a 2-byte frame check sequence — CRC-CCITT over
-the header and the data field, flags and abort bits excluded (PDF 72). LToUDP
+the header and the data field, flags and abort bits excluded (PDF 70). LToUDP
 strips it; `LToUDP.md` has the rest of that story.
 
 ## Phase 1 vs Phase 2
@@ -92,7 +92,7 @@ specifies every field.
 | Section                         | PDF pages  |
 |---------------------------------|------------|
 | LLAP node IDs and packet format | 65–69      |
-| LLAP timing and framing         | 72–73      |
+| LLAP timing and framing         | 70–73      |
 | AARP packet formats             | 87         |
 | AMT entry aging                 | 87–88      |
 | ELAP packet format              | 93         |

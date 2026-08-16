@@ -50,7 +50,7 @@ use crate::wire::{
     LLAP_LONG_DDP, LLAP_SHORT_DDP,
 };
 
-/// How long a node stays believed-in without being heard from. PDF 2-10 ages
+/// How long a node stays believed-in without being heard from. PDF 87 ages
 /// AMT entries the same way — confirm on traffic, delete on expiry,
 /// re-resolve on demand — so there is no refresh timer here, just expiry.
 ///
@@ -286,7 +286,7 @@ impl Bridge {
     }
 
     /// Pays whatever was owed on `node` now that a side has answered.
-    fn settle(&mut self, node: u8, answered: Side, _now: Instant) -> Vec<Action> {
+    fn settle(&mut self, node: u8, answered: Side) -> Vec<Action> {
         let Some(q) = self.pending.get(&node).copied() else {
             return Vec::new();
         };
@@ -404,7 +404,7 @@ impl Bridge {
             }
             let side = Side::Ether(a.src_hw);
             let mut out = self.confirm(a.src.node, side, now);
-            out.extend(self.settle(a.src.node, side, now));
+            out.extend(self.settle(a.src.node, side));
             return out;
         }
         // Requests and Probes, for an address on our own cable.
@@ -457,6 +457,19 @@ impl Bridge {
         }
 
         let cross = |out: &mut Vec<Action>| {
+            // `Ddp::parse` deliberately does not check `d.length` against what
+            // actually arrived (fail-closed parsers reject a short buffer, not
+            // a dishonest length field), so a node on the cable can claim a
+            // small length while its frame carries far more payload. Forwarding
+            // that verbatim would emit an LToUDP datagram no conformant
+            // receiver — including our own `inbound` — accepts: an LLAP data
+            // field is legal only at 13..=600 bytes here, and only when it
+            // agrees with DDP's own length field. Fail closed, same reasoning
+            // as dropping Phase 1 above.
+            let len = p.frame.payload.len();
+            if !(13..=600).contains(&len) || d.length as usize != len {
+                return;
+            }
             out.push(Action::ToLocal(Llap {
                 dst: d.dst.node,
                 src: d.src.node,
@@ -500,7 +513,7 @@ impl Bridge {
             LLAP_ENQ => self.ask(l.dst, Ask::Ether, Owed::LocalAck, None, now),
             LLAP_ACK => {
                 let mut out = self.confirm(l.src, Side::Local, now);
-                out.extend(self.settle(l.src, Side::Local, now));
+                out.extend(self.settle(l.src, Side::Local));
                 out
             }
             // RTS and CTS arbitrate a shared medium Ethernet does not have,
@@ -530,19 +543,27 @@ impl Bridge {
             },
         };
         let mac = if l.dst == 255 || dst.node == 255 {
-            BROADCAST_MAC
+            Some(BROADCAST_MAC)
         } else if dst.net == self.addr.net {
             match self.live(dst.node) {
-                Some(Side::Ether(m)) => m,
-                // Unknown, doubted, or on LocalTalk already: broadcast and let
-                // the cable sort it out.
-                _ => BROADCAST_MAC,
+                Some(Side::Ether(m)) => Some(m),
+                // LToUDP is a shared bus: everyone on the group, including a
+                // destination we believe is on LocalTalk, already received
+                // this datagram directly. Repeating it onto Ethernet's
+                // broadcast MAC would interrupt every real node on the cable
+                // for traffic that was never theirs — mirrors the
+                // `Some(Side::Ether(_)) => {}` guard in `ether_ddp`.
+                Some(Side::Local) => None,
+                // Unknown or doubted: broadcast and let the cable sort it out.
+                None => Some(BROADCAST_MAC),
             }
         } else {
             // Off-cable: the router's MAC, if we have gleaned it.
-            mac_for(&self.amt, dst)
+            Some(mac_for(&self.amt, dst))
         };
-        out.push(Action::ToEther(frame(self.mac, mac, DDP, bytes)));
+        if let Some(mac) = mac {
+            out.push(Action::ToEther(frame(self.mac, mac, DDP, bytes)));
+        }
         out
     }
 }
@@ -565,8 +586,13 @@ pub fn run(
 ) -> io::Result<()> {
     let mut b = Bridge::new(addr, tx.mac, amt);
     loop {
+        // Sampled after the blocking receive, not before: taken any earlier,
+        // `now` could be up to TICK stale by the time an event is actually
+        // handled, and a query answer arriving right at its timeout would be
+        // (wrongly) treated as late.
+        let event = rx.recv_timeout(TICK);
         let now = Instant::now();
-        let actions = match rx.recv_timeout(TICK) {
+        let actions = match event {
             Ok(Event::Packet { packet, .. }) => b.step(In::Ether(&packet), now),
             Ok(Event::Ltoudp { llap, .. }) => b.step(In::Local(&llap), now),
             Ok(Event::Dropped(n)) => {
@@ -781,7 +807,7 @@ mod tests {
         let mut b = bridge();
         let t = t0();
         b.ask(12, Ask::Ether, Owed::LocalAck, None, t);
-        let out = b.settle(12, Side::Ether(peer_mac()), t);
+        let out = b.settle(12, Side::Ether(peer_mac()));
         assert_eq!(out, vec![Action::ToLocal(Llap::control(12, 12, LLAP_ACK))]);
     }
 
@@ -791,7 +817,7 @@ mod tests {
         let t = t0();
         let asker = Addr { net: NET, node: 3 };
         b.ask(12, Ask::Local, Owed::EtherResponse { to: asker, to_mac: peer_mac() }, None, t);
-        let out = b.settle(12, Side::Local, t);
+        let out = b.settle(12, Side::Local);
         match &out[..] {
             [Action::ToEther(f)] => {
                 let a = crate::wire::Aarp::parse(&f.payload).unwrap();
@@ -812,7 +838,7 @@ mod tests {
         // Owed an ACK if *Ethernet* holds the ID; LocalTalk answering proves
         // the opposite and settles nothing.
         b.ask(12, Ask::Ether, Owed::LocalAck, None, t);
-        assert!(b.settle(12, Side::Local, t).is_empty());
+        assert!(b.settle(12, Side::Local).is_empty());
     }
 
     #[test]
@@ -821,7 +847,7 @@ mod tests {
         let t = t0();
         b.ask(12, Ask::Ether, Owed::LocalAck, None, t);
         b.expire(t + QUERY_TIMEOUT);
-        assert!(b.settle(12, Side::Ether(peer_mac()), t + QUERY_TIMEOUT).is_empty());
+        assert!(b.settle(12, Side::Ether(peer_mac())).is_empty());
     }
 
     #[test]
@@ -834,7 +860,7 @@ mod tests {
         b.confirm(12, Side::Ether(peer_mac()), t);
         // Answering as the LocalTalk node now would hijack an Ethernet node's
         // address, so the debt is cancelled rather than paid.
-        assert!(b.settle(12, Side::Local, t).is_empty());
+        assert!(b.settle(12, Side::Local).is_empty());
     }
 
     #[test]
@@ -856,7 +882,7 @@ mod tests {
         // nor confirmed Local — it is `live() == None`, same as no entry at
         // all. The old guard (`live() != Some(Ether(_))`) let that gap
         // through and proxied anyway; the fix tells the two `None`s apart.
-        assert!(b.settle(12, Side::Local, t).is_empty());
+        assert!(b.settle(12, Side::Local).is_empty());
     }
 
     // `Body`, `Ddp`, `Packet` and `DDP` already arrive through `use super::*`
@@ -956,6 +982,32 @@ mod tests {
     }
 
     #[test]
+    fn a_payload_that_disagrees_with_its_own_ddp_length_is_dropped_not_crossed() {
+        let mut b = bridge();
+        let t = t0();
+        b.confirm(12, Side::Local, t);
+        // The DDP header still says length 17 (13 + 4 data bytes), but the
+        // Ethernet frame actually carries far more — the length field cannot
+        // be trusted (`Ddp::parse` never checks it), so this must not reach
+        // LToUDP as an oversized, malformed datagram.
+        let mut p = ether_ddp(peer_mac(), Addr { net: NET, node: 3 }, Addr { net: NET, node: 12 }, 3);
+        p.frame.payload.resize(601, 0);
+        assert!(b.step(In::Ether(&p), t).is_empty());
+    }
+
+    #[test]
+    fn a_payload_within_bounds_but_shorter_than_its_own_length_field_is_dropped() {
+        let mut b = bridge();
+        let t = t0();
+        b.confirm(12, Side::Local, t);
+        // Still a legal LLAP data-field size (13..=600), but the bytes present
+        // do not match what the DDP header claims — equally untrustworthy.
+        let mut p = ether_ddp(peer_mac(), Addr { net: NET, node: 3 }, Addr { net: NET, node: 12 }, 3);
+        p.frame.payload.truncate(15);
+        assert!(b.step(In::Ether(&p), t).is_empty());
+    }
+
+    #[test]
     fn an_unknown_destination_is_forwarded_and_asked_about() {
         let mut b = bridge();
         let p = ether_ddp(peer_mac(), Addr { net: NET, node: 3 }, Addr { net: NET, node: 12 }, 3);
@@ -1029,6 +1081,17 @@ mod tests {
             [Action::ToEther(f)] => assert_eq!(f.dst, BROADCAST_MAC),
             other => panic!("expected one Ethernet frame, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn localtalk_to_localtalk_unicast_is_never_repeated_onto_ethernet() {
+        let mut b = bridge();
+        let t = t0();
+        // Both ends already live on LocalTalk — the shared bus already
+        // delivered this to node 3 directly, so nothing should cross.
+        b.confirm(3, Side::Local, t);
+        let l = local_ddp(12, 3);
+        assert!(b.step(In::Local(&l), t).is_empty());
     }
 
     #[test]

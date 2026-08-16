@@ -103,7 +103,7 @@ must not attribute any meaning to it beyond "mine" or "not mine".
 Everything after offset 4 is an LLAP packet as it would appear on a real
 LocalTalk bus, **minus the frame check sequence**. On the wire an LLAP frame
 ends with a 2-byte CRC-CCITT computed over the destination node ID, source node
-ID, type byte and data field (PDF 72). LToUDP strips it before sending and never
+ID, type byte and data field (PDF 70). LToUDP strips it before sending and never
 expects one back: UDP already carries a checksum, and the frame preamble, flag
 bytes, bit stuffing and abort sequence of the real link are meaningless here.
 
@@ -257,5 +257,5 @@ in full.
 | Topic                           | PDF pages |
 |---------------------------------|-----------|
 | LLAP node IDs and packet format | 65–69     |
-| LLAP timing, framing, FCS       | 72–73     |
+| LLAP timing, framing, FCS       | 70–73     |
 | Short vs extended DDP header    | 118       |

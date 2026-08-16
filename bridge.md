@@ -55,6 +55,10 @@ The source is dealt with **first**, before any decision about the destination.
 | Destination is one we are unsure about           | Held — nothing crosses until the doubt clears                 |
 | Destination is unknown                           | Crosses anyway, and **both** links are asked who holds the ID |
 
+A payload whose size disagrees with its own DDP length field, or that falls
+outside 13–600 bytes, is dropped instead of crossing — whichever row above
+matched — so a malformed frame is never repeated onto LToUDP.
+
 ### Arriving on LocalTalk
 
 | Frame                                       | What happens                                                           |
@@ -72,12 +76,13 @@ The source is dealt with **first**, before any decision about the destination.
 
 A datagram going out to Ethernet is addressed:
 
-| Destination                                     | Ethernet address used            |
-|-------------------------------------------------|----------------------------------|
-| Node 255, in either the LLAP or the DDP header  | AppleTalk broadcast              |
-| A node known to be on Ethernet                  | That node's MAC                  |
-| A node on another network                       | The router's MAC, if it is known |
-| Anything else — unknown, in doubt, or LocalTalk | AppleTalk broadcast              |
+| Destination                                    | Ethernet address used                                   |
+|------------------------------------------------|---------------------------------------------------------|
+| Node 255, in either the LLAP or the DDP header | AppleTalk broadcast                                     |
+| A node known to be on Ethernet                 | That node's MAC                                         |
+| A node on another network                      | The router's MAC, if it is known                        |
+| A node already known to be on LocalTalk        | Not sent — the shared bus already delivered it directly |
+| Anything else — unknown or in doubt            | AppleTalk broadcast                                     |
 
 ## Discovery and arbitration
 
@@ -134,18 +139,19 @@ and then stays silent is not noticed at all until its entry expires.
 Everything below goes to standard error. Silence is the normal state: apart from
 the startup lines, every message means something wanted attention.
 
-| Message                                                | Meaning                                                         |
-|--------------------------------------------------------|-----------------------------------------------------------------|
-| `listening on <interface>`                             | The capture started on that NIC                                 |
-| `claimed <net.node>, zone "<zone>", router <net.node>` | Address claimed, router answered. A normal start                |
-| `claimed <net.node>, no router on this network`        | Nothing answered; the network has no zones                      |
-| `<net.node> is outside this cable's range …`           | `--node` pinned an address the router will not route replies to |
-| `bridging <net.node> <-> LToUDP 239.192.76.84:1954`    | Running. Nothing more is printed in normal operation            |
-| `bridge: node N moved to Ethernet` (or `to LocalTalk`) | N appeared on the other link and the old one went quiet         |
-| `bridge: node N answered on both sides — …`            | Two nodes hold one ID, or a second bridge is reflecting         |
-| `bridge: ethernet: <error>`, `bridge: ltoudp: <error>` | One frame could not be sent; the far end will retransmit        |
-| `dropped N frames (queue full)`                        | It fell behind and lost N frames — a gap in forwarding          |
-| `rx: <error>`                                          | A capture or socket read error                                  |
+| Message                                                | Meaning                                                                                                                                     |
+|--------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
+| `appletalk: <error>`                                   | Fatal — the bridge did not start: address taken, no address available in range, or capture could not open (typically missing `CAP_NET_RAW`) |
+| `listening on <interface>`                             | The capture started on that NIC                                                                                                             |
+| `claimed <net.node>, zone "<zone>", router <net.node>` | Address claimed, router answered. A normal start                                                                                            |
+| `claimed <net.node>, no router on this network`        | Nothing answered; the network has no zones                                                                                                  |
+| `<net.node> is outside this cable's range …`           | `--node` pinned an address the router will not route replies to                                                                             |
+| `bridging <net.node> <-> LToUDP 239.192.76.84:1954`    | Running. Nothing more is printed in normal operation                                                                                        |
+| `bridge: node N moved to Ethernet` (or `to LocalTalk`) | N appeared on the other link and the old one went quiet                                                                                     |
+| `bridge: node N answered on both sides — …`            | Two nodes hold one ID, or a second bridge is reflecting                                                                                     |
+| `bridge: ethernet: <error>`, `bridge: ltoudp: <error>` | One frame could not be sent; the far end will retransmit                                                                                    |
+| `dropped N frames (queue full)`                        | It fell behind and lost N frames — a gap in forwarding                                                                                      |
+| `rx: <error>`                                          | A capture or socket read error                                                                                                              |
 
 `answered on both sides` is the one that needs a human: two nodes really do hold
 that ID, or a second bridge is repeating our own traffic back at us. Nothing is
@@ -160,9 +166,12 @@ forwarded to that ID until the entry ages out.
   cable range spanning several nets bridges only into the first.
 - **A silent move waits out the 30-second lifetime.** A move is only noticed
   when the moved node transmits.
-- **A node-ID enquiry costs a round trip.** A node whose enquiry series is
-  shorter than one AARP round trip could take an ID that is in fact held on
-  Ethernet. The duplicate report then makes that loud rather than silent.
+- **A node-ID enquiry costs a round trip.** A LocalTalk node whose enquiry
+  series is faster than one AARP round trip can claim an ID that Ethernet
+  already holds. Real LLAP arbitration completes in milliseconds, so this is
+  the *expected* outcome the first time an emulator boots onto the group
+  against a held ID, not a bug — the bridge reports `answered on both sides`
+  rather than preventing it.
 - **Phase 1 (non-SNAP) Ethernet frames are dropped**, not forwarded: such a
   frame has no length field to trim Ethernet's padding by, so repeating it would
   produce a packet that disagreed with its own length.
