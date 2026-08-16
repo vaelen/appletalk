@@ -110,6 +110,7 @@ impl Side {
 enum Ask {
     Ether,
     Local,
+    Both,
 }
 
 /// What is owed to whom when a query is answered.
@@ -179,6 +180,11 @@ pub struct Bridge {
     nodes: HashMap<u8, Entry>,
     /// Gleaned address-to-MAC for addresses on *other* networks — the router
     /// and everything beyond it. On-net MACs come from `nodes`.
+    ///
+    /// ponytail: grows without bound — every off-net address ever heard stays
+    /// forever, unlike `nodes` there is no TTL. Fine for one router's worth of
+    /// traffic; age it out (and give `node::mac_for` a clock) if a busy
+    /// network ever makes this map large.
     amt: HashMap<Addr, MacAddr>,
     pending: HashMap<u8, Pending>,
 }
@@ -255,8 +261,8 @@ impl Bridge {
         Vec::new()
     }
 
-    /// Puts a question to one link. `pending` doubles as the rate limit: a
-    /// second query while one is in flight is suppressed.
+    /// Puts a question to one link, or both. `pending` doubles as the rate
+    /// limit: a second query while one is in flight is suppressed.
     fn ask(
         &mut self,
         node: u8,
@@ -265,7 +271,10 @@ impl Bridge {
         moved_to: Option<Side>,
         now: Instant,
     ) -> Vec<Action> {
-        if self.pending.contains_key(&node) {
+        // Node 0 and 255 are never real nodes (PDF 66); a wire byte naming
+        // one must not drive an AARP Request/Probe or an ENQ onto either
+        // link. Same guard `confirm` makes at its own entry point.
+        if node == 0 || node == 255 || self.pending.contains_key(&node) {
             return Vec::new();
         }
         self.pending.insert(node, Pending { asked: now, owed, moved_to });
@@ -285,6 +294,15 @@ impl Bridge {
             // An ENQ we never act on is inert: only receipt of an ACK makes a
             // node give up an ID (PDF 65), so this asks without claiming.
             Ask::Local => vec![Action::ToLocal(Llap::control(node, node, LLAP_ENQ))],
+            // A destination nobody has claimed: ask both links at once,
+            // since either answer settles the question.
+            Ask::Both => {
+                let a = aarp_request(self.addr, self.mac, target);
+                vec![
+                    Action::ToEther(frame(self.mac, BROADCAST_MAC, AARP, a.to_bytes())),
+                    Action::ToLocal(Llap::control(node, node, LLAP_ENQ)),
+                ]
+            }
         }
     }
 
@@ -351,18 +369,10 @@ impl Bridge {
     }
 
     /// A destination nobody has claimed: ask both links at once, under one
-    /// pending entry, since either answer settles the question.
+    /// pending entry. Thin wrapper so `ask` stays the only owner of the
+    /// pending insert, the rate limit, and the reserved-ID guard.
     fn ask_both(&mut self, node: u8, now: Instant) -> Vec<Action> {
-        if self.pending.contains_key(&node) {
-            return Vec::new();
-        }
-        self.pending.insert(node, Pending { asked: now, owed: Owed::Nothing, moved_to: None });
-        let target = Addr { net: self.addr.net, node };
-        let a = aarp_request(self.addr, self.mac, target);
-        vec![
-            Action::ToEther(frame(self.mac, BROADCAST_MAC, AARP, a.to_bytes())),
-            Action::ToLocal(Llap::control(node, node, LLAP_ENQ)),
-        ]
+        self.ask(node, Ask::Both, Owed::Nothing, None, now)
     }
 
     /// What arrived, or nothing at all. `Tick` exists so entries expire and
@@ -383,6 +393,14 @@ impl Bridge {
     fn on_ether(&mut self, p: &Packet, now: Instant) -> Vec<Action> {
         // A promiscuous capture hears our own transmissions.
         if p.frame.src == self.mac {
+            return Vec::new();
+        }
+        // Phase 1 has no length field to trim Ethernet's padding by
+        // (wire::Frame's own ponytail note), so a DDP payload forwarded
+        // verbatim would carry trailing pad bytes and disagree with its own
+        // length field once parsed on the other side. We only ever transmit
+        // Phase 2 (CLAUDE.md); drop rather than emit a malformed frame.
+        if !p.frame.snap {
             return Vec::new();
         }
         match &p.body {
@@ -492,6 +510,12 @@ impl Bridge {
     fn on_local(&mut self, l: &Llap, now: Instant) -> Vec<Action> {
         match l.typ {
             LLAP_SHORT_DDP | LLAP_LONG_DDP => self.local_ddp(l, now),
+            // Defend our own address exactly as the Ethernet side does (row
+            // 2). This is not the cached-ENQ shortcut we refuse below: our
+            // own ID is not a memory of some other node, it is authoritative.
+            LLAP_ENQ if l.dst == self.addr.node => {
+                vec![Action::ToLocal(Llap::control(l.dst, l.dst, LLAP_ACK))]
+            }
             // Never answered from cache: an ACK denies an address, and a
             // memory of a node that has since left would deny it wrongly.
             LLAP_ENQ => self.ask(l.dst, Ask::Ether, Owed::LocalAck, None, now),
@@ -1120,5 +1144,39 @@ mod tests {
         // Addressed to a node on the far side of the router.
         let p = ether_ddp(peer_mac(), Addr { net: NET, node: 3 }, Addr { net: 2905, node: 9 }, 3);
         assert!(b.step(In::Ether(&p), t).is_empty());
+    }
+
+    #[test]
+    fn we_still_defend_our_own_address_on_localtalk() {
+        let mut b = bridge();
+        let n = us().node;
+        let out = b.step(In::Local(&Llap::control(n, n, LLAP_ENQ)), t0());
+        // Authoritative, not the cached-ENQ shortcut: it is our own address.
+        assert_eq!(out, vec![Action::ToLocal(Llap::control(n, n, LLAP_ACK))]);
+    }
+
+    #[test]
+    fn an_off_cable_broadcast_still_crosses_to_localtalk() {
+        let mut b = bridge();
+        // Off-cable, but node 255: the router-relayed broadcast every node on
+        // the cable is meant to hear, not the off-cable unicast that guard
+        // also has to reject.
+        let p = ether_ddp(peer_mac(), Addr { net: 2905, node: 9 }, Addr { net: 2905, node: 255 }, 3);
+        let out = b.step(In::Ether(&p), t0());
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], Action::ToLocal(l) if l.dst == 255 && l.typ == LLAP_LONG_DDP));
+    }
+
+    #[test]
+    fn a_malformed_short_header_is_dropped() {
+        let mut b = bridge();
+        // Length field says 9; only 7 bytes actually follow.
+        let l = Llap {
+            dst: 3,
+            src: 12,
+            typ: LLAP_SHORT_DDP,
+            data: vec![0x00, 0x09, 253, 252, 3, 0xde, 0xad],
+        };
+        assert!(b.step(In::Local(&l), t0()).is_empty());
     }
 }
