@@ -154,12 +154,16 @@ impl Bridge {
     pub fn new(addr: Addr, mac: MacAddr, amt: HashMap<Addr, MacAddr>) -> Bridge {
         let now = Instant::now();
         // Everything already gleaned on our own net is an Ethernet resident:
-        // it was heard over ELAP, which is proof enough to start with.
+        // it was heard over ELAP, which is proof enough to start with. Node 0
+        // and 255 are never real nodes (PDF 66), the same check `confirm`
+        // makes at its own entry point into the table.
         let nodes = amt
             .iter()
-            .filter(|(a, _)| a.net == addr.net && a.node != addr.node)
+            .filter(|(a, _)| a.net == addr.net && a.node != addr.node && a.node != 0 && a.node != 255)
             .map(|(a, m)| (a.node, Entry { side: Side::Ether(*m), confirmed: now, doubted: false }))
             .collect();
+        // `amt` holds only off-net addresses; on-net MACs live in `nodes`.
+        let amt = amt.into_iter().filter(|(a, _)| a.net != addr.net).collect();
         Bridge { addr, mac, nodes, amt, pending: HashMap::new() }
     }
 
@@ -190,6 +194,11 @@ impl Bridge {
                 return Vec::new();
             }
             self.nodes.insert(node, Entry { side: believed, confirmed: now, doubted: true });
+            // A contradiction needs its own move-check; let it displace a
+            // query already in flight rather than being suppressed by it —
+            // otherwise the node stays dark for ENTRY_TTL instead of the
+            // much shorter QUERY_TIMEOUT.
+            self.pending.remove(&node);
             return self.ask(node, believed.link(), Owed::Nothing, Some(side), now);
         }
 
@@ -263,10 +272,14 @@ impl Bridge {
             }
             Owed::EtherResponse { to, to_mac } if answered == Side::Local => {
                 self.pending.remove(&node);
-                // Never proxy against evidence: if Ethernet answered for the
-                // ID while the question was out, answering as the LocalTalk
-                // node would hijack an Ethernet node's address.
-                if matches!(self.live(node), Some(Side::Ether(_))) {
+                // Never proxy against evidence. `live()` collapses "no entry
+                // at all" and "entry doubted" into the same `None`, but they
+                // must not be treated alike here: no entry means this answer
+                // is the first word on the node, and is trusted; an entry
+                // that exists and is doubted or confirmed elsewhere is
+                // contested, and proxying over that gap would be exactly the
+                // hijack this guards against.
+                if self.nodes.contains_key(&node) && self.live(node) != Some(Side::Local) {
                     return Vec::new();
                 }
                 // Answer as the LocalTalk node, giving our own MAC — which is
@@ -326,6 +339,16 @@ mod tests {
         let b = Bridge::new(us(), our_mac(), amt);
         assert_eq!(b.live(3), Some(Side::Ether(peer_mac())));
         assert_eq!(b.live(9), None);
+    }
+
+    #[test]
+    fn seeding_never_makes_an_entry_for_a_reserved_node() {
+        let mut amt = HashMap::new();
+        amt.insert(Addr { net: NET, node: 0 }, peer_mac());
+        amt.insert(Addr { net: NET, node: 255 }, peer_mac());
+        let b = Bridge::new(us(), our_mac(), amt);
+        assert_eq!(b.live(0), None);
+        assert_eq!(b.live(255), None);
     }
 
     #[test]
@@ -529,6 +552,28 @@ mod tests {
         b.confirm(12, Side::Ether(peer_mac()), t);
         // Answering as the LocalTalk node now would hijack an Ethernet node's
         // address, so the debt is cancelled rather than paid.
+        assert!(b.settle(12, Side::Local, t).is_empty());
+    }
+
+    #[test]
+    fn a_proxy_response_is_never_sent_for_a_doubted_entry() {
+        let mut b = bridge();
+        let t = t0();
+        // Drive node 12 into the doubted state via a resolved duplicate
+        // contest: LocalTalk first, Ethernet contradicts it, then LocalTalk
+        // itself answers the move-check — both sides really hold the ID.
+        b.confirm(12, Side::Local, t);
+        b.confirm(12, Side::Ether(peer_mac()), t);
+        b.confirm(12, Side::Local, t);
+        assert_eq!(b.live(12), None);
+
+        // Only now does Ethernet ask after the (still-doubted) ID.
+        let asker = Addr { net: NET, node: 3 };
+        b.ask(12, Ask::Local, Owed::EtherResponse { to: asker, to_mac: peer_mac() }, None, t);
+        // LocalTalk answers, but a doubted entry is neither confirmed Ether
+        // nor confirmed Local — it is `live() == None`, same as no entry at
+        // all. The old guard (`live() != Some(Ether(_))`) let that gap
+        // through and proxied anyway; the fix tells the two `None`s apart.
         assert!(b.settle(12, Side::Local, t).is_empty());
     }
 }
