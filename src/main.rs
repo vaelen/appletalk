@@ -62,8 +62,14 @@ fn run_node(
     // Opened first: a port already held by an emulator on this host should
     // fail before we go claiming an AppleTalk address.
     let lt = match cmd {
-        cli::Command::Bridge { link: cli::Link::Udp } => Some(ltoudp::Ltoudp::open(ip)?),
-        _ => None,
+        cli::Command::Bridge { link: cli::Link::Udp } => Some((ltoudp::Ltoudp::open(ip)?, sender)),
+        // The spare producer exists only for the bridge's reader thread; kept
+        // alive on any other path, it would stop the event channel ever
+        // reporting that all producers are gone (the Task 3 bug, reintroduced).
+        _ => {
+            drop(sender);
+            None
+        }
     };
 
     // clap already rejects --node alongside --net, so at most one is set.
@@ -126,8 +132,8 @@ fn run_node(
             }
             Ok(())
         }
-        cli::Command::Bridge { .. } => {
-            let lt = lt.expect("opened above for exactly this command");
+        cli::Command::Bridge { link: cli::Link::Udp } => {
+            let (lt, sender) = lt.expect("opened above for exactly this command");
             let (tx, rx, addr, amt) = n.into_parts();
             // Started only now: until the address is claimed there is nothing
             // to bridge, and `Node::wait` would discard these anyway.

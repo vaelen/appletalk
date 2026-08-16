@@ -30,15 +30,10 @@ pub enum Event {
         packet: wire::Packet,
     },
     /// An LLAP frame off a LocalTalk-shaped link. Posted by `ltoudp`, which
-    /// holds a clone of the same sender the capture thread uses.
-    Ltoudp {
-        // ponytail: captured but unread — `text` never opens a LocalTalk
-        // link, and `bridge::run` only needs `llap`. Wire it in if a monitor
-        // view of the LocalTalk side is ever built.
-        #[allow(dead_code)]
-        at: SystemTime,
-        llap: wire::Llap,
-    },
+    /// holds a clone of the same sender the capture thread uses. No
+    /// timestamp: nothing reads one — `text` never opens a LocalTalk link,
+    /// and `bridge::run` works in `Instant`, not wall-clock time.
+    Ltoudp { llap: wire::Llap },
     /// Frames discarded because the queue was full, counted since the last
     /// report. A frontend that ignores this shows a gap with no explanation.
     Dropped(u64),
@@ -163,9 +158,9 @@ mod tests {
         let (tx, rx) = sync_channel(QUEUE);
         let second = tx.clone();
         let llap = Llap::control(42, 42, 0x81);
-        second.try_send(Event::Ltoudp { at: SystemTime::now(), llap: llap.clone() }).unwrap();
+        second.try_send(Event::Ltoudp { llap: llap.clone() }).unwrap();
         match rx.recv().unwrap() {
-            Event::Ltoudp { llap: got, .. } => assert_eq!(got, llap),
+            Event::Ltoudp { llap: got } => assert_eq!(got, llap),
             other => panic!("wrong event: {other:?}"),
         }
     }

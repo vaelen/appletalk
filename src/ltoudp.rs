@@ -12,7 +12,6 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::thread;
-use std::time::SystemTime;
 
 use socket2::{Domain, Protocol, Socket, Type};
 
@@ -102,7 +101,7 @@ fn read_loop(sock: UdpSocket, id: [u8; 4], tx: SyncSender<Event>) {
     loop {
         let event = match sock.recv_from(&mut buf) {
             Ok((n, _)) => match inbound(&buf[..n], id) {
-                Some(llap) => Event::Ltoudp { at: SystemTime::now(), llap },
+                Some(llap) => Event::Ltoudp { llap },
                 None => continue,
             },
             // ponytail: no backoff, so a recv_from error that keeps recurring
