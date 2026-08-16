@@ -69,6 +69,14 @@ pub fn probe(addr: Addr, mac: MacAddr) -> Aarp {
     Aarp { op: 3, src_hw: mac, src: addr, dst_hw: MacAddr::zero(), dst: addr }
 }
 
+/// "Who has this address?" — a resolve, not a claim. Unlike a Probe it names
+/// our own address as the sender and makes no assertion about the target's, so
+/// nothing has to give way on account of it.
+#[allow(dead_code)] // ponytail: no caller until the bridge frontend (task 8) sends one
+pub fn aarp_request(ours: Addr, our_mac: MacAddr, target: Addr) -> Aarp {
+    Aarp { op: 1, src_hw: our_mac, src: ours, dst_hw: MacAddr::zero(), dst: target }
+}
+
 /// "Yes, that address is mine, at this MAC."
 pub fn aarp_response(ours: Addr, our_mac: MacAddr, to: Addr, to_mac: MacAddr) -> Aarp {
     Aarp { op: 2, src_hw: our_mac, src: ours, dst_hw: to_mac, dst: to }
@@ -114,6 +122,16 @@ pub fn glean(amt: &mut HashMap<Addr, MacAddr>, p: &Packet) {
         }
         _ => {}
     }
+}
+
+/// The MAC to send a datagram to. Unknown means broadcast: everyone on the
+/// cable hears it, and the one it is for answers. Costs an interrupt on other
+/// AppleTalk nodes only.
+pub fn mac_for(amt: &HashMap<Addr, MacAddr>, dst: Addr) -> MacAddr {
+    if dst.node == 255 {
+        return BROADCAST_MAC;
+    }
+    amt.get(&dst).copied().unwrap_or(BROADCAST_MAC)
 }
 
 /// How much of our address the user pinned down for us.
@@ -586,17 +604,19 @@ impl Node {
         self.router
     }
 
+    /// Hands the link and everything learned so far to a long-running frontend.
+    /// The startup sequence is over by the time this is called; what is left is a
+    /// claimed address, a way to send, and the mappings gleaned along the way.
+    #[allow(dead_code)] // ponytail: no caller until the bridge frontend (task 8) borrows it
+    pub fn into_parts(self) -> (Tx, Receiver<Event>, Addr, HashMap<Addr, MacAddr>) {
+        (self.tx, self.rx, self.addr, self.amt)
+    }
+
     /// Transaction and lookup identifiers, so a late reply to a previous
     /// request cannot be mistaken for an answer to this one.
     pub fn next_id(&mut self) -> u16 {
         self.next_id = self.next_id.wrapping_add(1);
         self.next_id
-    }
-
-    fn mac_for(&self, addr: Addr) -> MacAddr {
-        // Unknown means broadcast: everyone on the cable hears it, and the one
-        // it is for answers. Costs an interrupt on other AppleTalk nodes only.
-        self.amt.get(&addr).copied().unwrap_or(BROADCAST_MAC)
     }
 
     fn send_ddp(&mut self, dst: Addr, dst_socket: u8, typ: u8, data: Vec<u8>) -> io::Result<()> {
@@ -612,9 +632,7 @@ impl Node {
         data: Vec<u8>,
     ) -> io::Result<()> {
         let d = datagram(self.addr, src_socket, dst, dst_socket, typ, data);
-        // A broadcast node number always goes to the multicast address.
-        let mac = if dst.node == 255 { BROADCAST_MAC } else { self.mac_for(dst) };
-        let f = frame(self.tx.mac, mac, DDP, d.to_bytes());
+        let f = frame(self.tx.mac, mac_for(&self.amt, dst), DDP, d.to_bytes());
         self.tx.send(&f)
     }
 
@@ -1205,5 +1223,37 @@ mod tests {
         assert_eq!(f.dst, MacAddr::new(0x09, 0x00, 0x07, 0xff, 0xff, 0xff));
         let b = f.to_bytes();
         assert_eq!(&b[14..22], &[0xaa, 0xaa, 0x03, 0x08, 0x00, 0x07, 0x80, 0x9b]);
+    }
+
+    #[test]
+    fn an_aarp_request_resolves_without_claiming() {
+        let mac = MacAddr::new(2, 0, 0, 0, 0, 1);
+        let ours = Addr { net: 6800, node: 7 };
+        let target = Addr { net: 6800, node: 42 };
+        let r = aarp_request(ours, mac, target);
+        // Op 1, and it asserts our own address as the sender rather than the
+        // address being asked about — that is what makes it not a claim.
+        assert_eq!(r.op, 1);
+        assert_eq!(r.src, ours);
+        assert_eq!(r.dst, target);
+        assert_eq!(r.dst_hw, MacAddr::zero());
+        assert_eq!(r.op_name(), "request");
+
+        // A probe, by contrast, puts the address under test in the source.
+        assert_eq!(probe(target, mac).src, target);
+    }
+
+    #[test]
+    fn mac_for_broadcasts_when_it_does_not_know() {
+        let mut amt = HashMap::new();
+        let known = Addr { net: 6800, node: 1 };
+        let mac = MacAddr::new(2, 0, 0, 0, 0, 9);
+        amt.insert(known, mac);
+        assert_eq!(mac_for(&amt, known), mac);
+        assert_eq!(mac_for(&amt, Addr { net: 6800, node: 2 }), BROADCAST_MAC);
+        // A broadcast node number always goes to the multicast address, even if
+        // something absurd is in the table for it.
+        amt.insert(Addr { net: 6800, node: 255 }, mac);
+        assert_eq!(mac_for(&amt, Addr { net: 6800, node: 255 }), BROADCAST_MAC);
     }
 }
