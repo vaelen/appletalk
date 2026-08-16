@@ -33,7 +33,7 @@ fn main() {
         // Only the passive path; a dumper needs no address.
         None | Some(cli::Command::Monitor { .. }) => text::run(events, args.output()),
         Some(cmd) => {
-            if let Err(e) = run_node(cmd, tx, events, args.node.as_deref()) {
+            if let Err(e) = run_node(cmd, tx, events, args.node.as_deref(), args.net) {
                 eprintln!("appletalk: {e}");
                 std::process::exit(1);
             }
@@ -46,11 +46,14 @@ fn run_node(
     cmd: &cli::Command,
     tx: capture::Tx,
     events: std::sync::mpsc::Receiver<capture::Event>,
-    want: Option<&str>,
+    node_arg: Option<&str>,
+    net_arg: Option<u16>,
 ) -> std::io::Result<()> {
-    let want = match want {
-        Some(s) => Some(node::parse_addr(s)?),
-        None => None,
+    // clap already rejects --node alongside --net, so at most one is set.
+    let want = match (node_arg, net_arg) {
+        (Some(s), _) => node::Want::Addr(node::parse_addr(s)?),
+        (None, Some(net)) => node::Want::Net(net),
+        (None, None) => node::Want::Discover,
     };
     let mut n = node::Node::claim(tx, events, want)?;
     match cmd {

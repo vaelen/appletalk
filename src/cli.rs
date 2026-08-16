@@ -19,6 +19,10 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "NET.NODE")]
     pub node: Option<String>,
 
+    /// Claim an address on this network, choosing the node number for you
+    #[arg(long, global = true, value_name = "NET", conflicts_with = "node")]
+    pub net: Option<u16>,
+
     /// Flags for the implicit `monitor`; conflict with naming a subcommand.
     #[command(flatten)]
     output: Output,
@@ -239,6 +243,17 @@ mod tests {
     fn ping_count_must_be_at_least_one() {
         assert!(Cli::try_parse_from(["appletalk", "ping", "-c", "0", "1.2"]).is_err());
         assert!(Cli::try_parse_from(["appletalk", "ping", "-c", "1", "1.2"]).is_ok());
+    }
+
+    #[test]
+    fn net_claims_a_node_number_for_you() {
+        assert_eq!(parse(&["appletalk", "--net", "6800", "zones"]).net, Some(6800));
+        assert_eq!(parse(&["appletalk", "zones", "--net", "6800"]).net, Some(6800));
+        // Naming the whole address and naming only the net are alternatives.
+        assert!(
+            Cli::try_parse_from(["appletalk", "--net", "6800", "--node", "6800.99", "zones"])
+                .is_err()
+        );
     }
 
     #[test]

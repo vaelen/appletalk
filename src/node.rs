@@ -116,6 +116,18 @@ pub fn glean(amt: &mut HashMap<Addr, MacAddr>, p: &Packet) {
     }
 }
 
+/// How much of our address the user pinned down for us.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Want {
+    /// Nothing: pick a provisional address in the startup range and ask a
+    /// router what this cable really is.
+    Discover,
+    /// This network, our choice of node — "I am on this net, give me a node".
+    Net(u16),
+    /// Exactly this address.
+    Addr(Addr),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum NetInfo {
     /// Our provisional network number is valid on this cable.
@@ -127,15 +139,27 @@ pub enum NetInfo {
 /// Reads a ZIP GetNetInfo reply: whether our provisional address survives, the
 /// zone name to adopt, and the address of the router that answered — which is
 /// the only way we learn of a router (PDF 181).
-pub fn netinfo_verdict(p: &Packet, provisional: Addr) -> Option<(NetInfo, String, Addr)> {
+pub fn netinfo_verdict(
+    p: &Packet,
+    provisional: Addr,
+    requested_zone: &str,
+) -> Option<(NetInfo, String, Addr)> {
     let Body::Ddp(d, DdpBody::Zip(Zip::NetInfoReply { range, zone, default_zone, .. })) = &p.body
     else {
         return None;
     };
-    // Capture is promiscuous and GetNetInfo replies are sometimes broadcast
-    // (PDF 187), so another booting node's reply is on the wire too. Only one
-    // addressed to us is ours to adopt.
-    if d.dst != provisional {
+    // Capture is promiscuous and another booting node's reply is on the wire
+    // too, so a reply directed at someone else is not ours.
+    if d.dst.node != 255 && d.dst != provisional {
+        return None;
+    }
+    // Replies are often broadcast rather than directed — observed from a real
+    // router, and PDF 190 provides for it — so the address alone cannot tell
+    // ours apart. The book's own test is the echoed zone name: "nodes
+    // receiving such replies should use this zone name to verify that the
+    // response is for the zone name that they requested. If not, the reply
+    // should be ignored."
+    if zone != requested_zone {
         return None;
     }
     // A range whose end precedes its start is not something we recognise, and
@@ -225,6 +249,9 @@ const PROBE_TRIES: u32 = 10;
 const PROBE_INTERVAL: Duration = Duration::from_millis(200);
 /// How many different addresses to try before giving up entirely.
 const ADDRESS_TRIES: u32 = 5;
+/// We keep no saved zone across runs, so we request the empty zone name — the
+/// "no saved zone" case (PDF 181) — and expect it echoed back in the reply.
+const REQUESTED_ZONE: &str = "";
 /// PDF 181: "retransmitted several times to insure that a response is received".
 const NETINFO_TRIES: u32 = 3;
 const NETINFO_INTERVAL: Duration = Duration::from_secs(1);
@@ -273,7 +300,7 @@ pub struct Node {
 impl Node {
     /// Runs the book's two-step startup and returns a node ready to ask
     /// questions. Narrates to stderr, because stdout is for results.
-    pub fn claim(tx: Tx, rx: Receiver<Event>, want: Option<Addr>) -> io::Result<Node> {
+    pub fn claim(tx: Tx, rx: Receiver<Event>, want: Want) -> io::Result<Node> {
         let mut n = Node {
             tx,
             rx,
@@ -289,7 +316,7 @@ impl Node {
         };
 
         n.addr = match want {
-            Some(a) => {
+            Want::Addr(a) => {
                 // 254 and 255 are reserved on Ethernet (PDF 98). Harmless as a
                 // ping target, but not something to claim as our own address.
                 if a.node == 254 || a.node == 255 {
@@ -301,7 +328,10 @@ impl Node {
                 n.claim_one(a)?;
                 a
             }
-            None => n.claim_any()?,
+            // A range of one network is the same problem as re-picking inside
+            // a cable range: choose a node, probe it, try again if it is taken.
+            Want::Net(net) => n.claim_in_range((net, net))?,
+            Want::Discover => n.claim_any()?,
         };
 
         // Step two: ask a router what this cable actually is.
@@ -309,7 +339,7 @@ impl Node {
             n.router = Some(router);
             n.zone = Some(zone);
             if let NetInfo::Repick { range } = verdict {
-                if want.is_some() {
+                if want != Want::Discover {
                     // The user asked for this address specifically; it is
                     // their business that it falls outside the cable range,
                     // and we say what we did rather than second-guessing it.
@@ -390,14 +420,13 @@ impl Node {
     }
 
     fn get_net_info(&mut self) -> Option<(NetInfo, String, Addr)> {
-        // An empty zone name is the "no saved zone" case (PDF 181).
-        let body = Zip::GetNetInfo { zone: String::new() }.to_bytes();
+        let body = Zip::GetNetInfo { zone: REQUESTED_ZONE.to_string() }.to_bytes();
         let provisional = self.addr;
         for _ in 0..NETINFO_TRIES {
             // ZIP is a socket-6 protocol at both ends.
             self.send_from(6, Addr { net: 0, node: 255 }, 6, DDP_ZIP, body.clone()).ok()?;
             let got = self.wait(Instant::now() + NETINFO_INTERVAL, move |_, p| {
-                netinfo_verdict(p, provisional)
+                netinfo_verdict(p, provisional, REQUESTED_ZONE)
             });
             if got.is_some() {
                 return got;
@@ -850,6 +879,12 @@ mod tests {
     /// A ZIP GetNetInfo reply from router 3.1, for cable range 3–5, zone
     /// "Engineering", optionally correcting an invalid requested zone.
     fn netinfo(range: (u16, u16), zone: &str, default_zone: Option<&str>) -> Packet {
+        netinfo_to(OURS, range, zone, default_zone)
+    }
+
+    /// The same reply, addressed wherever the router chose to send it. Real
+    /// routers broadcast it rather than directing it at the requester.
+    fn netinfo_to(dst: Addr, range: (u16, u16), zone: &str, default_zone: Option<&str>) -> Packet {
         let z = Zip::NetInfoReply {
             flags: 0,
             range,
@@ -857,14 +892,7 @@ mod tests {
             multicast: MacAddr(0x09, 0x00, 0x07, 0x00, 0x00, 0x0f),
             default_zone: default_zone.map(str::to_string),
         };
-        let d = datagram(
-            Addr { net: 3, node: 1 },
-            6,
-            Addr { net: 0xff00, node: 137 },
-            6,
-            DDP_ZIP,
-            z.to_bytes(),
-        );
+        let d = datagram(Addr { net: 3, node: 1 }, 6, dst, 6, DDP_ZIP, z.to_bytes());
         Packet {
             frame: frame(THEIR_MAC, OUR_MAC, DDP, Vec::new()),
             body: Body::Ddp(d, DdpBody::Zip(z)),
@@ -874,7 +902,7 @@ mod tests {
     #[test]
     fn a_provisional_net_inside_the_cable_range_is_kept() {
         let p = netinfo((0xff00, 0xff0a), "Engineering", None);
-        let (verdict, zone, router) = netinfo_verdict(&p, OURS).unwrap();
+        let (verdict, zone, router) = netinfo_verdict(&p, OURS, "Engineering").unwrap();
         assert_eq!(verdict, NetInfo::Keep);
         assert_eq!(zone, "Engineering");
         assert_eq!(router, Addr { net: 3, node: 1 });
@@ -885,21 +913,21 @@ mod tests {
         // range.0..range.1 alone would exclude this end; pin it explicitly.
         // OURS.net is 0xff00, placed at range.1 here rather than range.0.
         let p = netinfo((0xfef0, 0xff00), "Engineering", None);
-        let (verdict, _, _) = netinfo_verdict(&p, OURS).unwrap();
+        let (verdict, _, _) = netinfo_verdict(&p, OURS, "Engineering").unwrap();
         assert_eq!(verdict, NetInfo::Keep);
     }
 
     #[test]
     fn a_provisional_net_outside_the_cable_range_forces_a_repick() {
         let p = netinfo((3, 5), "Engineering", None);
-        let (verdict, _, _) = netinfo_verdict(&p, OURS).unwrap();
+        let (verdict, _, _) = netinfo_verdict(&p, OURS, "Engineering").unwrap();
         assert_eq!(verdict, NetInfo::Repick { range: (3, 5) });
     }
 
     #[test]
     fn an_inverted_cable_range_is_rejected_rather_than_underflowing() {
         let p = netinfo((0xff0a, 0xff00), "Engineering", None);
-        assert!(netinfo_verdict(&p, OURS).is_none());
+        assert!(netinfo_verdict(&p, OURS, "Engineering").is_none());
     }
 
     #[test]
@@ -908,14 +936,38 @@ mod tests {
         // meant for another booting node must not be adopted as ours.
         let p = netinfo((0xff00, 0xff0a), "Engineering", None);
         let other = Addr { net: 3, node: 9 };
-        assert!(netinfo_verdict(&p, other).is_none());
+        assert!(netinfo_verdict(&p, other, "Engineering").is_none());
+    }
+
+    #[test]
+    fn a_broadcast_reply_echoing_our_requested_zone_is_ours() {
+        // What a real router actually sends: the reply goes to the broadcast
+        // address, not to the requester, and echoes the empty zone name we
+        // asked for while supplying the cable's default zone.
+        let ours = Addr { net: 6800, node: 99 };
+        let bcast = Addr { net: 0, node: 255 };
+        let p = netinfo_to(bcast, (6800, 6800), REQUESTED_ZONE, Some("68k Mac Club"));
+        let (verdict, zone, router) = netinfo_verdict(&p, ours, REQUESTED_ZONE).unwrap();
+        assert_eq!(verdict, NetInfo::Keep);
+        assert_eq!(zone, "68k Mac Club");
+        assert_eq!(router, Addr { net: 3, node: 1 });
+    }
+
+    #[test]
+    fn a_broadcast_reply_for_a_different_zone_is_not_ours() {
+        // Broadcast means the address cannot tell replies apart, so the echoed
+        // zone name is the only thing distinguishing another node's from ours.
+        let bcast = Addr { net: 0, node: 255 };
+        let p = netinfo_to(bcast, (0xff00, 0xff0a), "Accounts", None);
+        assert!(netinfo_verdict(&p, OURS, "Engineering").is_none());
     }
 
     #[test]
     fn an_invalid_requested_zone_is_replaced_by_the_default_zone() {
-        // The reply echoes the zone we asked for and appends the real default.
+        // The reply echoes back the zone we asked for — "Nonesuch" — and
+        // appends the cable's real default, which is the one we adopt.
         let p = netinfo((3, 5), "Nonesuch", Some("Engineering"));
-        let (_, zone, _) = netinfo_verdict(&p, OURS).unwrap();
+        let (_, zone, _) = netinfo_verdict(&p, OURS, "Nonesuch").unwrap();
         assert_eq!(zone, "Engineering");
     }
 
@@ -927,7 +979,7 @@ mod tests {
             frame: frame(THEIR_MAC, OUR_MAC, DDP, Vec::new()),
             body: Body::Ddp(d, DdpBody::Zip(z)),
         };
-        assert!(netinfo_verdict(&p, OURS).is_none());
+        assert!(netinfo_verdict(&p, OURS, "Engineering").is_none());
     }
 
     fn lkup_reply(id: u8, tuples: Vec<NbpTuple>) -> Packet {
