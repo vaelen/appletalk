@@ -72,7 +72,6 @@ pub fn probe(addr: Addr, mac: MacAddr) -> Aarp {
 /// "Who has this address?" — a resolve, not a claim. Unlike a Probe it names
 /// our own address as the sender and makes no assertion about the target's, so
 /// nothing has to give way on account of it.
-#[allow(dead_code)] // ponytail: no caller until the bridge frontend (task 8) sends one
 pub fn aarp_request(ours: Addr, our_mac: MacAddr, target: Addr) -> Aarp {
     Aarp { op: 1, src_hw: our_mac, src: ours, dst_hw: MacAddr::zero(), dst: target }
 }
@@ -607,7 +606,6 @@ impl Node {
     /// Hands the link and everything learned so far to a long-running frontend.
     /// The startup sequence is over by the time this is called; what is left is a
     /// claimed address, a way to send, and the mappings gleaned along the way.
-    #[allow(dead_code)] // ponytail: no caller until the bridge frontend (task 8) borrows it
     pub fn into_parts(self) -> (Tx, Receiver<Event>, Addr, HashMap<Addr, MacAddr>) {
         (self.tx, self.rx, self.addr, self.amt)
     }

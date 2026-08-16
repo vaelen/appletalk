@@ -50,8 +50,6 @@ fn inbound(buf: &[u8], id: [u8; 4]) -> Option<Llap> {
     Llap::parse(&buf[4..])
 }
 
-// ponytail: nothing constructs an Ltoudp until Task 8 wires the bridge in.
-#[allow(dead_code)]
 pub struct Ltoudp {
     sock: UdpSocket,
     /// Prefixed to everything we send, and the only way we recognise our own
@@ -60,7 +58,6 @@ pub struct Ltoudp {
     id: [u8; 4],
 }
 
-#[allow(dead_code)]
 impl Ltoudp {
     /// Joins the group. `iface` is the local address to join on; None lets the
     /// kernel choose, which is only right on a single-homed host.

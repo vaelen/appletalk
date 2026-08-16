@@ -75,6 +75,20 @@ pub enum Command {
     },
     /// List the zones on the internet.
     Zones,
+    /// Bridge another AppleTalk link onto this Ethernet, as one network.
+    Bridge {
+        #[command(subcommand)]
+        link: Link,
+    },
+}
+
+/// Which other link to bridge. A subcommand rather than a flag because each
+/// one will want its own options.
+#[derive(Subcommand, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Link {
+    /// LocalTalk over UDP multicast (LToUDP), as Mini vMac, Snow, jrouter and
+    /// tashrouter speak it.
+    Udp,
 }
 
 #[derive(Args, Clone, Default, PartialEq)]
@@ -264,6 +278,31 @@ mod tests {
     #[test]
     fn interface_name_is_no_longer_positional() {
         assert!(Cli::try_parse_from(["appletalk", "eth0"]).is_err());
+    }
+
+    #[test]
+    fn bridge_takes_a_named_link() {
+        let cli = parse(&["appletalk", "bridge", "udp"]);
+        assert!(matches!(cli.command, Some(Command::Bridge { link: Link::Udp })));
+    }
+
+    #[test]
+    fn bridge_needs_a_link() {
+        // The link is what says *which* other network; there is no default.
+        assert!(Cli::try_parse_from(["appletalk", "bridge"]).is_err());
+        assert!(Cli::try_parse_from(["appletalk", "bridge", "tashtalk"]).is_err());
+    }
+
+    #[test]
+    fn bridge_takes_the_global_flags() {
+        for args in [
+            &["appletalk", "-i", "eth0", "bridge", "udp"][..],
+            &["appletalk", "bridge", "udp", "--node", "6800.7"][..],
+            &["appletalk", "--net", "6800", "bridge", "udp"][..],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            assert!(!cli.conflicting_output(), "{args:?}");
+        }
     }
 
     #[test]

@@ -65,7 +65,6 @@ impl Ddp {
     /// short header is only legal on. There is no inverse — PDF 118 permits
     /// extended headers even when both sockets share a network, so nothing here
     /// ever needs to write one back.
-    #[allow(dead_code)]
     pub fn from_short(p: &[u8], net: u16, dst_node: u8, src_node: u8) -> Option<Ddp> {
         let h = p.get(..5)?;
         // The upper 6 bits of the length are not significant (PDF 118).

@@ -58,7 +58,14 @@ fn run_node(
     node_arg: Option<&str>,
     net_arg: Option<u16>,
 ) -> std::io::Result<()> {
-    let capture::Capture { tx, events, .. } = cap;
+    let capture::Capture { tx, events, sender, ip, .. } = cap;
+    // Opened first: a port already held by an emulator on this host should
+    // fail before we go claiming an AppleTalk address.
+    let lt = match cmd {
+        cli::Command::Bridge { link: cli::Link::Udp } => Some(ltoudp::Ltoudp::open(ip)?),
+        _ => None,
+    };
+
     // clap already rejects --node alongside --net, so at most one is set.
     let want = match (node_arg, net_arg) {
         (Some(s), _) => node::Want::Addr(node::parse_addr(s)?),
@@ -118,6 +125,15 @@ fn run_node(
                 println!("{z}{mark}");
             }
             Ok(())
+        }
+        cli::Command::Bridge { .. } => {
+            let lt = lt.expect("opened above for exactly this command");
+            let (tx, rx, addr, amt) = n.into_parts();
+            // Started only now: until the address is claimed there is nothing
+            // to bridge, and `Node::wait` would discard these anyway.
+            lt.spawn(sender)?;
+            eprintln!("bridging {addr} <-> LToUDP {}:{}", ltoudp::GROUP, ltoudp::PORT);
+            bridge::run(tx, rx, lt, addr, amt)
         }
         cli::Command::Monitor { .. } => unreachable!("handled by the passive path"),
     }

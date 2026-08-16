@@ -12,23 +12,14 @@ use std::fmt;
 
 use super::Encode;
 
-// ponytail: only this module's own tests use these until a later task wires
-// the bridge in.
-#[allow(dead_code)]
 pub const LLAP_SHORT_DDP: u8 = 0x01;
-#[allow(dead_code)]
 pub const LLAP_LONG_DDP: u8 = 0x02;
-#[allow(dead_code)]
 pub const LLAP_ENQ: u8 = 0x81;
-#[allow(dead_code)]
 pub const LLAP_ACK: u8 = 0x82;
-#[allow(dead_code)]
 pub const LLAP_RTS: u8 = 0x84;
-#[allow(dead_code)]
 pub const LLAP_CTS: u8 = 0x85;
 
 /// The largest LLAP data field (PDF 68). The header is not counted.
-#[allow(dead_code)]
 const MAX_DATA: usize = 600;
 
 /// An LLAP packet: the 3-byte header and its data field.
@@ -39,7 +30,6 @@ const MAX_DATA: usize = 600;
 ///
 /// ponytail: so this cannot drive real LocalTalk hardware. Add the CRC
 /// (Appendix B) when a link that wants one appears.
-#[allow(dead_code)] // only this module's own tests construct one until a later task wires the bridge in
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Llap {
     pub dst: u8,
@@ -49,7 +39,6 @@ pub struct Llap {
     pub data: Vec<u8>,
 }
 
-#[allow(dead_code)] // only this module's own tests call these until a later task wires the bridge in
 impl Llap {
     pub fn parse(p: &[u8]) -> Option<Self> {
         let h = p.get(..3)?;

@@ -36,10 +36,14 @@
 //! is the backstop.
 
 use std::collections::HashMap;
+use std::io;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use pnet::util::MacAddr;
 
+use crate::capture::{Event, Tx};
+use crate::ltoudp::Ltoudp;
 use crate::node::{aarp_action, aarp_request, aarp_response, frame, mac_for, probe, AarpAction, BROADCAST_MAC};
 use crate::wire::{
     Aarp, Addr, Body, Ddp, Encode, Frame, Llap, Packet, AARP, DDP, LLAP_ACK, LLAP_ENQ,
@@ -52,31 +56,22 @@ use crate::wire::{
 ///
 /// ponytail: fixed rather than adaptive. Make it a flag if a real network
 /// wants otherwise.
-// ponytail: only `expire` reads this, and nothing constructs a Bridge to
-// call it until Task 8 wires the bridge in.
-#[allow(dead_code)]
 const ENTRY_TTL: Duration = Duration::from_secs(30);
 
 /// How long a cross-side query waits for its answer. Matches how long a
 /// requester on either side keeps retrying — `node.rs` probes 10 times at
 /// 200ms — so a debt is never settled after the creditor gave up.
-// ponytail: only `ask` and `expire` read this, and nothing constructs a
-// Bridge to call them until Task 8 wires the bridge in.
-#[allow(dead_code)]
 const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Which link a node lives on. `Ether` carries the MAC because that is what
 /// makes the entry useful for sending; `Local` needs no address beyond the
 /// node ID the map is keyed by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// ponytail: nothing constructs a Bridge until Task 8 wires the bridge in.
-#[allow(dead_code)]
 pub enum Side {
     Ether(MacAddr),
     Local,
 }
 
-#[allow(dead_code)]
 impl Side {
     /// Same link, whatever MAC. Two `Ether` values with different MACs are the
     /// same side — a node changing NIC has not crossed the bridge.
@@ -105,8 +100,6 @@ impl Side {
 /// Which link to put a question to. Distinct from `Side` because a question
 /// carries no MAC — that is exactly what it is asking for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// ponytail: nothing constructs a Bridge until Task 8 wires the bridge in.
-#[allow(dead_code)]
 enum Ask {
     Ether,
     Local,
@@ -115,8 +108,6 @@ enum Ask {
 
 /// What is owed to whom when a query is answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// ponytail: nothing constructs a Bridge until Task 8 wires the bridge in.
-#[allow(dead_code)]
 enum Owed {
     /// A LocalTalk node is claiming this ID; ACK it if Ethernet holds it.
     LocalAck,
@@ -128,8 +119,6 @@ enum Owed {
 }
 
 #[derive(Debug, Clone, Copy)]
-// ponytail: nothing constructs a Bridge until Task 8 wires the bridge in.
-#[allow(dead_code)]
 struct Entry {
     side: Side,
     confirmed: Instant,
@@ -140,8 +129,6 @@ struct Entry {
 }
 
 #[derive(Debug, Clone, Copy)]
-// ponytail: nothing constructs a Bridge until Task 8 wires the bridge in.
-#[allow(dead_code)]
 struct Pending {
     asked: Instant,
     owed: Owed,
@@ -153,8 +140,6 @@ struct Pending {
 /// Something for `run` to do. Pure data, so the whole decision table can be
 /// asserted on without a socket.
 #[derive(Debug, PartialEq, Eq)]
-// ponytail: nothing constructs a Bridge until Task 8 wires the bridge in.
-#[allow(dead_code)]
 pub enum Action {
     ToEther(Frame),
     ToLocal(Llap),
@@ -163,16 +148,12 @@ pub enum Action {
 }
 
 /// What arrived, or a bare tick when nothing did.
-// ponytail: nothing constructs a Bridge until Task 8 wires the bridge in.
-#[allow(dead_code)]
 pub enum In<'a> {
     Ether(&'a Packet),
     Local(&'a Llap),
     Tick,
 }
 
-// ponytail: nothing constructs a Bridge until Task 8 wires the bridge in.
-#[allow(dead_code)]
 pub struct Bridge {
     addr: Addr,
     mac: MacAddr,
@@ -189,8 +170,6 @@ pub struct Bridge {
     pending: HashMap<u8, Pending>,
 }
 
-// ponytail: nothing calls into Bridge until Task 8 wires the bridge in.
-#[allow(dead_code)]
 impl Bridge {
     pub fn new(addr: Addr, mac: MacAddr, amt: HashMap<Addr, MacAddr>) -> Bridge {
         let now = Instant::now();
@@ -565,6 +544,57 @@ impl Bridge {
         };
         out.push(Action::ToEther(frame(self.mac, mac, DDP, bytes)));
         out
+    }
+}
+
+/// How often the loop wakes with nothing to do, so entries expire and
+/// unanswered questions resolve on a quiet link too.
+const TICK: Duration = Duration::from_millis(250);
+
+/// Runs until the capture thread goes away.
+///
+/// A send failure is reported and the loop continues: one unsendable frame is
+/// not a reason to take the whole bridge down, and on a link this old the
+/// far end will retransmit.
+pub fn run(
+    mut tx: Tx,
+    rx: Receiver<Event>,
+    lt: Ltoudp,
+    addr: Addr,
+    amt: HashMap<Addr, MacAddr>,
+) -> io::Result<()> {
+    let mut b = Bridge::new(addr, tx.mac, amt);
+    loop {
+        let now = Instant::now();
+        let actions = match rx.recv_timeout(TICK) {
+            Ok(Event::Packet { packet, .. }) => b.step(In::Ether(&packet), now),
+            Ok(Event::Ltoudp { llap, .. }) => b.step(In::Local(&llap), now),
+            Ok(Event::Dropped(n)) => {
+                eprintln!("dropped {n} frames (queue full)");
+                b.step(In::Tick, now)
+            }
+            Ok(Event::Error(e)) => {
+                eprintln!("rx: {e}");
+                b.step(In::Tick, now)
+            }
+            Err(RecvTimeoutError::Timeout) => b.step(In::Tick, now),
+            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+        };
+        for a in actions {
+            match a {
+                Action::ToEther(f) => {
+                    if let Err(e) = tx.send(&f) {
+                        eprintln!("bridge: ethernet: {e}");
+                    }
+                }
+                Action::ToLocal(l) => {
+                    if let Err(e) = lt.send(&l) {
+                        eprintln!("bridge: ltoudp: {e}");
+                    }
+                }
+                Action::Report(m) => eprintln!("bridge: {m}"),
+            }
+        }
     }
 }
 

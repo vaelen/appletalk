@@ -35,9 +35,6 @@ pub use aarp::Aarp;
 pub use aep::{Aep, Echo};
 pub use atp::{Atp, Func};
 pub use ddp::Ddp;
-// The bridge (later tasks) wires these into production; only llap.rs's own
-// tests use this re-export until then.
-#[allow(unused_imports)]
 pub use llap::{Llap, LLAP_ACK, LLAP_ENQ, LLAP_LONG_DDP, LLAP_SHORT_DDP};
 pub use nbp::{Nbp, NbpFunc, NbpTuple};
 pub use zip::{Zip, ZipAtp};

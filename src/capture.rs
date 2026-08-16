@@ -31,10 +31,11 @@ pub enum Event {
     },
     /// An LLAP frame off a LocalTalk-shaped link. Posted by `ltoudp`, which
     /// holds a clone of the same sender the capture thread uses.
-    // ponytail: only this module's own test constructs one until Task 8 wires
-    // the bridge in.
-    #[allow(dead_code)]
     Ltoudp {
+        // ponytail: captured but unread — `text` never opens a LocalTalk
+        // link, and `bridge::run` only needs `llap`. Wire it in if a monitor
+        // view of the LocalTalk side is ever built.
+        #[allow(dead_code)]
         at: SystemTime,
         llap: wire::Llap,
     },
@@ -70,13 +71,9 @@ pub struct Capture {
     /// The interface actually opened, which may not be the one asked for.
     pub iface: String,
     /// Its first IPv4 address, if it has one.
-    // ponytail: unread until Task 8's bridge joins a multicast group on it.
-    #[allow(dead_code)]
     pub ip: Option<Ipv4Addr>,
     pub tx: Tx,
     /// A second handle on the event queue, for another link's reader thread.
-    // ponytail: unread until Task 8's bridge reader thread takes a clone.
-    #[allow(dead_code)]
     pub sender: SyncSender<Event>,
     pub events: Receiver<Event>,
 }
