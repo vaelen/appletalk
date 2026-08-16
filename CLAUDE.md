@@ -85,19 +85,29 @@ keep it that way.
 
 ## What a live network has confirmed
 
-Verified 2026-08-16 against a real segment: a `jrouter v0.0.21-dev` seed router
-at `6800.1`, cable range 6800-6800, one zone (`68k Mac Club`), with a Mac and a
-Netatalk box on it. Confirmed working: the AARP probe and claim, defending the
-address (peers resolved us and their replies arrived), ZIP GetNetInfo including
-a **broadcast** reply and adopting the default zone, `zones`, `nodes`, and
-`ping`.
+Verified 2026-08-16 against a real internet: a `jrouter v0.0.21-dev` seed router
+at `6800.1`, cable range 6800-6800, zone `68k Mac Club`, with a Mac and a
+Netatalk box — and, over an AURP tunnel to the USA, a second network (2905,
+zone `BabCom`) with a Quadra 800, a LaserWriter and more.
+
+Confirmed working:
+
+- The whole startup sequence unaided, including the interesting branch: the
+  provisional startup-range address falls outside the 6800-6800 cable range, so
+  `NetInfo::Repick` fires and `claim_in_range` claims a fresh address on the
+  real cable.
+- Defending the address — peers resolve us by AARP and their replies arrive.
+- ZIP GetNetInfo, including a **broadcast** reply and adopting the default zone.
+- `zones`, `nodes` and `ping` on the local cable.
+- `nodes <zone>` against a **remote** zone: the router explodes our BrRq into
+  FwdReqs across the internet and replies come back from the far network.
+- `ping` to a node on a remote network, routed over the tunnel.
 
 Not yet exercised, so do not assume these work: an address collision during the
-probe, the routerless branch, re-picking when the cable range excludes our
-provisional net, a zone list long enough to page more than once, a reply with
-no zone multicast address, and Phase 1. The book settles byte layouts, not
-behavior — cross-check with `tcpdump -e -x` before trusting anything on that
-second list.
+probe, the routerless branch, a zone list long enough to page more than once, a
+reply with no zone multicast address, `--net`, and Phase 1. The book settles
+byte layouts, not behavior — cross-check with `tcpdump -e -x` before trusting
+anything on that second list.
 
 ```sh
 sudo setcap cap_net_raw+ep target/debug/appletalk   # or run as root

@@ -6,21 +6,23 @@ grouped by what would prompt you to pick them up.
 
 ## Verify against real hardware
 
-The node has met one network: a `jrouter v0.0.21-dev` seed router at `6800.1`,
-cable range 6800-6800, a single zone, with a Mac and a Netatalk box. That run
-confirmed the address claim, AARP defense, ZIP GetNetInfo, `zones`, `nodes` and
-`ping`. It left these paths unexercised, and each one has already proven to be
-where the bugs hide:
+The node has met a real internet: a `jrouter v0.0.21-dev` seed router at
+`6800.1` with zone `68k Mac Club`, and a second network (2905, zone `BabCom`)
+reached over an AURP tunnel. That confirmed the full startup sequence including
+the re-pick into the cable range, AARP defense, ZIP GetNetInfo, `zones`, and
+both `nodes` and `ping` against local *and* remote networks.
+
+These paths remain unexercised, and each one has already proven to be where the
+bugs hide:
 
 | Path | Why it matters |
-|-------------------------------------------|------------------------------------------------------------|
-| An address collision during the probe | The retry-and-repick loop has never actually fired |
-| A network with no router | Only ever run by accident, while a bug made a routed network look routerless |
-| Re-picking when the cable range excludes us | `claim_in_range` has never run against a real range |
-| A zone list needing more than one page | `next_start` paging and `MAX_ZONE_PAGES` are book-only |
+|---------------------------------------|------------------------------------------------------------|
+| An address collision during the probe | The "that address is taken, pick another" loop has never fired |
+| A network with no router              | Only ever run by accident, while a bug made a routed network look routerless |
+| A zone list needing more than one page | `next_start` paging and `MAX_ZONE_PAGES` are book-only. The internet now has at least two zones, so this may be closer than it was |
 | A reply with no zone multicast address | Accepted since the `Option<MacAddr>` change, never seen |
-| `--net` | Added after the live session; only `--node` has been used |
-| A Phase 1 network | We only ever transmit Phase 2 |
+| `--net`                               | Every live run so far used `--node` or no flag at all |
+| A Phase 1 network                     | We only ever transmit Phase 2 |
 
 ## Protocols not yet parsed
 

@@ -116,10 +116,23 @@ appletalk nodes '*'              # this cable only
 
 An NBP wildcard lookup, printing one line per registered entity. A single
 machine usually registers several — a file server, a workstation, a printer
-spooler — so expect its address to appear more than once.
+spooler — so expect its address to appear more than once. A trailing `#n` is
+NBP's enumerator, distinguishing entities registered under one name on one
+socket.
 
-With a router, this is a broadcast request the router explodes across the zone.
-Without one, it is a local broadcast on the cable.
+With a router, this is a broadcast request the router explodes across the zone,
+which means naming a zone on the far side of a tunnel works exactly as well as
+the local one:
+
+```
+$ appletalk nodes BabCom
+claimed 6800.53, zone "68k Mac Club", router 6800.1
+BabCom Gateway:Macintosh Quadra 800@* at 2905.50:251 #1
+BabCom-PDF:LaserWriter@* at 2905.1:132
+Sunny:LaserWriter@BabCom at 2905.217:128
+```
+
+Without a router, it falls back to a local broadcast on the cable.
 
 ### ping — echo a node
 
@@ -158,11 +171,12 @@ The wire layer is complete for AARP, DDP, NBP, ATP, AEP and ZIP, with
 round-trip tests built from byte literals. RTMP, ADSP, ASP, PAP and AFP are not
 parsed yet.
 
-Verified against a live segment: the address claim, AARP defense, ZIP
-GetNetInfo, and all three query commands. Not yet exercised on real hardware:
-address collisions during the probe, networks with no router, re-picking when
-the cable range excludes the provisional address, zone lists long enough to
-need a second page, and Phase 1 networks.
+Verified against a live AppleTalk internet — a seed router, a couple of vintage
+Macs, and a second network reached over an AURP tunnel. The address claim, AARP
+defense, ZIP GetNetInfo, and all three query commands work, against both the
+local cable and a remote zone across the tunnel. Not yet exercised on real
+hardware: address collisions during the probe, networks with no router, zone
+lists long enough to need a second page, and Phase 1 networks.
 
 This node asks questions but does not answer them. It registers no NBP name, so
 it is invisible to a `nodes` run from another machine, and it does not reply to
