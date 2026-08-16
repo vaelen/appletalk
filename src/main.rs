@@ -31,7 +31,15 @@ fn main() {
 
     match &args.command {
         // Only the passive path; a dumper needs no address.
-        None | Some(cli::Command::Monitor { .. }) => text::run(cap.events, args.output()),
+        None | Some(cli::Command::Monitor { .. }) => {
+            // Drop the spare queue producer before the (normally unbounded)
+            // read loop. Otherwise it dangles here for the call's whole
+            // lifetime, and the channel can never report "all producers
+            // gone" once something gives the capture thread a way to exit
+            // on its own.
+            drop(cap.sender);
+            text::run(cap.events, args.output())
+        }
         Some(cmd) => {
             if let Err(e) = run_node(cmd, cap, args.node.as_deref(), args.net) {
                 eprintln!("appletalk: {e}");

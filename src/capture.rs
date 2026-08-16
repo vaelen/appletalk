@@ -83,8 +83,9 @@ pub struct Capture {
 
 /// Opens `want` (or the first sensible interface) and starts capturing.
 ///
-/// Returns the interface name, a transmit handle, and the event stream.
-/// Opening happens before the thread starts, so the common failure — no
+/// Returns the interface name and address, a transmit handle, a second
+/// producer for the event queue, and the event stream itself. Opening
+/// happens before the thread starts, so the common failure — no
 /// CAP_NET_RAW — surfaces here rather than killing a thread nobody is
 /// watching.
 pub fn spawn(want: Option<&str>) -> io::Result<Capture> {
