@@ -25,7 +25,9 @@ pub enum Zip {
         flags: u8,
         range: (u16, u16),
         zone: String,
-        multicast: MacAddr,
+        /// None when the router supplied no address — legal, and what a data
+        /// link without multicast gets (PDF 190).
+        multicast: Option<MacAddr>,
         /// Sent when the requested zone was not valid on this cable.
         default_zone: Option<String>,
     },
@@ -63,8 +65,13 @@ impl Zip {
             6 => {
                 let h = p.get(..6)?;
                 let (zone, rest) = pstring(&p[6..])?;
+                // Length zero means the router gave us no address at all; any
+                // other length must be a MAC we can actually use.
                 let mclen = *rest.first()? as usize;
-                let multicast = mac(rest.get(1..1 + mclen)?)?;
+                let multicast = match mclen {
+                    0 => None,
+                    _ => Some(mac(rest.get(1..1 + mclen)?)?),
+                };
                 let rest = rest.get(1 + mclen..)?;
                 let flags = h[1];
                 Some(Zip::NetInfoReply {
@@ -99,7 +106,11 @@ impl fmt::Display for Zip {
             }
             Zip::GetNetInfo { zone } => write!(f, "get-net-info zone {zone}"),
             Zip::NetInfoReply { flags, range, zone, multicast, default_zone } => {
-                write!(f, "net-info-reply nets {}-{} zone {zone} mcast {multicast}", range.0, range.1)?;
+                let mcast = match multicast {
+                    Some(m) => m.to_string(),
+                    None => "none".to_string(),
+                };
+                write!(f, "net-info-reply nets {}-{} zone {zone} mcast {mcast}", range.0, range.1)?;
                 if flags & 0x80 != 0 {
                     f.write_str(" zone-invalid")?;
                 }
@@ -210,8 +221,16 @@ impl Encode for Zip {
                 out.extend(range.0.to_be_bytes());
                 out.extend(range.1.to_be_bytes());
                 put_pstring(out, zone);
-                out.push(6);
-                out.extend(mac_bytes(*multicast));
+                // The length is derived from whether we have an address at
+                // all, so an absent one writes a zero-length field rather than
+                // six bytes of nothing.
+                match multicast {
+                    Some(m) => {
+                        out.push(6);
+                        out.extend(mac_bytes(*m));
+                    }
+                    None => out.push(0),
+                }
                 if let Some(z) = default_zone {
                     put_pstring(out, z);
                 }
@@ -263,6 +282,34 @@ mod tests {
             z.to_string(),
             "net-info-reply nets 3-5 zone Engineering mcast 09:00:07:00:00:01 one-zone"
         );
+    }
+
+    #[test]
+    fn zip_net_info_reply_accepts_an_absent_multicast_address() {
+        // PDF 190: the multicast address "is preceded by its length in bytes,
+        // which should be zero if the data link does not support multicast".
+        // A router that computes no zone multicast address must still be
+        // understood, and a default zone can still follow the empty field.
+        let mut reply = vec![6, 0x80, 0, 3, 0, 5];
+        reply.extend(ps("Nonexistent"));
+        reply.push(0); // no multicast address
+        reply.extend(ps("Engineering"));
+        let z = Zip::parse(&reply).unwrap();
+        assert_eq!(
+            z,
+            Zip::NetInfoReply {
+                flags: 0x80,
+                range: (3, 5),
+                zone: "Nonexistent".to_string(),
+                multicast: None,
+                default_zone: Some("Engineering".to_string()),
+            }
+        );
+        assert_eq!(
+            z.to_string(),
+            "net-info-reply nets 3-5 zone Nonexistent mcast none zone-invalid default Engineering"
+        );
+        assert_eq!(Zip::parse(&z.to_bytes()), Some(z)); // round-trips with the empty field
     }
 
     #[test]

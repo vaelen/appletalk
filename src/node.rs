@@ -889,7 +889,7 @@ mod tests {
             flags: 0,
             range,
             zone: zone.to_string(),
-            multicast: MacAddr(0x09, 0x00, 0x07, 0x00, 0x00, 0x0f),
+            multicast: Some(MacAddr(0x09, 0x00, 0x07, 0x00, 0x00, 0x0f)),
             default_zone: default_zone.map(str::to_string),
         };
         let d = datagram(Addr { net: 3, node: 1 }, 6, dst, 6, DDP_ZIP, z.to_bytes());
