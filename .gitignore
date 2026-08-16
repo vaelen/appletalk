@@ -1,7 +1,12 @@
 /target
 
-# Reference material: 57MB, and Apple retains copyright. Keep it local.
-inside-appletalk-second-edition.pdf
+# Reference material — the AppleTalk book is 57MB and Apple retains copyright.
+# Keep any PDF local.
+*.pdf
 
 # Scratch handoff between sessions; not part of the project.
 session.md
+
+# Specs and plans from agent-driven sessions. Useful while the work is in
+# flight, but the code, CLAUDE.md and appletalk.md are the durable record.
+docs/superpowers/
