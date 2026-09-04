@@ -21,6 +21,8 @@ protocol overview and the planned build order.
 | `appletalk.md`   | Protocol reference: layers, addressing, Phase 1 vs 2.                                        |
 | `LToUDP.md`      | The LToUDP protocol, for someone implementing it elsewhere.                                  |
 | `bridge.md`      | The bridge's behaviour, for whoever has to debug it.                                         |
+| `docs/AURP.md`   | The AURP tunnel protocol (RFC 1504) as GlobalTalk runs it; groundwork for router mode.       |
+| `repos/`         | Reference clones of jrouter and tashrouter. Gitignored; re-clone if missing.                 |
 
 Keep parsing pure and in `wire/` — it stays testable without a NIC.
 

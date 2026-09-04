@@ -10,3 +10,6 @@ session.md
 # Specs and plans from agent-driven sessions. Useful while the work is in
 # flight, but the code, CLAUDE.md and appletalk.md are the durable record.
 docs/superpowers/
+
+# Third-party routers cloned for reference (tashrouter, jrouter). Never checked in.
+repos/
