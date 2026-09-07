@@ -9,9 +9,7 @@
 //! (spec, "Bring-up"). Everything else here is framing — the same datagram
 //! looks different on Ethernet, on LToUDP and on a TashTalk UART, and the
 //! router upstream should not have to know which.
-//!
-//! stub: Task 11 is the first caller.
-#![allow(dead_code)]
+
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};

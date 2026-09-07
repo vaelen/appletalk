@@ -19,9 +19,7 @@
 //! is appended on the way out and verified and stripped on the way in.
 //!
 //! Reference: `repos/tashtalk/documentation/protocol.md`.
-//!
-//! stub: Task 11 opens one of these; nothing calls it yet.
-#![allow(dead_code)]
+
 
 use std::io::{self, Read, Write};
 use std::sync::mpsc::{SyncSender, TrySendError};

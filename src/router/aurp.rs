@@ -9,10 +9,7 @@
 //! layouts, the dialog and the discard table; this module is the two state
 //! machines and nothing else. It never touches a socket -- the run loop feeds
 //! it datagrams and sends the `Action::ToPeer`s it hands back.
-//!
-//! stub: Task 11 gives `Peers` its first caller; until then nothing in the
-//! binary opens a tunnel.
-#![allow(dead_code)]
+
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Write as _};
@@ -707,6 +704,11 @@ impl Peers {
         s
     }
 
+    /// Whether we already hold a connection to this address. Nothing in the
+    /// run loop asks: `packet` decides for itself what to do with a stranger,
+    /// and `resolved` is idempotent. Kept because it is the only read-only
+    /// window onto the peer set a caller has.
+    #[allow(dead_code)]
     pub fn known(&self, addr: Ipv4Addr) -> bool {
         self.peers.contains_key(&addr)
     }

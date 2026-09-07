@@ -5,10 +5,7 @@
 //!
 //! The file is read once at startup; nothing here is consulted again while the
 //! router runs. `Config`'s fields are read by the router itself.
-//!
-//! stub: Task 11 is the first reader of most of `Config`, so the allow stays
-//! until it lands.
-#![allow(dead_code)]
+
 use std::collections::HashSet;
 use std::fs;
 use std::io;

@@ -6,9 +6,7 @@
 //! Everything here is pure: `handle` and `tick` take what they need, read and
 //! update the tables, and hand back datagrams for the runtime to send. No I/O,
 //! no clock of their own.
-//!
-//! stub: Task 11 is the first caller.
-#![allow(dead_code)]
+
 
 use std::time::{Duration, Instant};
 

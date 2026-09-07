@@ -31,8 +31,6 @@ pub enum Event {
         /// Stamped in userspace after the read, so it lags the wire by however
         /// long the frame sat in the kernel buffer.
         at: SystemTime,
-        // stub: Task 11 routes on this; today's frontends have one link.
-        #[allow(dead_code)]
         port: PortId,
         packet: wire::Packet,
     },
@@ -42,14 +40,10 @@ pub enum Event {
     /// `text` never opens a LocalTalk link, and `bridge::run` works in
     /// `Instant`, not wall-clock time.
     Llap {
-        // stub: Task 11 routes on this; today's frontends have one link.
-        #[allow(dead_code)]
         port: PortId,
         llap: wire::Llap,
     },
     /// One UDP datagram off the AURP socket.
-    // stub: Task 11 posts these; nothing consumes them yet.
-    #[allow(dead_code)]
     Aurp { from: SocketAddrV4, bytes: Vec<u8> },
     /// Frames discarded because the queue was full, counted since the last
     /// report. A frontend that ignores this shows a gap with no explanation.
@@ -107,16 +101,12 @@ pub fn spawn(want: Option<&str>) -> io::Result<Capture> {
 
 /// A NIC opened for a router port: it shares the router's event channel
 /// instead of owning one.
-// stub: Task 11 opens router ports with this.
-#[allow(dead_code)]
 pub struct Nic {
     pub iface: String,
     pub ip: Option<Ipv4Addr>,
     pub tx: Tx,
 }
 
-// stub: Task 11.
-#[allow(dead_code)]
 pub fn spawn_into(want: Option<&str>, port: PortId, tx: SyncSender<Event>) -> io::Result<Nic> {
     let (iface, ip, sender_half, rx, mac) = open(want)?;
     thread::spawn(move || capture_loop(rx, tx, port));
