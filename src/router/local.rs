@@ -17,7 +17,10 @@ use super::table::{RouteChange, Tables};
 use super::{Dest, Emit, Target};
 use crate::capture::PortId;
 use crate::node::datagram;
-use crate::wire::{Addr, Ddp, DdpBody, Encode, NetworkTuple, Rtmp};
+use crate::wire::{
+    zone_multicast, Addr, Atp, Ddp, DdpBody, Encode, Func, NetworkTuple, Rtmp, Zip, ZipAtp,
+    DDP_ATP, DDP_ZIP,
+};
 
 /// How often a router broadcasts its routing table on each port (PDF 143).
 pub const RTMP_INTERVAL: Duration = Duration::from_secs(10);
@@ -31,6 +34,10 @@ pub const ZIP_SOCKET: u8 = 6;
 
 /// The most data one DDP datagram carries.
 const DDP_MAX: usize = 586;
+/// What is left for an ATP response's data once its 8-byte header is on.
+const ATP_MAX: usize = 578;
+/// A ZIP Reply's function and network-count bytes.
+const ZIP_HEAD: usize = 2;
 
 /// The router's own name, and the state its two timers keep.
 pub struct Local {
@@ -57,6 +64,8 @@ impl Local {
     ) -> (Vec<Emit>, Vec<RouteChange>) {
         match body {
             DdpBody::Rtmp(r) => self.rtmp(port, ports, ddp, r, tables, now),
+            DdpBody::Zip(z) => self.zip(port, ddp, z, tables),
+            DdpBody::Atp(a) => (zone_list(port, ddp, a, tables).into_iter().collect(), Vec::new()),
             _ => (Vec::new(), Vec::new()),
         }
     }
@@ -108,6 +117,199 @@ impl Local {
         let dest = Dest::Node(ddp.src.node);
         rtmp_data(port, dest, ddp.src, ddp.src_socket, tuples)
     }
+
+    // ------------------------------------------------------------------- ZIP
+
+    fn zip(
+        &self,
+        port: &Port,
+        ddp: &Ddp,
+        z: &Zip,
+        tables: &mut Tables,
+    ) -> (Vec<Emit>, Vec<RouteChange>) {
+        match z {
+            Zip::Query { nets } => (query_reply(port, ddp, nets, tables), Vec::new()),
+            Zip::Reply { zones, extended } => (Vec::new(), learn_zones(zones, *extended, tables)),
+            Zip::GetNetInfo { zone } => (net_info(port, ddp, zone).into_iter().collect(), Vec::new()),
+            // A NetInfoReply is somebody else's answer, and Notify is not
+            // decoded; neither is ours to act on.
+            Zip::NetInfoReply { .. } | Zip::Notify => (Vec::new(), Vec::new()),
+        }
+    }
+}
+
+/// Answers a ZIP Query with the zones of every network named that we hold a
+/// complete list for. Nothing known means no reply at all (PDF 184).
+fn query_reply(port: &Port, ddp: &Ddp, nets: &[u16], tables: &Tables) -> Vec<Emit> {
+    let mut replies: Vec<Zip> = Vec::new();
+    let mut batch: Vec<(u16, String)> = Vec::new();
+    let mut size = ZIP_HEAD;
+    for &net in nets {
+        let Some(list) = tables.zones(net).filter(|z| z.complete()) else { continue };
+        let pairs: Vec<(u16, String)> = list.names.iter().map(|n| (net, n.clone())).collect();
+        let bytes: usize = pairs.iter().map(|(_, n)| pair_bytes(n)).sum();
+        let alone = ZIP_HEAD + bytes > DDP_MAX;
+        // A network's zones list has to be whole inside one Reply, so flush
+        // before starting a network that will not fit alongside it (PDF 184).
+        if !batch.is_empty() && (alone || size + bytes > DDP_MAX) {
+            replies.push(Zip::Reply { zones: std::mem::take(&mut batch), extended: false });
+            size = ZIP_HEAD;
+        }
+        if alone {
+            replies.extend(pages(pairs));
+            continue;
+        }
+        batch.extend(pairs);
+        size += bytes;
+    }
+    if !batch.is_empty() {
+        replies.push(Zip::Reply { zones: batch, extended: false });
+    }
+    replies
+        .into_iter()
+        .filter_map(|r| {
+            let ddp = from(port, ZIP_SOCKET, ddp.src, ddp.src_socket, DDP_ZIP, &r)?;
+            Some(Emit::On { port: port.id, dest: Dest::Node(ddp.dst.node), ddp })
+        })
+        .collect()
+}
+
+/// One network's list split across Extended Replies.
+///
+/// ponytail: the book's network count on an Extended Reply is the size of the
+/// *whole* list, not of this packet, but `Zip::Reply` derives the count from
+/// the pairs it carries and `Zip::parse` reads exactly that many back. A
+/// receiver therefore sees each page as a complete list. Carry the total on
+/// `Zip::Reply` if a network ever really has more than a packet of zones.
+fn pages(pairs: Vec<(u16, String)>) -> Vec<Zip> {
+    let mut out = Vec::new();
+    let mut batch: Vec<(u16, String)> = Vec::new();
+    let mut size = ZIP_HEAD;
+    for p in pairs {
+        let n = pair_bytes(&p.1);
+        if size + n > DDP_MAX && !batch.is_empty() {
+            out.push(Zip::Reply { zones: std::mem::take(&mut batch), extended: true });
+            size = ZIP_HEAD;
+        }
+        size += n;
+        batch.push(p);
+    }
+    if !batch.is_empty() {
+        out.push(Zip::Reply { zones: batch, extended: true });
+    }
+    out
+}
+
+/// A network number and a length-prefixed zone name, as a Reply carries them.
+fn pair_bytes(name: &str) -> usize {
+    2 + 1 + name.len().min(32)
+}
+
+/// A ZIP Reply fills in the zone table. The names for one network are
+/// contiguous, so they are gathered per network before being stored.
+fn learn_zones(zones: &[(u16, String)], extended: bool, tables: &mut Tables) -> Vec<RouteChange> {
+    let mut by_net: Vec<(u16, Vec<String>)> = Vec::new();
+    for (net, name) in zones {
+        match by_net.iter_mut().find(|(n, _)| n == net) {
+            Some((_, names)) => names.push(name.clone()),
+            None => by_net.push((*net, vec![name.clone()])),
+        }
+    }
+    let mut changes = Vec::new();
+    for (net, names) in by_net {
+        let expected = extended.then_some(names.len());
+        changes.extend(tables.add_zones(net, &names, expected));
+    }
+    changes
+}
+
+/// The answer a booting node needs: this cable's range, whether the zone it
+/// asked for is valid here, and the multicast address to listen on (PDF 190).
+fn net_info(port: &Port, ddp: &Ddp, zone: &str) -> Option<Emit> {
+    let valid = !zone.is_empty() && port.has_zone(zone);
+    let mut flags = 0u8;
+    if !valid {
+        flags |= 0x80; // the requested zone is not on this cable
+    }
+    if port.zones.len() == 1 {
+        flags |= 0x20; // one zone, so there is no point asking for the list
+    }
+    // An invalid request is answered with the default zone's multicast
+    // address, and the default zone's name after it.
+    let effective = if valid { zone } else { port.default_zone() };
+    let multicast = match port.extended() {
+        true => Some(zone_multicast(effective)),
+        false => {
+            flags |= 0x40; // this data link has no multicast: use broadcast
+            None
+        }
+    };
+    let body = Zip::NetInfoReply {
+        flags,
+        range: port.range,
+        // Always a copy of the name from the request, so a node that hears a
+        // broadcast reply can tell whether it is the one it asked for.
+        zone: zone.to_string(),
+        multicast,
+        default_zone: (!valid).then(|| port.default_zone().to_string()),
+    };
+    // A requester whose network is not this cable's has no reachable node
+    // address, so the reply goes to the whole cable (PDF 190).
+    let dest = match (port.range.0..=port.range.1).contains(&ddp.src.net) {
+        true => Dest::Node(ddp.src.node),
+        false => Dest::Broadcast,
+    };
+    Some(Emit::On {
+        port: port.id,
+        dest,
+        ddp: from(port, ZIP_SOCKET, ddp.src, ddp.src_socket, DDP_ZIP, &body)?,
+    })
+}
+
+/// GetZoneList, GetLocalZones and GetMyZone: one ATP response with as many
+/// names as fit, and the last-packet flag when the list runs out (PDF 186).
+fn zone_list(port: &Port, ddp: &Ddp, a: &Atp, tables: &Tables) -> Option<Emit> {
+    if a.func != Func::Req || ddp.dst_socket != ZIP_SOCKET {
+        return None;
+    }
+    let (all, start) = match ZipAtp::parse_request(&a.user_bytes, &a.data)? {
+        ZipAtp::GetZoneList { start } => (tables.all_zones(), start),
+        ZipAtp::GetLocalZones { start } => (port.zones.clone(), start),
+        ZipAtp::GetMyZone => (vec![port.default_zone().to_string()], 1),
+        ZipAtp::Reply { .. } => return None,
+    };
+    // The start index is 1-based; a start past the end is legal and answered
+    // with an empty last page.
+    let rest = all.get(start.saturating_sub(1) as usize..).unwrap_or(&[]);
+    let mut names: Vec<String> = Vec::new();
+    let mut size = 0;
+    for n in rest {
+        size += 1 + n.len().min(32);
+        if size > ATP_MAX {
+            break;
+        }
+        names.push(n.clone());
+    }
+    let (user, data) = ZipAtp::reply_parts(names.len() == rest.len(), &names);
+    let body = Atp::response(a.tid, 0, true, false, user, data);
+    Some(Emit::On {
+        port: port.id,
+        dest: Dest::Node(ddp.src.node),
+        ddp: from(port, ZIP_SOCKET, ddp.src, ddp.src_socket, DDP_ATP, &body)?,
+    })
+}
+
+/// A datagram from one of our sockets on `port`. `None` until the port holds
+/// an address, because there is no legal source to send from before then.
+fn from(
+    port: &Port,
+    src_socket: u8,
+    dst: Addr,
+    dst_socket: u8,
+    typ: u8,
+    body: &impl Encode,
+) -> Option<Ddp> {
+    Some(datagram(port.addr()?, src_socket, dst, dst_socket, typ, body.to_bytes()))
 }
 
 /// A port id no configured port holds. `tuples_for` drops the routes reached
@@ -351,6 +553,305 @@ mod tests {
             let Emit::On { ddp, .. } = e else { panic!() };
             assert!(ddp.data.len() <= DDP_MAX, "{} bytes", ddp.data.len());
         }
+    }
+
+    /// The `Zip` inside an `Emit`, with the port and destination it went to.
+    fn zip_of(e: &Emit) -> (PortId, &Dest, Zip) {
+        match e {
+            Emit::On { port, dest, ddp } => (*port, dest, Zip::parse(&ddp.data).expect("ZIP")),
+            other => panic!("expected a port-directed emit, got {other:?}"),
+        }
+    }
+
+    /// A table with our cable on port 0, a routed network 2905, and a routed
+    /// network 100 nobody has told us the zones of yet.
+    fn internet(t: Instant) -> Tables {
+        let mut tables = Tables::new();
+        tables.add_port(0, (NET, NET), true, vec![ZONE.into()], t);
+        tables.learn(&ext(2905, 2905, 1), Target::Port(0), PEER, t);
+        tables.add_zones(2905, &["BabCom".into()], None);
+        tables.learn(&ext(100, 100, 1), Target::Port(0), PEER, t);
+        tables
+    }
+
+    #[test]
+    fn zip_query_answers_only_for_networks_with_a_complete_zone_list() {
+        let t = Instant::now();
+        let p = ether(0, (NET, NET), &[ZONE], 9, t);
+        let mut tables = internet(t);
+        let mut l = Local::new("router".into());
+
+        let q = Zip::Query { nets: vec![NET, 2905, 100, 999] };
+        let ddp = to_us(&p, ZIP_SOCKET, DDP_ZIP, &q);
+        let (out, changes) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Zip(q), &mut tables, t);
+        assert_eq!(changes, Vec::new());
+        assert_eq!(out.len(), 1);
+        let (port, dest, z) = zip_of(&out[0]);
+        assert_eq!((port, dest), (0, &Dest::Node(PEER.node)));
+        // 100 has no zones and 999 no route at all, so neither appears.
+        assert_eq!(
+            z,
+            Zip::Reply {
+                zones: vec![(NET, ZONE.into()), (2905, "BabCom".into())],
+                extended: false,
+            }
+        );
+        assert_eq!(z.to_string(), "reply 6800=68k Mac Club, 2905=BabCom");
+        let Emit::On { ddp, .. } = &out[0] else { panic!() };
+        assert_eq!((ddp.src_socket, ddp.dst_socket, ddp.typ), (ZIP_SOCKET, 200, DDP_ZIP));
+
+        // Nothing known about any network named: no reply at all.
+        let q = Zip::Query { nets: vec![100, 999] };
+        let ddp = to_us(&p, ZIP_SOCKET, DDP_ZIP, &q);
+        let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Zip(q), &mut tables, t);
+        assert_eq!(out, Vec::new());
+    }
+
+    #[test]
+    fn a_zone_list_too_big_for_one_reply_goes_as_extended_replies() {
+        let t = Instant::now();
+        let p = ether(0, (NET, NET), &[ZONE], 9, t);
+        let mut tables = internet(t);
+        // 33 bytes a pair, so 17 fit in a 586-byte Reply and 20 do not.
+        let many: Vec<String> = (0..20).map(|i| format!("{i:0>30}")).collect();
+        tables.add_zones(2905, &many, None);
+        let mut l = Local::new("router".into());
+
+        let q = Zip::Query { nets: vec![2905] };
+        let ddp = to_us(&p, ZIP_SOCKET, DDP_ZIP, &q);
+        let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Zip(q), &mut tables, t);
+        assert_eq!(out.len(), 2);
+        let mut seen = Vec::new();
+        for (i, e) in out.iter().enumerate() {
+            let (_, _, z) = zip_of(e);
+            let Zip::Reply { zones, extended } = z else { panic!() };
+            assert!(extended, "page {i} is not an Extended Reply");
+            assert!(zones.iter().all(|(n, _)| *n == 2905), "one network per packet");
+            let Emit::On { ddp, .. } = e else { panic!() };
+            assert!(ddp.data.len() <= DDP_MAX, "page {i} is {} bytes", ddp.data.len());
+            seen.extend(zones.into_iter().map(|(_, n)| n));
+        }
+        // "BabCom" was already there, then the twenty long ones.
+        assert_eq!(seen.len(), 21);
+        assert_eq!(&seen[1..], &many[..]);
+    }
+
+    #[test]
+    fn a_zip_reply_fills_the_zone_table() {
+        let t = Instant::now();
+        let p = ether(0, (NET, NET), &[ZONE], 9, t);
+        let mut tables = internet(t);
+        let mut l = Local::new("router".into());
+
+        let r = Zip::Reply {
+            zones: vec![(100, "Engineering".into()), (100, "Marketing".into())],
+            extended: false,
+        };
+        let ddp = to_us(&p, ZIP_SOCKET, DDP_ZIP, &r);
+        let (out, changes) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Zip(r), &mut tables, t);
+        assert_eq!(out, Vec::new());
+        // 100 had no zones, so it has just become advertisable.
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].new.as_ref().unwrap().range, (100, 100));
+        let list = tables.zones(100).unwrap();
+        assert_eq!(list.names, vec!["Engineering".to_string(), "Marketing".into()]);
+        assert_eq!(list.expected, None);
+
+        // An Extended Reply announces the total, so the list is only complete
+        // once that many names are in.
+        let r = Zip::Reply { zones: vec![(100, "Sales".into())], extended: true };
+        let ddp = to_us(&p, ZIP_SOCKET, DDP_ZIP, &r);
+        l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Zip(r), &mut tables, t);
+        assert_eq!(tables.zones(100).unwrap().expected, Some(1));
+    }
+
+    #[test]
+    fn get_net_info_confirms_a_valid_zone() {
+        let t = Instant::now();
+        let p = ether(0, (NET, NET + 1), &[ZONE, "Other"], 9, t);
+        let mut tables = internet(t);
+        let mut l = Local::new("router".into());
+
+        let g = Zip::GetNetInfo { zone: "68K MAC CLUB".into() };
+        let ddp = to_us(&p, ZIP_SOCKET, DDP_ZIP, &g);
+        let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Zip(g), &mut tables, t);
+        let (port, dest, z) = zip_of(&out[0]);
+        assert_eq!((port, dest), (0, &Dest::Node(PEER.node)));
+        assert_eq!(
+            z,
+            Zip::NetInfoReply {
+                // Two zones on this cable, and the name was valid: no flags.
+                flags: 0,
+                range: (NET, NET + 1),
+                zone: "68K MAC CLUB".into(),
+                multicast: Some(zone_multicast(ZONE)),
+                default_zone: None,
+            }
+        );
+    }
+
+    #[test]
+    fn get_net_info_rejects_an_unknown_or_empty_zone_and_names_the_default() {
+        let t = Instant::now();
+        let p = ether(0, (NET, NET), &[ZONE], 9, t);
+        let mut tables = internet(t);
+        let mut l = Local::new("router".into());
+
+        for asked in ["BabCom", ""] {
+            let g = Zip::GetNetInfo { zone: asked.into() };
+            let ddp = to_us(&p, ZIP_SOCKET, DDP_ZIP, &g);
+            let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Zip(g), &mut tables, t);
+            let (_, _, z) = zip_of(&out[0]);
+            assert_eq!(
+                z,
+                Zip::NetInfoReply {
+                    // 0x80 zone invalid, 0x20 only one zone on this cable.
+                    flags: 0xa0,
+                    range: (NET, NET),
+                    zone: asked.into(),
+                    // The default zone's address, not the one asked for.
+                    multicast: Some(zone_multicast(ZONE)),
+                    default_zone: Some(ZONE.into()),
+                },
+                "asked for {asked:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn get_net_info_on_localtalk_offers_no_multicast_address() {
+        let t = Instant::now();
+        let p = ltalk(1, 3, &[ZONE], 200, t);
+        let mut tables = Tables::new();
+        tables.add_port(1, (3, 3), false, vec![ZONE.into()], t);
+        let mut l = Local::new("router".into());
+
+        let g = Zip::GetNetInfo { zone: ZONE.into() };
+        let ddp = datagram(Addr { net: 3, node: 1 }, 200, p.addr().unwrap(), ZIP_SOCKET, DDP_ZIP, g.to_bytes());
+        let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Zip(g), &mut tables, t);
+        let (_, dest, z) = zip_of(&out[0]);
+        assert_eq!(dest, &Dest::Node(1));
+        let Zip::NetInfoReply { flags, multicast, .. } = z else { panic!() };
+        // 0x40 use-broadcast, 0x20 only one zone. The name was valid.
+        assert_eq!((flags, multicast), (0x60, None));
+    }
+
+    #[test]
+    fn get_net_info_is_broadcast_when_the_requester_is_not_on_this_cable() {
+        let t = Instant::now();
+        let p = ether(0, (NET, NET), &[ZONE], 9, t);
+        let mut tables = internet(t);
+        let mut l = Local::new("router".into());
+
+        // A node still on the startup range has no address we can send to.
+        let g = Zip::GetNetInfo { zone: ZONE.into() };
+        let ddp = datagram(
+            Addr { net: 0xff10, node: 42 },
+            200,
+            Addr { net: NET, node: 255 },
+            ZIP_SOCKET,
+            DDP_ZIP,
+            g.to_bytes(),
+        );
+        let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Zip(g), &mut tables, t);
+        let (_, dest, _) = zip_of(&out[0]);
+        assert_eq!(dest, &Dest::Broadcast);
+    }
+
+    #[test]
+    fn atp_answers_get_zone_list_get_local_zones_and_get_my_zone() {
+        let t = Instant::now();
+        let p = ether(0, (NET, NET), &[ZONE, "Other"], 9, t);
+        let mut tables = internet(t);
+        let mut l = Local::new("router".into());
+
+        let cases: [(u8, u16, Vec<String>); 4] = [
+            (8, 1, vec![ZONE.into(), "BabCom".into()]),
+            (8, 2, vec!["BabCom".into()]),
+            (9, 1, vec![ZONE.into(), "Other".into()]),
+            (7, 0, vec![ZONE.into()]),
+        ];
+        for (func, start, want) in cases {
+            let s = start.to_be_bytes();
+            let a = Atp::request(0x1234, 1, None, [func, 0, s[0], s[1]], Vec::new());
+            let ddp = to_us(&p, ZIP_SOCKET, DDP_ATP, &a);
+            let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Atp(a), &mut tables, t);
+            assert_eq!(out.len(), 1, "function {func}");
+            let Emit::On { port, dest, ddp } = &out[0] else { panic!() };
+            assert_eq!((*port, dest), (0, &Dest::Node(PEER.node)));
+            assert_eq!((ddp.src_socket, ddp.dst_socket, ddp.typ), (ZIP_SOCKET, 200, DDP_ATP));
+            let r = Atp::parse(&ddp.data).unwrap();
+            assert_eq!((r.func, r.tid, r.bitmap, r.eom()), (Func::Resp, 0x1234, 0, true));
+            assert_eq!(
+                ZipAtp::parse_reply(&r.user_bytes, &r.data).unwrap(),
+                ZipAtp::Reply { last: true, zones: want },
+                "function {func} start {start}"
+            );
+        }
+
+        // A start index past the end is legal: an empty last page.
+        let a = Atp::request(1, 1, None, [8, 0, 0, 99], Vec::new());
+        let ddp = to_us(&p, ZIP_SOCKET, DDP_ATP, &a);
+        let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Atp(a), &mut tables, t);
+        let Emit::On { ddp, .. } = &out[0] else { panic!() };
+        let r = Atp::parse(&ddp.data).unwrap();
+        assert_eq!(
+            ZipAtp::parse_reply(&r.user_bytes, &r.data).unwrap(),
+            ZipAtp::Reply { last: true, zones: Vec::new() }
+        );
+
+        // An ATP request to another socket is nobody's business here.
+        let a = Atp::request(1, 1, None, [8, 0, 0, 1], Vec::new());
+        let ddp = to_us(&p, 200, DDP_ATP, &a);
+        let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Atp(a), &mut tables, t);
+        assert_eq!(out, Vec::new());
+    }
+
+    #[test]
+    fn get_zone_list_pages_a_list_that_does_not_fit_one_response() {
+        let t = Instant::now();
+        let p = ether(0, (NET, NET), &[ZONE], 9, t);
+        let mut tables = internet(t);
+        // 40 names of 30 bytes, 31 bytes each on the wire, after our own two
+        // shorter ones: 20 of them fill ATP's 578 bytes exactly.
+        let many: Vec<String> = (0..40).map(|i| format!("{i:0>30}")).collect();
+        tables.add_zones(100, &many, None);
+        let mut l = Local::new("router".into());
+
+        let page = |l: &mut Local, tables: &mut Tables, start: u16| {
+            let s = start.to_be_bytes();
+            let a = Atp::request(7, 1, None, [8, 0, s[0], s[1]], Vec::new());
+            let ddp = to_us(&p, ZIP_SOCKET, DDP_ATP, &a);
+            let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Atp(a), tables, t);
+            let Emit::On { ddp, .. } = &out[0] else { panic!() };
+            assert!(ddp.data.len() <= 8 + ATP_MAX, "{} bytes", ddp.data.len());
+            let r = Atp::parse(&ddp.data).unwrap();
+            let ZipAtp::Reply { last, zones } = ZipAtp::parse_reply(&r.user_bytes, &r.data).unwrap()
+            else {
+                panic!()
+            };
+            (last, zones)
+        };
+
+        // all_zones() is our own zone, then BabCom, then the forty.
+        let (last, first) = page(&mut l, &mut tables, 1);
+        assert_eq!((last, first.len()), (false, 20));
+        assert_eq!(first[0], ZONE);
+
+        // Walk the rest from the index the previous page ended at.
+        let mut all = first;
+        let mut start = 1 + all.len() as u16;
+        loop {
+            let (last, zones) = page(&mut l, &mut tables, start);
+            assert!(!zones.is_empty());
+            start += zones.len() as u16;
+            all.extend(zones);
+            if last {
+                break;
+            }
+        }
+        assert_eq!(all.len(), 42);
+        assert_eq!(&all[2..], &many[..]);
     }
 
     /// `Port` is not `Clone`, and every test needs the port both as the one
