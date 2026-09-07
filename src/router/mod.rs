@@ -52,6 +52,29 @@ pub enum Target {
     Peer(Ipv4Addr),
 }
 
+/// Where a datagram being forwarded came from. Distinct from `Target`: a
+/// datagram off a tunnel and one this router made are both "no port", and the
+/// forwarding rules treat them differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    Port(PortId),
+    Peer(Ipv4Addr),
+    /// Made here: a service's reply, or anything else we originated.
+    Local,
+}
+
+impl Origin {
+    /// True when forwarding to `t` would send the datagram straight back the
+    /// way it came, down a cable or a tunnel alike.
+    fn is(self, t: Target) -> bool {
+        match (self, t) {
+            (Origin::Port(a), Target::Port(b)) => a == b,
+            (Origin::Peer(a), Target::Peer(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Dest {
     Node(u8),
@@ -129,7 +152,7 @@ impl Router {
                 // A port only lifts a datagram out of a frame it decoded, so
                 // the body beside it is this datagram's own.
                 if let (Inbound::Ddp(ddp), Body::Ddp(_, body)) = (inbound, &packet.body) {
-                    out.extend(self.arrived(Some(port), ddp, body, now));
+                    out.extend(self.arrived(Origin::Port(port), ddp, body, now));
                 }
                 out
             }
@@ -140,7 +163,7 @@ impl Router {
                     // LLAP carries no decode tree with it: the body has to be
                     // parsed here.
                     let body = wire::decode_ddp_body(&ddp);
-                    out.extend(self.arrived(Some(port), ddp, &body, now));
+                    out.extend(self.arrived(Origin::Port(port), ddp, &body, now));
                 }
                 out
             }
@@ -153,7 +176,7 @@ impl Router {
                 // increment (spec, "DDP forwarding").
                 if let Some(d) = ddp.as_deref().and_then(Ddp::parse) {
                     let body = wire::decode_ddp_body(&d);
-                    out.extend(self.arrived(None, d, &body, now));
+                    out.extend(self.arrived(Origin::Peer(from), d, &body, now));
                 }
                 out
             }
@@ -183,11 +206,11 @@ impl Router {
         }
     }
 
-    /// A datagram off a link (`from` a port) or off a tunnel (`from` None),
-    /// run through the spec's forwarding order.
+    /// A datagram off a link or off a tunnel, run through the spec's
+    /// forwarding order.
     fn arrived(
         &mut self,
-        from: Option<PortId>,
+        origin: Origin,
         mut ddp: Ddp,
         body: &DdpBody,
         now: Instant,
@@ -202,7 +225,10 @@ impl Router {
         }
         // Network 0 means "this cable" (PDF 118); everything downstream wants
         // a real network number.
-        if let Some(i) = from.and_then(|id| self.index(id)) {
+        if let Some(i) = match origin {
+            Origin::Port(id) => self.index(id),
+            _ => None,
+        } {
             let net = self.ports[i].range.0;
             if ddp.dst.net == 0 {
                 ddp.dst.net = net;
@@ -212,7 +238,7 @@ impl Router {
             }
         }
         // The cable the destination network belongs to, if it is one of ours.
-        let Some(q) = self.owner(ddp.dst.net) else { return self.forward(from, ddp, now) };
+        let Some(q) = self.owner(ddp.dst.net) else { return self.forward(origin, ddp, now) };
         let node = ddp.dst.node;
         // Node 0 means "any router on that network" and 255 means everybody,
         // and both include us.
@@ -237,28 +263,36 @@ impl Router {
         // on it. `forward` refuses to repeat it onto the port it came from,
         // which is what makes step 3's "already where it belongs" a drop.
         if node == 255 || !for_us {
-            out.extend(self.forward(from, ddp, now));
+            out.extend(self.forward(origin, ddp, now));
         }
         out
     }
 
-    /// The forwarding rules; `from` None means a datagram from a peer (no hop
-    /// increment) or one we originated.
-    pub fn forward(&mut self, from: Option<PortId>, mut ddp: Ddp, _now: Instant) -> Vec<Action> {
+    /// The forwarding rules for a datagram this router is passing on.
+    pub fn forward(&mut self, origin: Origin, mut ddp: Ddp, _now: Instant) -> Vec<Action> {
         if ddp.hops >= MAX_HOPS {
             return Vec::new();
         }
         let Some(route) = self.tables.best(ddp.dst.net) else { return Vec::new() };
         let (target, next, distance) = (route.target, route.next, route.distance);
-        // Crossing this router costs a hop; originating a datagram here, or
-        // relaying one off a tunnel, does not (`docs/AURP.md`, "Hop counts").
-        if from.is_some() {
+        // Never repeat a datagram out the port or down the tunnel it arrived
+        // on, whatever the table says the best route is.
+        if origin.is(target) {
+            return Vec::new();
+        }
+        // Crossing this router costs a hop. Two exceptions: a datagram we
+        // originated has crossed nothing, and one off a tunnel bound for a
+        // cable had the tunnel's one hop applied by the sending side (spec,
+        // "DDP forwarding"; `docs/AURP.md`, "Hop counts"). Relaying one tunnel
+        // to the next makes us that sending side, so that hop is ours.
+        let free = matches!(origin, Origin::Local)
+            || matches!((origin, target), (Origin::Peer(_), Target::Port(_)));
+        if !free {
             ddp.hops += 1;
         }
         match target {
             Target::Peer(ip) => vec![self.peers.forward(ip, &ddp.to_bytes())],
-            // Never repeat a datagram out the port it arrived on.
-            Target::Port(id) if Some(id) != from => {
+            Target::Port(id) => {
                 let Some(i) = self.index(id) else { return Vec::new() };
                 let dest = match (distance, ddp.dst.node) {
                     // Directly attached: the datagram is home.
@@ -269,7 +303,6 @@ impl Router {
                 };
                 self.ports[i].emit(&dest, &ddp).into_iter().collect()
             }
-            Target::Port(_) => Vec::new(),
         }
     }
 
@@ -281,7 +314,7 @@ impl Router {
                 Some(i) => self.ports[i].emit(&dest, &ddp).into_iter().collect(),
                 None => Vec::new(),
             },
-            Emit::Route(ddp) => self.forward(None, ddp, now),
+            Emit::Route(ddp) => self.forward(Origin::Local, ddp, now),
         }
     }
 
@@ -701,6 +734,15 @@ mod tests {
         }
     }
 
+    /// A datagram as it arrives inside `PEER`'s tunnel.
+    fn tunnelled(ddp: &Ddp) -> Vec<u8> {
+        Aurp::Data {
+            dh: DomainHeader { dst: Di::Ip(Ipv4Addr::new(203, 0, 113, 1)), src: Di::Ip(PEER) },
+            ddp: ddp.to_bytes(),
+        }
+        .to_bytes()
+    }
+
     fn aep_of(ddp: &Ddp) -> Aep {
         Aep::parse(&ddp.data).expect("an AEP body")
     }
@@ -788,14 +830,39 @@ mod tests {
         let mut r = router(now);
         let mut over = echo_request(Addr { net: 2905, node: 5 }, Addr { net: ETHER, node: 42 });
         over.hops = 3;
-        let wrapped = Aurp::Data {
-            dh: DomainHeader { dst: Di::Ip(Ipv4Addr::new(203, 0, 113, 1)), src: Di::Ip(PEER) },
-            ddp: over.to_bytes(),
-        }
-        .to_bytes();
-        let out = r.step(In::Aurp { from: PEER, bytes: &wrapped }, now);
+        let out = r.step(In::Aurp { from: PEER, bytes: &tunnelled(&over) }, now);
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(ether_out(&out[0]).hops, 3);
+    }
+
+    /// A relay from one tunnel to the next makes us the sending side of the
+    /// second tunnel, so that tunnel's one hop is ours to apply.
+    #[test]
+    fn a_peer_to_peer_relay_costs_one_hop() {
+        let now = Instant::now();
+        let mut r = router(now);
+        let far = Ipv4Addr::new(198, 51, 100, 20);
+        route(&mut r, 3000, Target::Peer(far), Addr { net: 0, node: 0 }, now);
+        let mut over = echo_request(Addr { net: 2905, node: 5 }, Addr { net: 3000, node: 9 });
+        over.hops = 3;
+        let out = r.step(In::Aurp { from: PEER, bytes: &tunnelled(&over) }, now);
+        assert_eq!(out.len(), 1, "{out:?}");
+        let Action::ToPeer { peer, bytes } = &out[0] else { panic!("not tunnelled: {out:?}") };
+        assert_eq!(*peer, far);
+        let Aurp::Data { ddp, .. } = Aurp::parse(bytes).expect("an AURP packet") else {
+            panic!("not a Data packet")
+        };
+        assert_eq!(Ddp::parse(&ddp).expect("a datagram").hops, 4);
+    }
+
+    #[test]
+    fn a_datagram_is_never_sent_back_to_the_peer_it_came_from() {
+        let now = Instant::now();
+        let mut r = router(now);
+        // The way to 3000 is back down the tunnel this arrives on.
+        route(&mut r, 3000, Target::Peer(PEER), Addr { net: 0, node: 0 }, now);
+        let over = echo_request(Addr { net: 2905, node: 5 }, Addr { net: 3000, node: 9 });
+        assert_eq!(r.step(In::Aurp { from: PEER, bytes: &tunnelled(&over) }, now), Vec::new());
     }
 
     #[test]
@@ -850,12 +917,7 @@ mod tests {
         let mut r = router(now);
         route(&mut r, 2905, Target::Peer(PEER), Addr { net: 0, node: 0 }, now);
         let req = echo_request(Addr { net: 2905, node: 5 }, Addr { net: ETHER, node: 0 });
-        let wrapped = Aurp::Data {
-            dh: DomainHeader { dst: Di::Ip(Ipv4Addr::new(203, 0, 113, 1)), src: Di::Ip(PEER) },
-            ddp: req.to_bytes(),
-        }
-        .to_bytes();
-        let out = r.step(In::Aurp { from: PEER, bytes: &wrapped }, now);
+        let out = r.step(In::Aurp { from: PEER, bytes: &tunnelled(&req) }, now);
         // Answered by us, back down the tunnel — not repeated onto the cable.
         assert_eq!(out.len(), 1, "{out:?}");
         let Action::ToPeer { bytes, .. } = &out[0] else { panic!("not tunnelled: {out:?}") };

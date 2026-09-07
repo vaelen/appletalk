@@ -127,6 +127,11 @@ datagram arriving from a tunnel is passed to the local cable **without** a
 second increment. Whole tunnel, one hop. Do the same, or hop counts drift by
 one per tunnel relative to every AIR out there.
 
+Relaying from one tunnel to the next is the case that rule leaves implicit: we
+are the *sending* side of the second tunnel, so that tunnel's hop is ours to
+apply. A datagram arriving from peer A and leaving to peer B is incremented
+once; only peer-to-cable is free.
+
 ### What crosses and what does not
 
 Only unicast datagrams whose destination network is behind the peer cross the
