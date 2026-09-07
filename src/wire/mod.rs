@@ -36,7 +36,7 @@ mod zip;
 pub use aarp::Aarp;
 pub use aep::{Aep, Echo};
 pub use atp::{Atp, Func};
-// stub: Task 3 gives these a parser; Task 10 the first caller.
+// stub: Task 10 is the first caller.
 #[allow(unused_imports)]
 pub use aurp::{Aurp, Cmd, Di, DomainHeader, EventTuple};
 pub use ddp::Ddp;

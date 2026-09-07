@@ -319,6 +319,9 @@ fn parse_tuples(mut rest: &[u8]) -> Option<Vec<NetworkTuple>> {
 /// null event (code 0) is a single byte.
 fn parse_event(p: &[u8]) -> Option<(EventTuple, &[u8])> {
     let code = *p.first()?;
+    if code > 5 {
+        return None; // 0 null, 1 NA, 2 ND, 3 NRC, 4 NDC, 5 ZC; the rest undefined
+    }
     if code == 0 {
         return Some((EventTuple { code, tuple: NO_TUPLE }, &p[1..]));
     }
@@ -397,6 +400,8 @@ fn encode_zi_rsp(out: &mut Vec<u8>, extended: Option<u16>, zones: &[(u16, String
             None => {
                 // ponytail: exact match only, so "Zone" and "zone" each get
                 // spelled out. Lowercase the key if the saved bytes ever matter.
+                // ponytail: the offset is 15 bits, which a packet kept under
+                // the path MTU cannot reach. Split the reply if it ever can.
                 seen.insert(name.as_str(), (out.len() - base) as u16);
                 put_pstring(out, name);
             }
@@ -421,6 +426,8 @@ fn parse_options(p: &[u8], count: u8) -> Option<Vec<(u8, Vec<u8>)>> {
 }
 
 fn encode_options(out: &mut Vec<u8>, options: &[(u8, Vec<u8>)]) {
+    // ponytail: both counts are one byte, so 256 options or a 255-byte option
+    // wrap. Nothing on GlobalTalk sends even one; validate if we ever send them.
     out.push(options.len() as u8);
     for (t, data) in options {
         out.push((1 + data.len()) as u8);
@@ -441,8 +448,14 @@ impl Aurp {
         let dh = DomainHeader { dst, src };
         let body = &rest[6..];
         match u16::from_be_bytes([h[4], h[5]]) {
-            // One whole DDP datagram with the 13-byte extended header.
-            TYPE_DATA => (body.len() >= 13).then(|| Aurp::Data { dh, ddp: body.to_vec() }),
+            // One whole DDP datagram with the 13-byte extended header and
+            // nothing else: the 10-bit length covers the header and the data,
+            // so anything after it is not part of the datagram.
+            TYPE_DATA => {
+                let h = body.get(..13)?;
+                let len = u16::from_be_bytes([h[0] & 0x03, h[1]]) as usize;
+                (len == body.len()).then(|| Aurp::Data { dh, ddp: body.to_vec() })
+            }
             TYPE_ROUTING => {
                 let h = body.get(..8)?;
                 let cmd = Cmd::parse(
@@ -609,6 +622,8 @@ mod tests {
         assert_eq!((events[1].code, events[1].tuple.range), (2, (5, 5)));
         assert_eq!(events[2].code, 0); // the null event is one byte
         assert_eq!(a.to_bytes(), p);
+        // 6 and up are undefined; the tuple after one cannot be trusted either.
+        assert!(Aurp::parse(&routing(1, 2, 4, 0, &[6, 0, 5, 0])).is_none());
     }
 
     #[test]
@@ -671,6 +686,19 @@ mod tests {
         assert_eq!(a.to_bytes(), p);
         assert_eq!(a.to_string(), "aurp-data 10.0.0.1 > null 13 bytes");
         assert!(Aurp::parse(&p[..p.len() - 1]).is_none()); // shorter than a DDP header
+    }
+
+    /// A type 2 body is exactly one datagram: the DDP length field must account
+    /// for every byte, or a re-encode would turn the extra ones into payload.
+    #[test]
+    fn data_length_must_match_the_body() {
+        let head = [1, 0, 7, 1, 0, 0, 10, 0, 0, 1, 0, 1, 0, 0, 0, 2];
+        let mut short = head.to_vec();
+        short.extend([0x00, 14, 0, 0, 0x1a, 0x90, 0x0b, 0x59, 1, 2, 4, 4, 4]); // claims 14, is 13
+        assert!(Aurp::parse(&short).is_none());
+        let mut long = head.to_vec();
+        long.extend([0x00, 13, 0, 0, 0x1a, 0x90, 0x0b, 0x59, 1, 2, 4, 4, 4, 0xff]); // 13, is 14
+        assert!(Aurp::parse(&long).is_none());
     }
 
     #[test]
