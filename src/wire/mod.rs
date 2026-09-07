@@ -36,8 +36,6 @@ mod zip;
 pub use aarp::Aarp;
 pub use aep::{Aep, Echo};
 pub use atp::{Atp, Func};
-// stub: Task 10 is the first caller.
-#[allow(unused_imports)]
 pub use aurp::{Aurp, Cmd, Di, DomainHeader, EventTuple};
 pub use ddp::Ddp;
 pub use llap::{Llap, LLAP_ACK, LLAP_ENQ, LLAP_LONG_DDP, LLAP_SHORT_DDP};
@@ -242,16 +240,7 @@ pub fn decode(bytes: &[u8]) -> Option<Packet> {
         AARP => Aarp::parse(&frame.payload).map_or(Body::Unknown, Body::Aarp),
         DDP => match Ddp::parse(&frame.payload) {
             Some(d) => {
-                let inner = match d.typ {
-                    DDP_RTMP_DATA | DDP_RTMP_REQ => {
-                        Rtmp::parse(d.typ, &d.data).map_or(DdpBody::Unknown, DdpBody::Rtmp)
-                    }
-                    DDP_NBP => Nbp::parse(&d.data).map_or(DdpBody::Unknown, DdpBody::Nbp),
-                    DDP_ATP => Atp::parse(&d.data).map_or(DdpBody::Unknown, DdpBody::Atp),
-                    DDP_AEP => Aep::parse(&d.data).map_or(DdpBody::Unknown, DdpBody::Aep),
-                    DDP_ZIP => Zip::parse(&d.data).map_or(DdpBody::Unknown, DdpBody::Zip),
-                    _ => DdpBody::Unknown,
-                };
+                let inner = decode_ddp_body(&d);
                 Body::Ddp(d, inner)
             }
             None => Body::Unknown,
@@ -259,6 +248,22 @@ pub fn decode(bytes: &[u8]) -> Option<Packet> {
         _ => return None,
     };
     Some(Packet { frame, body })
+}
+
+/// The protocol inside a datagram, by its DDP type. Split out of `decode` so a
+/// datagram lifted off a LocalTalk link — which never went through `decode` —
+/// reaches the same parsers.
+pub fn decode_ddp_body(d: &Ddp) -> DdpBody {
+    match d.typ {
+        DDP_RTMP_DATA | DDP_RTMP_REQ => {
+            Rtmp::parse(d.typ, &d.data).map_or(DdpBody::Unknown, DdpBody::Rtmp)
+        }
+        DDP_NBP => Nbp::parse(&d.data).map_or(DdpBody::Unknown, DdpBody::Nbp),
+        DDP_ATP => Atp::parse(&d.data).map_or(DdpBody::Unknown, DdpBody::Atp),
+        DDP_AEP => Aep::parse(&d.data).map_or(DdpBody::Unknown, DdpBody::Aep),
+        DDP_ZIP => Zip::parse(&d.data).map_or(DdpBody::Unknown, DdpBody::Zip),
+        _ => DdpBody::Unknown,
+    }
 }
 
 /// Fixture builders shared by the protocol modules' tests.
