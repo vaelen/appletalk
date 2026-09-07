@@ -16,7 +16,6 @@ $ appletalk zones
 $ appletalk nodes
 Mini:AFPServer@* at 6800.150:249
 Mini:Workstation@* at 6800.150:4
-jrouter v0.0.21-dev:AppleRouter@68k Mac Club at 6800.1:253
 raspberrypi:AFPServer@* at 6800.3:128
 
 $ appletalk ping -c 2 6800.3
@@ -209,7 +208,7 @@ appletalk bridge udp
 ```
 
 Repeats AppleTalk between the Ethernet cable and LocalTalk-over-UDP-multicast
-(LToUDP) — the transport Mini vMac, Snow, jrouter and tashrouter all speak.
+(LToUDP) — the transport that Mini vMac, Snow, jrouter and tashrouter all speak.
 Emulated Macs on the multicast group become ordinary nodes on your EtherTalk
 network: they show up in the Chooser, answer a `nodes` run from another machine,
 and can mount a real file server. Traffic goes both ways.
@@ -475,14 +474,15 @@ group and machines on the Ethernet cable reach each other in both directions,
 and an emulator sees every zone on the internet, including those on the far side
 of the tunnel.
 
-Router mode runs end to end, but **none of it has been verified against a live
-network**: not the ports, not the routing and zone tables, not the local
-services, not the AURP tunnel. Its tests, `--help` and the config-error paths
-are all it has been through. The TashTalk port is furthest out — the hardware
-has not arrived, so its serial framing has only ever been tested against byte
-literals. A Phase 1 EtherTalk frame is dropped by the router rather than
-routed: Phase 1 carries no length field to trim Ethernet's padding by, so the
-datagram disagrees with its own length and fails closed.
+Router mode has run live on a real internet: an EtherTalk port and an LToUDP
+port, the GlobalTalk peer list, and traffic routed to remote zones over the
+AURP tunnel. Not yet measured on a wire: the hop-count rule (one hop per
+cable, none for the tunnel) and a second seed router. The TashTalk port is 
+furthest out — the hardware has not arrived, so its serial framing has only 
+ever been tested against byte literals. A Phase 1 EtherTalk frame is dropped 
+by the router rather than routed: Phase 1 carries no length field to trim 
+Ethernet's padding by, so the datagram disagrees with its own length and fails 
+closed.
 
 Not yet exercised on real hardware: retrying after an address collision — as
 opposed to detecting one, which works — zone lists long enough to need a second

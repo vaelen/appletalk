@@ -23,7 +23,7 @@ bugs hide:
 | A zone list needing more than one page | Still book-only. The live internet has 36 zones, but as length-prefixed strings that is 435 bytes — inside the 578 an ATP response carries, so the router answers in one packet. Roughly 50 zones would force a second page                |
 | A reply with no zone multicast address | Accepted since the `Option<MacAddr>` change, never seen                                                                                                                                                                                    |
 | A Phase 1 network                      | We only ever transmit Phase 2                                                                                                                                                                                                              |
-| Router mode, all of it                 | Not one part of `router` has met a live network. `CLAUDE.md` lists the three checks and their order: a second seed router beside jrouter, peering with it over UDP 387, then jrouter switched off                                          |
+| Router mode: hop counts on the wire    | Confirmed live 2026-09-08: EtherTalk and LToUDP ports, GlobalTalk peers, remote zones reachable. Unmeasured: `tcpdump -e -x` hops one higher on the cable than on the tunnel, never two; a second seed router beside jrouter               |
 | TashTalk against real hardware         | Deferred until the board arrives. Its serial framing — FCS, escapes, the node bitmap — is tested against byte literals only, and no ENQ has ever been answered by the firmware                                                             |
 
 ## Protocols not yet parsed

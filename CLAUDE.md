@@ -144,23 +144,31 @@ with `tcpdump -e -x` before trusting anything on that second list. The router
 adds one known drop to that list: a Phase 1 EtherTalk frame fails `arrived`'s
 DDP length check, because Phase 1 carries its Ethernet padding into the payload.
 
-**Router mode: nothing is confirmed on a wire.** `router` runs end to end —
-`run` opens every configured port and the AURP socket, then drives `step` off a
-250 ms tick — but everything under it has only met its own tests plus `--help`,
-the no-ports exit-2 path and a release build. Do not describe any of it as
-working on a network. Two things to know before reading the logs: every line it
-prints is prefixed `router:`, and `SIGUSR1` prints the routing and zone table,
-the peer table and a per-port summary, in that order, as one log line.
-`SIGINT`/`SIGTERM` send RD to every peer we are data sender to and drain for
-two seconds before exiting. The four checks that would change the status, in
-order:
+**Router mode: confirmed live on 2026-09-08**, in jrouter's place rather than
+beside it. The config was translated from the jrouter config (an EtherTalk port
+on `br0`, net 6800, zone `68k Mac Club`, a public IP, open peering and the seven
+GlobalTalk peers) plus an LToUDP port. Both ports came up, the AURP peers
+connected, and traffic was routed to the remote zones over the tunnel. That is
+the load-bearing result: ports, claims, tables, ZIP and AURP all work together
+on a real internet. Still unmeasured, so do not assume them: the hop-count
+check (`tcpdump -e -x` showing hops one higher on the cable than on the tunnel,
+never two), the second-seed-router-beside-jrouter arrangement, and an emulator
+on the LToUDP port listing the whole zone list through us. Two things to know
+before reading the logs: every line it prints is prefixed `router:`, and
+`SIGUSR1` prints the routing and zone table, the peer table and a per-port
+summary, in that order, as one log line. `SIGINT`/`SIGTERM` send RD to every
+peer we are data sender to and drain for two seconds before exiting.
 
 | Live check                                                                                                                                          | State                               |
 |-----------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------|
+| EtherTalk and LToUDP ports up, GlobalTalk peers connected over UDP 387, traffic routed to remote zones across the tunnel                            | Confirmed 2026-09-08                |
 | Second seed router beside jrouter, with an LToUDP port on its own net: an emulator lists the whole zone list through us and pings across the tunnel | Pending                             |
-| Peering with the LAN jrouter over UDP 387: both directions open, routes and zones crossing both ways                                                | Pending                             |
-| jrouter off: the GlobalTalk peers reconnect to us, and `tcpdump -e -x` shows hop counts one higher on the cable than on the tunnel, never two       | Pending                             |
+| `tcpdump -e -x` shows hop counts one higher on the cable than on the tunnel, never two                                                              | Pending                             |
 | TashTalk against a real board: the claim, an ENQ answered by the firmware, a physical Mac reaching the cable and the tunnel                         | Deferred until the hardware arrives |
+
+One deployment lesson from that run: under systemd, `RestrictAddressFamilies`
+must include `AF_NETLINK` or interface enumeration returns nothing and every
+NIC is "not found". `contrib/appletalk-router.service` has it.
 
 ```sh
 sudo setcap cap_net_raw+ep target/debug/appletalk   # or run as root
