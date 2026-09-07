@@ -957,6 +957,7 @@ impl fmt::Display for Sender {
 mod tests {
     use super::*;
     use crate::router::table::Tables;
+    use crate::wire::Ddp;
 
     const LOCAL: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
     const REMOTE: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
@@ -1386,7 +1387,18 @@ mod tests {
         let t0 = Instant::now();
         let mut tb = Tables::new();
         let mut ps = Peers::new(Di::Ip(LOCAL), true, &[], t0);
-        let ddp = vec![0u8; 20];
+        let ddp = Ddp {
+            hops: 0,
+            length: 0,
+            checksum: 0,
+            dst: Addr { net: 2905, node: 3 },
+            dst_socket: 4,
+            src: Addr { net: 6800, node: 1 },
+            src_socket: 4,
+            typ: 3,
+            data: vec![1, 2, 3],
+        }
+        .to_bytes();
         let dh = DomainHeader { dst: Di::Ip(LOCAL), src: Di::Ip(REMOTE) };
         let bytes = Aurp::Data { dh, ddp: ddp.clone() }.to_bytes();
         let (a, ch, back) = ps.packet(REMOTE, &bytes, &mut tb, t0);
