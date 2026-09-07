@@ -18,8 +18,8 @@ use super::{Dest, Emit, Target};
 use crate::capture::PortId;
 use crate::node::datagram;
 use crate::wire::{
-    zone_multicast, Addr, Atp, Ddp, DdpBody, Encode, Func, NetworkTuple, Rtmp, Zip, ZipAtp,
-    DDP_ATP, DDP_ZIP,
+    zone_multicast, Addr, Aep, Atp, Ddp, DdpBody, Echo, Encode, Func, Nbp, NbpFunc, NbpTuple,
+    NetworkTuple, Rtmp, Zip, ZipAtp, DDP_AEP, DDP_ATP, DDP_NBP, DDP_ZIP,
 };
 
 /// How often a router broadcasts its routing table on each port (PDF 143).
@@ -38,6 +38,11 @@ const DDP_MAX: usize = 586;
 const ATP_MAX: usize = 578;
 /// A ZIP Reply's function and network-count bytes.
 const ZIP_HEAD: usize = 2;
+
+/// The NBP type a router registers itself under, and the socket it answers
+/// lookups from.
+const ROUTER_TYPE: &str = "AppleRouter";
+const ROUTER_SOCKET: u8 = 253;
 
 /// The router's own name, and the state its two timers keep.
 pub struct Local {
@@ -66,7 +71,9 @@ impl Local {
             DdpBody::Rtmp(r) => self.rtmp(port, ports, ddp, r, tables, now),
             DdpBody::Zip(z) => self.zip(port, ddp, z, tables),
             DdpBody::Atp(a) => (zone_list(port, ddp, a, tables).into_iter().collect(), Vec::new()),
-            _ => (Vec::new(), Vec::new()),
+            DdpBody::Nbp(n) => (self.nbp(port, ports, ddp, n, tables), Vec::new()),
+            DdpBody::Aep(a) => (echo(port, ddp, a).into_iter().collect(), Vec::new()),
+            DdpBody::Unknown => (Vec::new(), Vec::new()),
         }
     }
 
@@ -136,6 +143,126 @@ impl Local {
             Zip::NetInfoReply { .. } | Zip::Notify => (Vec::new(), Vec::new()),
         }
     }
+
+    // ------------------------------------------------------------------- NBP
+
+    fn nbp(&self, port: &Port, ports: &[Port], ddp: &Ddp, n: &Nbp, tables: &Tables) -> Vec<Emit> {
+        let Some(t) = n.tuples.first() else { return Vec::new() };
+        // `*` and an empty zone both mean "wherever this cable is". The far
+        // end has no way to work that out, so it is resolved here (PDF 191).
+        let zone = match t.zone.as_str() {
+            "" | "*" => port.default_zone().to_string(),
+            z => z.to_string(),
+        };
+        let mut out = Vec::new();
+        match n.func {
+            NbpFunc::BrRq => {
+                for (start, target) in tables.nets_in_zone(&zone) {
+                    match direct_port(ports, target, start) {
+                        Some(q) => out.extend(lkup(q, n, &zone)),
+                        // Somebody else's cable: the first router on it is the
+                        // one that turns this into a LkUp (PDF 191).
+                        None => out.push(fwd_req(ddp, n, start, &zone)),
+                    }
+                }
+            }
+            NbpFunc::FwdReq => {
+                for q in ports.iter().filter(|q| q.has_zone(&zone)) {
+                    out.extend(lkup(q, n, &zone));
+                }
+            }
+            NbpFunc::LkUp => {}
+            // Somebody's answer to somebody's lookup: forwarded like any
+            // datagram, never answered here.
+            NbpFunc::LkUpReply => return Vec::new(),
+        }
+        out.extend(self.reply(port, n, t));
+        out
+    }
+
+    /// Our own LkUp-Reply, when the lookup names this router.
+    fn reply(&self, port: &Port, n: &Nbp, t: &NbpTuple) -> Option<Emit> {
+        let object = t.object == "=" || t.object.eq_ignore_ascii_case(&self.name);
+        let typ = t.typ == "=" || t.typ.eq_ignore_ascii_case(ROUTER_TYPE);
+        let zone = t.zone.is_empty() || t.zone == "*" || port.has_zone(&t.zone);
+        if !(object && typ && zone) {
+            return None;
+        }
+        let body = Nbp {
+            func: NbpFunc::LkUpReply,
+            id: n.id,
+            tuples: vec![NbpTuple {
+                addr: port.addr()?,
+                socket: ROUTER_SOCKET,
+                enumerator: 0,
+                object: self.name.clone(),
+                typ: ROUTER_TYPE.to_string(),
+                zone: port.default_zone().to_string(),
+            }],
+        };
+        // The requester's address comes from the tuple, not from DDP: the
+        // router that relayed the lookup is not the one waiting (PDF 192).
+        Some(Emit::Route(from(port, NBP_SOCKET, t.addr, t.socket, DDP_NBP, &body)?))
+    }
+}
+
+/// The port a network is directly attached to, if it is a cable of ours. A
+/// `Target::Port` whose range does not start where the port's does is a route
+/// learned through that port, not one of our own networks.
+fn direct_port(ports: &[Port], target: Target, start: u16) -> Option<&Port> {
+    match target {
+        Target::Port(id) => ports.iter().find(|p| p.id == id && p.range.0 == start),
+        Target::Peer(_) => None,
+    }
+}
+
+/// The same lookup, addressed at the whole cable through its zone multicast.
+fn lkup(q: &Port, n: &Nbp, zone: &str) -> Option<Emit> {
+    let body = retarget(n, NbpFunc::LkUp, zone);
+    // Network 0, node 255: every node on the cable, narrowed to the zone by
+    // the multicast address the link carries it on (PDF 192).
+    let ddp = from(q, NBP_SOCKET, Addr { net: 0, node: 255 }, NBP_SOCKET, DDP_NBP, &body)?;
+    Some(Emit::On { port: q.id, dest: Dest::Zone(zone.to_string()), ddp })
+}
+
+/// The same lookup, on its way to the first router of network `start`.
+fn fwd_req(ddp: &Ddp, n: &Nbp, start: u16, zone: &str) -> Emit {
+    let body = retarget(n, NbpFunc::FwdReq, zone);
+    // Node 0 of the range start means "the first router on that network"
+    // (PDF 191). The requester's own source address rides along untouched.
+    Emit::Route(datagram(
+        ddp.src,
+        ddp.src_socket,
+        Addr { net: start, node: 0 },
+        NBP_SOCKET,
+        DDP_NBP,
+        body.to_bytes(),
+    ))
+}
+
+/// The same tuples under a different function code, with the wildcard zone
+/// resolved: the only two things a router changes on the way through.
+fn retarget(n: &Nbp, func: NbpFunc, zone: &str) -> Nbp {
+    Nbp {
+        func,
+        id: n.id,
+        tuples: n
+            .tuples
+            .iter()
+            .map(|t| NbpTuple { zone: zone.to_string(), ..t.clone() })
+            .collect(),
+    }
+}
+
+/// AEP: the same data straight back to whoever asked.
+fn echo(port: &Port, ddp: &Ddp, a: &Aep) -> Option<Emit> {
+    if a.func != Echo::Request {
+        return None;
+    }
+    let body = Aep { func: Echo::Reply, data: a.data.clone() };
+    // Routed rather than pinned to this port: a ping can come from a network
+    // away, and the router already knows the way back.
+    Some(Emit::Route(from(port, AEP_SOCKET, ddp.src, ddp.src_socket, DDP_AEP, &body)?))
 }
 
 /// Answers a ZIP Query with the zones of every network named that we hold a
@@ -852,6 +979,203 @@ mod tests {
         }
         assert_eq!(all.len(), 42);
         assert_eq!(&all[2..], &many[..]);
+    }
+
+    /// The `Nbp` inside an `Emit::Route`, with the datagram that carried it.
+    fn routed_nbp(e: &Emit) -> (&Ddp, Nbp) {
+        match e {
+            Emit::Route(ddp) => (ddp, Nbp::parse(&ddp.data).expect("NBP")),
+            other => panic!("expected a routed emit, got {other:?}"),
+        }
+    }
+
+    fn lookup(func: NbpFunc, id: u8, from: Addr, socket: u8, name: &str, typ: &str, zone: &str) -> Nbp {
+        crate::node::lookup_request(func, id, from, socket, name, typ, zone)
+    }
+
+    /// Ports 0 (our cable) and 1 (net 100), plus a routed network 2905. Both
+    /// port 1 and 2905 carry the zone "Shared".
+    fn two_cables(t: Instant) -> (Port, Port, Tables) {
+        let a = ether(0, (NET, NET), &[ZONE], 9, t);
+        let b = ether(1, (100, 100), &["Shared"], 9, t);
+        let mut tables = Tables::new();
+        tables.add_port(0, (NET, NET), true, vec![ZONE.into()], t);
+        tables.add_port(1, (100, 100), true, vec!["Shared".into()], t);
+        tables.learn(&ext(2905, 2905, 1), Target::Port(0), PEER, t);
+        tables.add_zones(2905, &["Shared".into()], None);
+        (a, b, tables)
+    }
+
+    #[test]
+    fn nbp_brrq_looks_up_directly_and_forwards_to_the_rest() {
+        let t = Instant::now();
+        let (a, b, mut tables) = two_cables(t);
+        let ports = vec![p_clone(&a), p_clone(&b)];
+        let mut l = Local::new("router".into());
+
+        let n = lookup(NbpFunc::BrRq, 7, PEER, 250, "=", "AFPServer", "Shared");
+        let ddp = to_us(&a, NBP_SOCKET, DDP_NBP, &n);
+        let (out, changes) = l.handle(&a, &ports, &ddp, &DdpBody::Nbp(n), &mut tables, t);
+        assert_eq!(changes, Vec::new());
+        assert_eq!(out.len(), 2, "{out:?}");
+
+        // Port 1 is directly on a network in that zone: a zone-multicast LkUp.
+        let Emit::On { port, dest, ddp: sent } = &out[0] else { panic!("{:?}", out[0]) };
+        assert_eq!((*port, dest), (1, &Dest::Zone("Shared".into())));
+        assert_eq!(sent.dst, Addr { net: 0, node: 255 });
+        assert_eq!((sent.src, sent.src_socket, sent.dst_socket), (b.addr().unwrap(), NBP_SOCKET, NBP_SOCKET));
+        assert_eq!(
+            Nbp::parse(&sent.data).unwrap(),
+            lookup(NbpFunc::LkUp, 7, PEER, 250, "=", "AFPServer", "Shared")
+        );
+
+        // 2905 is somebody else's cable: a FwdReq to its first router, still
+        // carrying the requester's own DDP source.
+        let (sent, fwd) = routed_nbp(&out[1]);
+        assert_eq!(sent.dst, Addr { net: 2905, node: 0 });
+        assert_eq!((sent.src, sent.src_socket, sent.dst_socket), (PEER, 200, NBP_SOCKET));
+        assert_eq!(fwd, lookup(NbpFunc::FwdReq, 7, PEER, 250, "=", "AFPServer", "Shared"));
+    }
+
+    #[test]
+    fn nbp_brrq_replaces_a_wildcard_zone_with_the_ports_default() {
+        let t = Instant::now();
+        let (a, b, mut tables) = two_cables(t);
+        let ports = vec![p_clone(&a), p_clone(&b)];
+        let mut l = Local::new("router".into());
+
+        for asked in ["*", ""] {
+            let n = lookup(NbpFunc::BrRq, 3, PEER, 250, "Fred", "AFPServer", asked);
+            let ddp = to_us(&a, NBP_SOCKET, DDP_NBP, &n);
+            let (out, _) = l.handle(&a, &ports, &ddp, &DdpBody::Nbp(n), &mut tables, t);
+            assert_eq!(out.len(), 1, "asked for {asked:?}: {out:?}");
+            let Emit::On { port, dest, ddp: sent } = &out[0] else { panic!() };
+            assert_eq!((*port, dest), (0, &Dest::Zone(ZONE.into())));
+            // The far end cannot know what `*` meant here, so it is resolved.
+            assert_eq!(
+                Nbp::parse(&sent.data).unwrap(),
+                lookup(NbpFunc::LkUp, 3, PEER, 250, "Fred", "AFPServer", ZONE)
+            );
+        }
+    }
+
+    #[test]
+    fn nbp_fwdreq_becomes_a_lkup_on_every_port_holding_the_zone() {
+        let t = Instant::now();
+        let mut a = ether(0, (NET, NET), &[ZONE, "Shared"], 9, t);
+        a.zones = vec![ZONE.into(), "Shared".into()];
+        let (_, b, mut tables) = two_cables(t);
+        let ports = vec![p_clone(&a), p_clone(&b)];
+        let mut l = Local::new("router".into());
+
+        let n = lookup(NbpFunc::FwdReq, 9, PEER, 250, "Fred", "AFPServer", "Shared");
+        let ddp = datagram(PEER, 200, Addr { net: NET, node: 0 }, NBP_SOCKET, DDP_NBP, n.to_bytes());
+        let (out, _) = l.handle(&a, &ports, &ddp, &DdpBody::Nbp(n), &mut tables, t);
+        assert_eq!(out.len(), 2, "{out:?}");
+        for (i, want) in [(0usize, 0u8), (1, 1)] {
+            let Emit::On { port, dest, ddp: sent } = &out[i] else { panic!("{:?}", out[i]) };
+            assert_eq!((*port, dest), (want, &Dest::Zone("Shared".into())));
+            assert_eq!(sent.dst, Addr { net: 0, node: 255 });
+            assert_eq!(
+                Nbp::parse(&sent.data).unwrap(),
+                lookup(NbpFunc::LkUp, 9, PEER, 250, "Fred", "AFPServer", "Shared")
+            );
+        }
+    }
+
+    #[test]
+    fn nbp_lookups_naming_us_get_a_reply_to_the_tuples_own_address() {
+        let t = Instant::now();
+        let p = ether(0, (NET, NET), &[ZONE], 9, t);
+        let mut tables = internet(t);
+        let mut l = Local::new("router".into());
+        let asking = Addr { net: 2905, node: 7 };
+
+        for (object, typ, zone) in [
+            ("router", "AppleRouter", ZONE),
+            ("ROUTER", "=", "*"),
+            ("=", "=", ""),
+        ] {
+            let n = lookup(NbpFunc::LkUp, 21, asking, 250, object, typ, zone);
+            let ddp = to_us(&p, NBP_SOCKET, DDP_NBP, &n);
+            let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Nbp(n), &mut tables, t);
+            assert_eq!(out.len(), 1, "{object}:{typ}@{zone}");
+            // The requester's address comes from the tuple, not from DDP.
+            let (sent, reply) = routed_nbp(&out[0]);
+            assert_eq!((sent.dst, sent.dst_socket), (asking, 250));
+            assert_eq!((sent.src, sent.src_socket, sent.typ), (p.addr().unwrap(), NBP_SOCKET, DDP_NBP));
+            assert_eq!(
+                reply,
+                Nbp {
+                    func: NbpFunc::LkUpReply,
+                    id: 21,
+                    tuples: vec![NbpTuple {
+                        addr: p.addr().unwrap(),
+                        socket: 253,
+                        enumerator: 0,
+                        object: "router".into(),
+                        typ: "AppleRouter".into(),
+                        zone: ZONE.into(),
+                    }],
+                }
+            );
+        }
+
+        // Somebody else's name, type or zone is not ours to answer.
+        for (object, typ, zone) in [
+            ("Fred", "AppleRouter", ZONE),
+            ("router", "AFPServer", ZONE),
+            ("router", "AppleRouter", "BabCom"),
+        ] {
+            let n = lookup(NbpFunc::LkUp, 21, asking, 250, object, typ, zone);
+            let ddp = to_us(&p, NBP_SOCKET, DDP_NBP, &n);
+            let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Nbp(n), &mut tables, t);
+            assert_eq!(out, Vec::new(), "{object}:{typ}@{zone}");
+        }
+    }
+
+    #[test]
+    fn aep_requests_are_echoed_and_replies_are_not() {
+        let t = Instant::now();
+        let p = ether(0, (NET, NET), &[ZONE], 9, t);
+        let mut tables = internet(t);
+        let mut l = Local::new("router".into());
+
+        let a = Aep { func: Echo::Request, data: vec![0xde, 0xad, 0xbe, 0xef] };
+        let ddp = to_us(&p, AEP_SOCKET, DDP_AEP, &a);
+        let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Aep(a), &mut tables, t);
+        assert_eq!(out.len(), 1);
+        let Emit::Route(sent) = &out[0] else { panic!("{:?}", out[0]) };
+        assert_eq!((sent.dst, sent.dst_socket), (PEER, 200));
+        assert_eq!((sent.src, sent.src_socket), (p.addr().unwrap(), AEP_SOCKET));
+        assert_eq!(
+            Aep::parse(&sent.data).unwrap(),
+            Aep { func: Echo::Reply, data: vec![0xde, 0xad, 0xbe, 0xef] }
+        );
+
+        // A reply is somebody else's answer to somebody else's ping.
+        let a = Aep { func: Echo::Reply, data: vec![1] };
+        let ddp = to_us(&p, AEP_SOCKET, DDP_AEP, &a);
+        let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Aep(a), &mut tables, t);
+        assert_eq!(out, Vec::new());
+    }
+
+    #[test]
+    fn anything_else_is_ignored() {
+        let t = Instant::now();
+        let p = ether(0, (NET, NET), &[ZONE], 9, t);
+        let mut tables = internet(t);
+        let mut l = Local::new("router".into());
+
+        // A LkUp-Reply is forwarded like any datagram, not answered here.
+        let n = Nbp { func: NbpFunc::LkUpReply, id: 1, tuples: Vec::new() };
+        let ddp = to_us(&p, NBP_SOCKET, DDP_NBP, &n);
+        let out = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Nbp(n), &mut tables, t);
+        assert_eq!(out, (Vec::new(), Vec::new()));
+
+        let ddp = datagram(PEER, 200, p.addr().unwrap(), 200, 7, vec![1, 2, 3]);
+        let out = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Unknown, &mut tables, t);
+        assert_eq!(out, (Vec::new(), Vec::new()));
     }
 
     /// `Port` is not `Clone`, and every test needs the port both as the one
