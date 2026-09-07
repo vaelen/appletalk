@@ -23,16 +23,15 @@ use crate::capture::PortId;
 use crate::node::{
     self, aarp_action, aarp_response, glean, mac_for, probe, AarpAction, BROADCAST_MAC,
 };
+/// The AARP probe schedule is the node runtime's (PDF 98); a port claims its
+/// address exactly the way a node does.
+pub use crate::node::{PROBE_INTERVAL, PROBE_TRIES};
 use crate::router::{Action, Dest};
 use crate::wire::{
     zone_multicast, Addr, Body, Ddp, Encode, Llap, Packet, AARP, DDP, LLAP_ACK, LLAP_ENQ,
     LLAP_LONG_DDP, LLAP_SHORT_DDP,
 };
 
-/// AARP probes, and the gap between them (PDF 85). The same numbers `node.rs`
-/// uses; its own copies are private to the node runtime.
-pub const PROBE_TRIES: u32 = 10;
-pub const PROBE_INTERVAL: Duration = Duration::from_millis(200);
 /// lapENQs, and the gap between them (PDF 71).
 pub const ENQ_TRIES: u32 = 8;
 pub const ENQ_INTERVAL: Duration = Duration::from_millis(250);
@@ -161,6 +160,12 @@ impl Port {
     /// Ethernet input: glean, defend, and pass datagrams up.
     pub fn inbound_ether(&mut self, p: &Packet, now: Instant) -> (Inbound, Vec<Action>) {
         let Kind::Ether { mac } = self.kind else { return (Inbound::Ignore, Vec::new()) };
+        // Our own frame heard back off a reflecting cable. Drop it before
+        // anything reads it: a reflected AARP Response names our own address,
+        // which `aarp_action` would report as someone else stealing it.
+        if p.frame.src == mac {
+            return (Inbound::Ignore, Vec::new());
+        }
         glean(&mut self.amt, p);
         match &p.body {
             Body::Aarp(a) => {
@@ -189,8 +194,6 @@ impl Port {
                 };
                 (Inbound::Handled, out)
             }
-            // Our own frame heard back off the cable.
-            Body::Ddp(..) if p.frame.src == mac => (Inbound::Ignore, Vec::new()),
             // Both header forms reach Ethernet as extended, so there is
             // nothing to lift.
             Body::Ddp(d, _) => (Inbound::Ddp(d.clone()), Vec::new()),
@@ -252,12 +255,7 @@ impl Port {
         match self.kind {
             Kind::Ether { mac } => {
                 let dst = match dest {
-                    // ponytail: the AMT is keyed by full address, and a
-                    // `Dest::Node` names only the node — so a next hop on
-                    // another network of our range misses and broadcasts,
-                    // which still delivers. Key the map by node ID per port
-                    // if the extra broadcasts ever matter.
-                    Dest::Node(n) => mac_for(&self.amt, Addr { net: ddp.dst.net, node: *n }),
+                    Dest::Node(n) => self.mac_for_node(*n, ddp.dst.net),
                     Dest::Broadcast => BROADCAST_MAC,
                     Dest::Zone(z) => zone_multicast(z),
                 };
@@ -284,6 +282,27 @@ impl Port {
                 Some(Action::ToLlap { port: self.id, llap: Llap { dst, src: node, typ, data } })
             }
         }
+    }
+
+    /// The MAC for a node on this cable. The exact address is right for a
+    /// direct delivery, but a *next hop* was gleaned under its own address on
+    /// our cable while `ddp.dst` names the far network, so that lookup misses
+    /// every time — and a hardware-broadcast DDP for a remote network is
+    /// forwarded by every router that hears it, not merely ignored. So fall
+    /// back to any address in this port's own range carrying that node ID.
+    ///
+    /// ponytail: a next hop gleaned under a network outside our range still
+    /// broadcasts. Key the AMT by node ID per port if one ever turns up.
+    fn mac_for_node(&self, node: u8, net: u16) -> MacAddr {
+        let exact = mac_for(&self.amt, Addr { net, node });
+        if exact != BROADCAST_MAC {
+            return exact;
+        }
+        let ours = self.range.0..=self.range.1;
+        self.amt
+            .iter()
+            .find(|(a, _)| a.node == node && ours.contains(&a.net))
+            .map_or(BROADCAST_MAC, |(_, m)| *m)
     }
 
     /// The node ID we hold, or the one we are asking for.
@@ -564,6 +583,33 @@ mod tests {
     }
 
     #[test]
+    fn emit_unicasts_to_a_next_hop_gleaned_under_its_own_address() {
+        let t = Instant::now();
+        let mut p = port(Kind::Ether { mac: OURS }, t);
+        let node = claim(&mut p, t);
+        // The next-hop router is on our cable, so that is the address its
+        // traffic is gleaned under.
+        let hop = Addr { net: NET, node: 42 };
+        let beacon = ddp(hop, Addr { net: NET, node: 255 });
+        p.inbound_ether(&ether_packet(Body::Ddp(beacon, DdpBody::Unknown), THEIRS), t);
+
+        // The datagram we forward through it names the *far* network, so the
+        // exact lookup misses — but this must still be a unicast. Broadcasting
+        // it would have every router on the cable forward it.
+        let far = ddp(Addr { net: NET, node }, Addr { net: 2905, node: 7 });
+        let Action::ToEther { frame, .. } = p.emit(&Dest::Node(42), &far).unwrap() else {
+            panic!("expected an Ethernet frame");
+        };
+        assert_eq!(frame.dst, THEIRS);
+
+        // A node we have never heard from still has to be broadcast for.
+        let Action::ToEther { frame, .. } = p.emit(&Dest::Node(43), &far).unwrap() else {
+            panic!("expected an Ethernet frame");
+        };
+        assert_eq!(frame.dst, BROADCAST_MAC);
+    }
+
+    #[test]
     fn emit_uses_the_zone_multicast_on_ether_and_broadcast_on_localtalk() {
         let t = Instant::now();
         let mut e = port(Kind::Ether { mac: OURS }, t);
@@ -656,6 +702,16 @@ mod tests {
         let (r, out) = e.inbound_ether(&ether_packet(Body::Ddp(theirs, DdpBody::Unknown), THEIRS), t);
         assert!(matches!(r, Inbound::Ddp(_)), "{r:?}");
         assert_eq!(out, Vec::new());
+
+        // Our own AARP Response reflected back names our own address, which
+        // is not somebody else stealing it.
+        let ours = Addr { net: NET, node };
+        let refl = Aarp { op: 2, src_hw: OURS, src: ours, dst_hw: THEIRS, dst: ours };
+        assert_eq!(
+            e.inbound_ether(&ether_packet(Body::Aarp(refl), OURS), t),
+            (Inbound::Ignore, Vec::new())
+        );
+        assert_eq!(e.node, Some(node));
 
         // On LocalTalk it is the node ID, and our own echoed ACK with it.
         let mut l = port(Kind::Tashtalk, t);

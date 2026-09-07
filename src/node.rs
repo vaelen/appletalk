@@ -262,8 +262,8 @@ pub fn parse_addr(s: &str) -> io::Result<Addr> {
 }
 
 /// PDF 98: ten retransmissions, one fifth of a second apart.
-const PROBE_TRIES: u32 = 10;
-const PROBE_INTERVAL: Duration = Duration::from_millis(200);
+pub const PROBE_TRIES: u32 = 10;
+pub const PROBE_INTERVAL: Duration = Duration::from_millis(200);
 /// How many different addresses to try before giving up entirely.
 const ADDRESS_TRIES: u32 = 5;
 /// We keep no saved zone across runs, so we request the empty zone name — the
