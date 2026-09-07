@@ -181,32 +181,47 @@ impl Tables {
         now: Instant,
     ) -> Vec<RouteChange> {
         // A correctly maintained table holds no overlapping ranges, so a tuple
-        // that overlaps an entry without matching it is dropped (PDF 149).
-        if self.routes.iter().any(|r| r.range != t.range && overlaps(r.range, t.range)) {
+        // that overlaps an entry without matching it is dropped (PDF 149). A
+        // tuple for a network of our own is dropped too -- we are the authority
+        // on it, and it must not gain a second entry (PDF 145).
+        if self.routes.iter().any(|r| {
+            (r.range != t.range && overlaps(r.range, t.range)) || (r.range == t.range && r.direct())
+        }) {
             return Vec::new();
         }
         let start = t.range.0;
         let old = self.snapshot(&[start]);
-        let distance = t.distance.saturating_add(1);
-        let state = if t.distance == 31 { State::Bad } else { State::Good };
+        // Distance 31 is notify neighbour: mark the entry bad and leave its
+        // distance alone. Anything from 15 up would store 16 or more hops,
+        // which DDP's hop count cannot carry, so the book deletes the entry
+        // rather than keeping an unreachable route (PDF 146).
+        let bad = t.distance == 31;
+        let unreachable = t.distance >= 15 && !bad;
+        let state = if bad { State::Bad } else { State::Good };
         match self
             .routes
-            .iter_mut()
-            .find(|r| r.range == t.range && r.target == target && r.next == next)
+            .iter()
+            .position(|r| r.range == t.range && r.target == target && r.next == next)
         {
-            Some(r) if r.direct() => {}
+            Some(i) if unreachable => {
+                self.routes.remove(i);
+            }
             // Replace-Entry.
-            Some(r) => {
+            Some(i) => {
+                let r = &mut self.routes[i];
                 r.extended = t.extended;
-                r.distance = distance;
+                if !bad {
+                    r.distance = t.distance + 1;
+                }
                 r.state = state;
                 r.seen = now;
             }
+            None if unreachable => {}
             // Create-New-Entry: an alternative path, which may not be the best.
             None => self.routes.push(Route {
                 range: t.range,
                 extended: t.extended,
-                distance,
+                distance: t.distance + 1,
                 target,
                 next,
                 state,
@@ -292,6 +307,10 @@ impl Tables {
             let mut tuple = r.tuple();
             if !r.state.usable() {
                 tuple.distance = 31;
+            } else if tuple.distance >= 15 {
+                // Copy-in-tuples advertises a good entry only while its
+                // distance is below 15 (PDF 148).
+                continue;
             }
             out.push(tuple);
         }
@@ -638,6 +657,37 @@ mod tests {
         assert_eq!(tb.nets_in_zone("eng"), vec![(5, Target::Port(0))]);
         assert_eq!(tb.all_zones(), ["Local", "Eng", "Sales"]);
         assert!(tb.zoneless().is_empty());
+    }
+
+    #[test]
+    fn fifteen_hops_is_the_ceiling_and_our_own_nets_are_not_relearned() {
+        let now = Instant::now();
+        let mut tb = Tables::new();
+        tb.add_port(0, (1, 1), false, vec![], now);
+        // A tuple already at the ceiling is never stored as a usable route.
+        assert!(tb.learn(&t((5, 5), false, 15), Target::Port(0), r1(), now).is_empty());
+        assert!(tb.best(5).is_none());
+        assert!(tb.routes().all(|r| r.range != (5, 5)));
+        // A route that grows past the ceiling is deleted, not advertised.
+        tb.learn(&t((7, 7), false, 1), Target::Port(0), r1(), now);
+        assert_eq!(tb.best(7).unwrap().distance, 2);
+        let ch = tb.learn(&t((7, 7), false, 20), Target::Port(0), r1(), now);
+        assert_eq!(ch.len(), 1);
+        assert!(ch[0].new.is_none());
+        assert!(tb.routes().all(|r| r.range != (7, 7)));
+        // A tuple for one of our own networks is ignored, not stored as a sibling.
+        assert!(tb.learn(&t((1, 1), false, 3), Target::Port(0), r1(), now).is_empty());
+        assert_eq!(tb.routes().filter(|r| r.range == (1, 1)).count(), 1);
+        // Notify neighbour leaves the stored distance alone and still goes out at 31.
+        tb.learn(&t((9, 9), false, 4), Target::Port(0), r1(), now);
+        tb.learn(&t((9, 9), false, 31), Target::Port(0), r1(), now);
+        let bad = tb.routes().find(|r| r.range == (9, 9)).unwrap();
+        assert_eq!((bad.state, bad.distance), (State::Bad, 5));
+        // A peer's network at 15 hops stays in the table but is never beaconed.
+        tb.learn(&t((11, 11), false, 0), peer(), Addr { net: 0, node: 0 }, now);
+        tb.set_distance(peer(), 11, 15, now);
+        assert_eq!(tb.best(11).unwrap().distance, 15);
+        assert_eq!(tb.tuples_for(1), vec![t((1, 1), false, 0), t((9, 9), false, 31)]);
     }
 
     #[test]
