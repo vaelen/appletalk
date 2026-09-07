@@ -2,27 +2,35 @@
 
 A Rust implementation of the AppleTalk protocol stack. It dumps EtherTalk
 traffic passively by default, and can also claim an AppleTalk address and act
-as a node: `zones`, `nodes`, `ping` and `bridge`. `appletalk.md` has the
+as a node: `zones`, `nodes`, `ping` and `bridge`. `router` goes further and
+routes between several links and AURP tunnel peers. `appletalk.md` has the
 protocol overview and the planned build order.
 
 ## Layout
 
-| File             | Holds                                                                                        |
-|------------------|----------------------------------------------------------------------------------------------|
-| `src/wire/`      | Protocol parsers, one file per protocol; `decode()`. No I/O.                                 |
-| `src/session.rs` | Reassembles multi-packet ATP transactions. The only stateful module, driven by the frontend. |
-| `src/capture.rs` | Capture thread: NIC to `Event`s on a bounded channel.                                        |
-| `src/node.rs`    | Node runtime: claims an address, defends it, sends requests, awaits replies.                 |
-| `src/ltoudp.rs`  | LToUDP transport: the multicast socket and its reader thread.                                |
-| `src/bridge.rs`  | Bridge runtime: repeats AppleTalk between EtherTalk and a LocalTalk link.                    |
-| `src/text.rs`    | Plain-text frontend. Timestamps and hexdump.                                                 |
-| `src/cli.rs`     | `clap` command line: subcommands, and the output/filter flags a frontend obeys.              |
-| `src/main.rs`    | Glue: pick an interface, pick a frontend, start it.                                          |
-| `appletalk.md`   | Protocol reference: layers, addressing, Phase 1 vs 2.                                        |
-| `LToUDP.md`      | The LToUDP protocol, for someone implementing it elsewhere.                                  |
-| `bridge.md`      | The bridge's behaviour, for whoever has to debug it.                                         |
-| `docs/AURP.md`   | The AURP tunnel protocol (RFC 1504) as GlobalTalk runs it; groundwork for router mode.       |
-| `repos/`         | Reference clones of jrouter and tashrouter. Gitignored; re-clone if missing.                 |
+| File                  | Holds                                                                                              |
+|-----------------------|----------------------------------------------------------------------------------------------------|
+| `src/wire/`           | Protocol parsers, one file per protocol; `decode()`. No I/O.                                       |
+| `src/session.rs`      | Reassembles multi-packet ATP transactions. The only stateful module, driven by the frontend.       |
+| `src/capture.rs`      | Capture thread: NIC to `Event`s on a bounded channel.                                              |
+| `src/node.rs`         | Node runtime: claims an address, defends it, sends requests, awaits replies.                       |
+| `src/ltoudp.rs`       | LToUDP transport: the multicast socket and its reader thread.                                      |
+| `src/tashtalk.rs`     | TashTalk transport: LocalTalk over a serial port — FCS, escapes, node bitmap, reader thread.       |
+| `src/bridge.rs`       | Bridge runtime: repeats AppleTalk between EtherTalk and a LocalTalk link.                          |
+| `src/config.rs`       | Router config: the TOML file, the `router` flags, their merge, and `peers import`.                 |
+| `src/router/mod.rs`   | Router runtime: the `Target`/`Dest`/`Emit`/`Action` types the parts below speak, and the run loop. |
+| `src/router/table.rs` | Routing and zone tables: best route per network, the book's aging, split horizon per port.         |
+| `src/router/ports.rs` | One router port: its link kind, network range, zones, address claim and framing.                   |
+| `src/router/local.rs` | The services a router owes its own cables: RTMP, ZIP, NBP and echo. Pure.                          |
+| `src/router/aurp.rs`  | The AURP peers: two one-way connections each, their state machines and timers.                     |
+| `src/text.rs`         | Plain-text frontend. Timestamps and hexdump.                                                       |
+| `src/cli.rs`          | `clap` command line: subcommands, and the output/filter flags a frontend obeys.                    |
+| `src/main.rs`         | Glue: pick an interface, pick a frontend, start it.                                                |
+| `appletalk.md`        | Protocol reference: layers, addressing, Phase 1 vs 2.                                              |
+| `LToUDP.md`           | The LToUDP protocol, for someone implementing it elsewhere.                                        |
+| `bridge.md`           | The bridge's behaviour, for whoever has to debug it.                                               |
+| `docs/AURP.md`        | The AURP tunnel protocol (RFC 1504) as GlobalTalk runs it, and what this stack implements.         |
+| `repos/`              | Reference clones of jrouter and tashrouter. Gitignored; re-clone if missing.                       |
 
 Keep parsing pure and in `wire/` — it stays testable without a NIC.
 
@@ -133,11 +141,27 @@ entry aging after a node goes quiet, and that Ethernet-to-Ethernet traffic stays
 off the LToUDP group. The book settles byte layouts, not behavior — cross-check
 with `tcpdump -e -x` before trusting anything on that second list.
 
+**Router mode: nothing is confirmed.** Everything under `router` — the ports,
+the routing and zone tables, the local services, the AURP tunnel and the config
+— has only ever met its own unit tests. Do not describe any of it as working.
+The four checks that would change that, in order:
+
+| Live check                                                                                                                                          | State                               |
+|-----------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------|
+| Second seed router beside jrouter, with an LToUDP port on its own net: an emulator lists the whole zone list through us and pings across the tunnel | Pending                             |
+| Peering with the LAN jrouter over UDP 387: both directions open, routes and zones crossing both ways                                                | Pending                             |
+| jrouter off: the GlobalTalk peers reconnect to us, and `tcpdump -e -x` shows hop counts one higher on the cable than on the tunnel, never two       | Pending                             |
+| TashTalk against a real board: the claim, an ENQ answered by the firmware, a physical Mac reaching the cable and the tunnel                         | Deferred until the hardware arrives |
+
 ```sh
 sudo setcap cap_net_raw+ep target/debug/appletalk   # or run as root
+# router only: UDP 387 is privileged
+sudo setcap cap_net_raw,cap_net_bind_service+ep target/debug/appletalk
 ./target/debug/appletalk [-i interface] [--hex] [--hide rtmp,...]   # monitor, the default
-./target/debug/appletalk zones                                     # list zones on the internet
+./target/debug/appletalk zones                                      # list zones on the internet
 ./target/debug/appletalk nodes [zone]                               # list entities in a zone
 ./target/debug/appletalk ping <net.node | object:type@zone>         # echo a node
 ./target/debug/appletalk bridge udp                                 # join LToUDP and bridge it
+./target/debug/appletalk router [--config appletalk.toml]           # route between links and peers
+./target/debug/appletalk peers import peers.txt                     # merge a peer list into the config
 ```
