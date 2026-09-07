@@ -452,7 +452,7 @@ pub fn run(mut cfg: Config) -> io::Result<()> {
     // alive for ever and hide the "all producers gone" case.
     drop(tx);
 
-    cfg.public_ip = Some(domain_identifier(&cfg, &sock, nic_ip));
+    cfg.public_ip = domain_identifier(&cfg, &sock, nic_ip);
 
     let now = Instant::now();
     let mut r = Router::new(&cfg, kinds, now);
@@ -461,7 +461,7 @@ pub fn run(mut cfg: Config) -> io::Result<()> {
         cfg.name,
         r.ports.len(),
         cfg.listen,
-        cfg.public_ip.expect("just set")
+        cfg.public_ip.map_or(Di::Null, Di::Ip)
     );
 
     // SAFETY: both handlers only store to a `static AtomicBool`, which is all
@@ -507,7 +507,7 @@ pub fn run(mut cfg: Config) -> io::Result<()> {
         if DUMP.swap(false, Ordering::Relaxed) {
             actions.extend(r.step(In::Dump, now));
         }
-        if deadline.is_none() && STOP.load(Ordering::Relaxed) {
+        if deadline.is_none() && STOP.swap(false, Ordering::Relaxed) {
             eprintln!("router: shutting down");
             actions.extend(r.peers.shutdown(now));
             deadline = Some(now + SHUTDOWN_GRACE);
@@ -515,7 +515,9 @@ pub fn run(mut cfg: Config) -> io::Result<()> {
         for a in actions {
             execute(a, &mut links, &sock);
         }
-        if deadline.is_some_and(|d| now >= d) {
+        // Out of time, or a second SIGINT: the operator is not waiting the
+        // two seconds out.
+        if deadline.is_some_and(|d| now >= d || STOP.swap(false, Ordering::Relaxed)) {
             return Ok(());
         }
     }
@@ -592,15 +594,20 @@ fn spawn_aurp(sock: &UdpSocket, tx: SyncSender<Event>) -> io::Result<()> {
 
 /// Our AURP domain identifier: what we configured, else whatever address the
 /// socket or a NIC gives us. A private or loopback address works between two
-/// routers on one LAN and nowhere else, so say so rather than fail.
-fn domain_identifier(cfg: &Config, sock: &UdpSocket, nic_ip: Option<Ipv4Addr>) -> Ipv4Addr {
+/// routers on one LAN and nowhere else, so say so rather than fail. None when
+/// nothing resolved at all, which is the null DI: announcing 0.0.0.0 would
+/// name a domain that cannot exist, and a peer addresses a null DI by the IP
+/// header instead (`docs/AURP.md`, "Domain identifiers").
+fn domain_identifier(cfg: &Config, sock: &UdpSocket, nic_ip: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
     let bound = match sock.local_addr() {
         Ok(std::net::SocketAddr::V4(a)) if !a.ip().is_unspecified() => Some(*a.ip()),
         _ => None,
     };
-    let ip = cfg.public_ip.or(bound).or(nic_ip).unwrap_or(Ipv4Addr::UNSPECIFIED);
-    if ip.is_private() || ip.is_loopback() || ip.is_unspecified() {
-        eprintln!("router: domain identifier {ip} is not a public address; set public_ip if peers are across the internet");
+    let ip = cfg.public_ip.or(bound).or(nic_ip).filter(|a| !a.is_unspecified());
+    match ip {
+        None => eprintln!("router: no address to use as a domain identifier; peers will have to go by our IP header. Set public_ip"),
+        Some(a) if a.is_private() || a.is_loopback() => eprintln!("router: domain identifier {a} is not a public address; set public_ip if peers are across the internet"),
+        Some(_) => {}
     }
     ip
 }

@@ -24,6 +24,11 @@ pub enum Zip {
     /// the number of names in the *whole* list, not in this packet (PDF 185).
     /// `None` is a plain Reply (command 2), whose count is exactly the pairs it
     /// carries and whose every network's list is entirely inside it.
+    ///
+    /// Writing this straight back out is a deliberate exemption from "recompute
+    /// derived fields at encode time": an Extended Reply's count is not derived
+    /// from the packet at all, only from the whole list, which only the sender
+    /// knows. The plain Reply's count *is* recomputed.
     Reply { zones: Vec<(u16, String)>, total: Option<u8> },
     /// A booting node asking a router for its cable range and zone.
     GetNetInfo { zone: String },

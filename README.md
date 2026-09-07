@@ -224,7 +224,7 @@ silently disable a port.
 name = "appletalk"            # NBP object name, type AppleRouter
 public_ip = "203.0.113.5"     # our AURP domain identifier; needed behind NAT
 listen = "0.0.0.0:387"
-open_peering = true           # accept peers we did not configure
+open_peering = true           # accept peers we did not configure, up to 256
 peers = ["router.example.net", "192.0.2.7"]
 
 [[ethertalk]]
@@ -322,7 +322,13 @@ kill -USR1 $(pidof appletalk)
 `SIGINT` or `SIGTERM` shuts it down politely: it sends an RD to every peer it
 is data sender to, keeps running for up to two seconds so those can be
 acknowledged, and exits. Peers therefore drop our routes at once rather than
-waiting out their tickle timer.
+waiting out their tickle timer. A second `SIGINT` during those two seconds
+exits immediately.
+
+Open peering holds at most 256 peers, and an unconfigured one with neither
+connection up is dropped after 90 seconds quiet: UDP 387 faces the internet,
+and a stranger's packet must not buy permanent memory. Configured peers are
+exempt from both.
 
 AURP listens on UDP 387, which is privileged, so the router wants one more
 capability than the rest of the stack:

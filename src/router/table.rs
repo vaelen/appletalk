@@ -213,7 +213,11 @@ impl Tables {
                 r.state = state;
                 r.seen = now;
             }
-            None if unreachable => {}
+            // Neither an unreachable tuple nor notify-neighbour creates an
+            // entry: there is nothing to mark bad, and inventing one at
+            // distance 32 would be a route to a network we have never heard
+            // of (PDF 146).
+            None if unreachable || bad => {}
             // Create-New-Entry: an alternative path, which may not be the best.
             None => self.routes.push(Route {
                 range: t.range,
@@ -600,6 +604,10 @@ mod tests {
         assert!(ch[0].new.is_none());
         assert!(tb.best(10).is_none());
         assert_eq!(tb.tuples_for(1), vec![t((1, 1), false, 0), t((10, 12), true, 31)]); // notify neighbour
+        // Notify neighbour for a network we hold no entry for creates none:
+        // an entry at distance 32 would be a route to a stranger.
+        assert!(tb.learn(&t((900, 900), true, 31), Target::Port(0), r1(), now).is_empty());
+        assert!(tb.best(900).is_none());
     }
 
     #[test]

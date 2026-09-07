@@ -500,6 +500,10 @@ pub fn import_peers(config: Option<&Path>, list: &Path) -> io::Result<(usize, us
     let mut doc: toml_edit::DocumentMut =
         text.parse().map_err(|e| bad(format!("{}: {e}", path.display())))?;
     let counts = merge_peers(&mut doc, &hosts);
+    // Nothing new: leave the file's mtime, formatting and comments alone.
+    if counts.0 == 0 {
+        return Ok(counts);
+    }
 
     // Written beside the config and renamed over it, so an interrupted write
     // cannot leave a half-config behind.
