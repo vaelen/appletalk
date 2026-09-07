@@ -378,6 +378,17 @@ mod tests {
     }
 
     #[test]
+    fn decode_follows_rtmp_data() {
+        let mut dgram = vec![0x00, 0, 0x00, 0x00, 0x00, 0x00, 0x1a, 0x90, 255, 1, 1, 1, DDP_RTMP_DATA];
+        dgram.extend([0x1a, 0x90, 8, 1, 0x1a, 0x90, 0x80, 0x1a, 0x90, 0x82]);
+        dgram[1] = dgram.len() as u8;
+        let mut body = vec![0xaa, 0xaa, 0x03, 0x08, 0x00, 0x07, 0x80, 0x9b];
+        body.extend(&dgram);
+        let p = decode(&frame(body.len() as u16, &body)).unwrap();
+        assert!(matches!(p.body, Body::Ddp(_, DdpBody::Rtmp(Rtmp::Data { .. }))));
+    }
+
+    #[test]
     fn decode_skips_non_appletalk() {
         assert!(decode(&frame(0x0800, &[0; 20])).is_none()); // IPv4
         assert!(decode(&[0; 10]).is_none()); // runt
