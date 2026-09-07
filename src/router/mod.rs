@@ -245,7 +245,14 @@ impl Router {
         let for_us = node == 0 || node == 255 || Some(node) == self.ports[q].node;
         let mut out = Vec::new();
         if for_us {
+            // The cable it came off, where there is one. Borrowing both by
+            // index needs the arriving one resolved first.
+            let here = match origin {
+                Origin::Port(id) => self.index(id),
+                _ => None,
+            };
             let (emits, changes) = self.local.handle(
+                here.map(|i| &self.ports[i]),
                 &self.ports[q],
                 &self.ports,
                 &ddp,
@@ -975,6 +982,35 @@ mod tests {
         assert_eq!(deleted.len(), 1, "{deleted:?}");
         assert!(deleted[0].contains("3000-3000"), "{}", deleted[0]);
         assert!(deleted[0].contains("distance 1"), "{}", deleted[0]);
+    }
+
+    /// A router never sends RTMP off its own cable, so RTMP addressed to
+    /// another of our cables' broadcast teaches us nothing -- otherwise any
+    /// node on cable 0 could inject a route reached through a next hop that
+    /// is not even on cable 1.
+    #[test]
+    fn rtmp_data_arriving_on_the_wrong_cable_is_ignored() {
+        let now = Instant::now();
+        let mut r = router(now);
+        let beacon = Rtmp::Data {
+            sender: Addr { net: ETHER, node: 5 },
+            range: Some((ETHER, ETHER)),
+            tuples: vec![NetworkTuple { range: (3000, 3000), extended: true, distance: 0 }],
+        };
+        // Off the Ethernet cable, but addressed to the LToUDP cable's broadcast.
+        let ddp = datagram(
+            Addr { net: ETHER, node: 5 },
+            RTMP_SOCKET,
+            Addr { net: LOCAL, node: 255 },
+            RTMP_SOCKET,
+            DDP_RTMP_DATA,
+            beacon.to_bytes(),
+        );
+        let out = r.step(In::Ether { port: 0, packet: &on_ether(&ddp) }, now);
+        assert!(r.tables.best(3000).is_none(), "{out:?}");
+        // The same beacon on the cable it names is learned.
+        let out = r.step(In::Llap { port: 1, llap: &on_llap(&ddp, 255, 5) }, now);
+        assert!(r.tables.best(3000).is_some(), "{out:?}");
     }
 
     #[test]

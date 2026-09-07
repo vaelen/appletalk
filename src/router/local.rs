@@ -54,32 +54,52 @@ impl Local {
     }
 
     /// A datagram delivered to this router (dst node ours, 0, or 255 on one of
-    /// our nets) on `port`.
+    /// our nets).
+    ///
+    /// `arrived_on` is the cable it came off, `None` for one out of a tunnel;
+    /// `concerning` is the port owning the network it was addressed to. The
+    /// two differ whenever a node broadcasts at another of our cables, and
+    /// which one a service wants is not the same for all of them: an echo is
+    /// answered from the address the datagram named, but "this network" to a
+    /// node asking means the cable that node is on.
+    // Two ports, the whole port list, the datagram, its decoded body, the
+    // tables and the clock: every one of them is something a service here
+    // reads, and bundling them would only move the list into a struct.
+    #[allow(clippy::too_many_arguments)]
     pub fn handle(
         &mut self,
-        port: &Port,
+        arrived_on: Option<&Port>,
+        concerning: &Port,
         ports: &[Port],
         ddp: &Ddp,
         body: &DdpBody,
         tables: &mut Tables,
         now: Instant,
     ) -> (Vec<Emit>, Vec<RouteChange>) {
+        let here = arrived_on.unwrap_or(concerning);
         // Each service listens on one well-known socket; a datagram of the
         // right type sent anywhere else is not addressed to it.
         match body {
+            // A router only ever sends RTMP to its own cable, and never down a
+            // tunnel. RTMP that reached us any other way is a node on one cable
+            // claiming routes on another, whose next hop is not even reachable
+            // there; believing it would be a black hole anyone could install.
             DdpBody::Rtmp(r) if ddp.dst_socket == RTMP_SOCKET => {
-                self.rtmp(port, ports, ddp, r, tables, now)
+                match arrived_on.filter(|p| p.id == concerning.id) {
+                    Some(p) => self.rtmp(p, ports, ddp, r, tables, now),
+                    None => (Vec::new(), Vec::new()),
+                }
             }
-            DdpBody::Zip(z) if ddp.dst_socket == ZIP_SOCKET => self.zip(port, ddp, z, tables),
+            DdpBody::Zip(z) if ddp.dst_socket == ZIP_SOCKET => self.zip(here, ddp, z, tables),
             // ZIP's three ATP calls are the only ATP a router answers.
             DdpBody::Atp(a) if ddp.dst_socket == ZIP_SOCKET => {
-                (zone_list(port, ddp, a, tables).into_iter().collect(), Vec::new())
+                (zone_list(here, ddp, a, tables).into_iter().collect(), Vec::new())
             }
             DdpBody::Nbp(n) if ddp.dst_socket == NBP_SOCKET => {
-                (self.nbp(port, ports, ddp, n, tables), Vec::new())
+                (self.nbp(here, ports, ddp, n, tables), Vec::new())
             }
             DdpBody::Aep(a) if ddp.dst_socket == AEP_SOCKET => {
-                (echo(port, ddp, a).into_iter().collect(), Vec::new())
+                (echo(concerning, ddp, a).into_iter().collect(), Vec::new())
             }
             _ => (Vec::new(), Vec::new()),
         }
@@ -620,7 +640,7 @@ mod tests {
         };
         let ddp = to_us(&p, RTMP_SOCKET, DDP_RTMP_DATA, &data);
         let (out, changes) =
-            l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Rtmp(data), &mut tables, t);
+            l.handle(Some(&p), &p, &[p_clone(&p)], &ddp, &DdpBody::Rtmp(data), &mut tables, t);
         assert_eq!(out, Vec::new());
         assert_eq!(changes.len(), 1, "{changes:?}");
         let new = changes[0].new.as_ref().unwrap();
@@ -635,7 +655,7 @@ mod tests {
         };
         let ddp = to_us(&p, RTMP_SOCKET, DDP_RTMP_DATA, &mine);
         let (out, changes) =
-            l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Rtmp(mine), &mut tables, t);
+            l.handle(Some(&p), &p, &[p_clone(&p)], &ddp, &DdpBody::Rtmp(mine), &mut tables, t);
         assert_eq!((out, changes), (Vec::new(), Vec::new()));
         assert!(tables.best(4000).is_none());
     }
@@ -651,7 +671,7 @@ mod tests {
 
         let ddp = to_us(&p, RTMP_SOCKET, DDP_RTMP_REQ, &Rtmp::Request);
         let (out, changes) =
-            l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Rtmp(Rtmp::Request), &mut tables, t);
+            l.handle(Some(&p), &p, &[p_clone(&p)], &ddp, &DdpBody::Rtmp(Rtmp::Request), &mut tables, t);
         assert_eq!(changes, Vec::new());
         assert_eq!(out.len(), 1);
         let (port, dest, r) = rtmp_of(&out[0]);
@@ -677,7 +697,7 @@ mod tests {
         let mut l = Local::new("router".into());
         let ddp = to_us(&p, RTMP_SOCKET, DDP_RTMP_REQ, &Rtmp::Request);
         let (out, _) =
-            l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Rtmp(Rtmp::Request), &mut tables, t);
+            l.handle(Some(&p), &p, &[p_clone(&p)], &ddp, &DdpBody::Rtmp(Rtmp::Request), &mut tables, t);
         let (_, _, r) = rtmp_of(&out[0]);
         assert!(matches!(r, Rtmp::Data { range: None, .. }), "{r}");
     }
@@ -698,14 +718,14 @@ mod tests {
 
         let split = Rtmp::Rdr { split_horizon: true };
         let ddp = to_us(&a, RTMP_SOCKET, DDP_RTMP_REQ, &split);
-        let (out, _) = l.handle(&a, &ports, &ddp, &DdpBody::Rtmp(split), &mut tables, t);
+        let (out, _) = l.handle(Some(&a), &a, &ports, &ddp, &DdpBody::Rtmp(split), &mut tables, t);
         let (_, _, r) = rtmp_of(&out[0]);
         let Rtmp::Data { tuples, .. } = &r else { panic!() };
         assert_eq!(tuples, &[ext(100, 100, 0)]);
 
         let full = Rtmp::Rdr { split_horizon: false };
         let ddp = to_us(&a, RTMP_SOCKET, DDP_RTMP_REQ, &full);
-        let (out, _) = l.handle(&a, &ports, &ddp, &DdpBody::Rtmp(full), &mut tables, t);
+        let (out, _) = l.handle(Some(&a), &a, &ports, &ddp, &DdpBody::Rtmp(full), &mut tables, t);
         let (_, _, r) = rtmp_of(&out[0]);
         let Rtmp::Data { tuples, .. } = &r else { panic!() };
         assert_eq!(tuples, &[ext(NET, NET, 0), ext(100, 100, 0), ext(2905, 2905, 2)]);
@@ -770,7 +790,7 @@ mod tests {
 
         let q = Zip::Query { nets: vec![NET, 2905, 100, 999] };
         let ddp = to_us(&p, ZIP_SOCKET, DDP_ZIP, &q);
-        let (out, changes) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Zip(q), &mut tables, t);
+        let (out, changes) = l.handle(Some(&p), &p, &[p_clone(&p)], &ddp, &DdpBody::Zip(q), &mut tables, t);
         assert_eq!(changes, Vec::new());
         assert_eq!(out.len(), 1);
         // Routed, not pinned to a node on this cable: the asking router may be
@@ -790,7 +810,7 @@ mod tests {
         // Nothing known about any network named: no reply at all.
         let q = Zip::Query { nets: vec![100, 999] };
         let ddp = to_us(&p, ZIP_SOCKET, DDP_ZIP, &q);
-        let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Zip(q), &mut tables, t);
+        let (out, _) = l.handle(Some(&p), &p, &[p_clone(&p)], &ddp, &DdpBody::Zip(q), &mut tables, t);
         assert_eq!(out, Vec::new());
     }
 
@@ -806,7 +826,7 @@ mod tests {
 
         let q = Zip::Query { nets: vec![2905] };
         let ddp = to_us(&p, ZIP_SOCKET, DDP_ZIP, &q);
-        let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Zip(q), &mut tables, t);
+        let (out, _) = l.handle(Some(&p), &p, &[p_clone(&p)], &ddp, &DdpBody::Zip(q), &mut tables, t);
         assert_eq!(out.len(), 2);
         let mut seen = Vec::new();
         for (i, e) in out.iter().enumerate() {
@@ -835,7 +855,7 @@ mod tests {
             total: None,
         };
         let ddp = to_us(&p, ZIP_SOCKET, DDP_ZIP, &r);
-        let (out, changes) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Zip(r), &mut tables, t);
+        let (out, changes) = l.handle(Some(&p), &p, &[p_clone(&p)], &ddp, &DdpBody::Zip(r), &mut tables, t);
         assert_eq!(out, Vec::new());
         // 100 had no zones, so it has just become advertisable.
         assert_eq!(changes.len(), 1, "{changes:?}");
@@ -848,7 +868,7 @@ mod tests {
         // of a longer list does not make it complete.
         let r = Zip::Reply { zones: vec![(100, "Sales".into())], total: Some(30) };
         let ddp = to_us(&p, ZIP_SOCKET, DDP_ZIP, &r);
-        l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Zip(r), &mut tables, t);
+        l.handle(Some(&p), &p, &[p_clone(&p)], &ddp, &DdpBody::Zip(r), &mut tables, t);
         assert_eq!(tables.zones(100).unwrap().expected, Some(30));
         assert!(!tables.zones(100).unwrap().complete(), "three names of thirty is not a list");
     }
@@ -862,7 +882,7 @@ mod tests {
 
         let g = Zip::GetNetInfo { zone: "68K MAC CLUB".into() };
         let ddp = to_us(&p, ZIP_SOCKET, DDP_ZIP, &g);
-        let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Zip(g), &mut tables, t);
+        let (out, _) = l.handle(Some(&p), &p, &[p_clone(&p)], &ddp, &DdpBody::Zip(g), &mut tables, t);
         let (port, dest, z) = zip_of(&out[0]);
         assert_eq!((port, dest), (0, &Dest::Node(PEER.node)));
         assert_eq!(
@@ -888,7 +908,7 @@ mod tests {
         for asked in ["BabCom", ""] {
             let g = Zip::GetNetInfo { zone: asked.into() };
             let ddp = to_us(&p, ZIP_SOCKET, DDP_ZIP, &g);
-            let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Zip(g), &mut tables, t);
+            let (out, _) = l.handle(Some(&p), &p, &[p_clone(&p)], &ddp, &DdpBody::Zip(g), &mut tables, t);
             let (_, _, z) = zip_of(&out[0]);
             assert_eq!(
                 z,
@@ -916,7 +936,7 @@ mod tests {
 
         let g = Zip::GetNetInfo { zone: ZONE.into() };
         let ddp = datagram(Addr { net: 3, node: 1 }, 200, p.addr().unwrap(), ZIP_SOCKET, DDP_ZIP, g.to_bytes());
-        let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Zip(g), &mut tables, t);
+        let (out, _) = l.handle(Some(&p), &p, &[p_clone(&p)], &ddp, &DdpBody::Zip(g), &mut tables, t);
         let (_, dest, z) = zip_of(&out[0]);
         assert_eq!(dest, &Dest::Node(1));
         let Zip::NetInfoReply { flags, multicast, .. } = z else { panic!() };
@@ -941,7 +961,7 @@ mod tests {
             DDP_ZIP,
             g.to_bytes(),
         );
-        let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Zip(g), &mut tables, t);
+        let (out, _) = l.handle(Some(&p), &p, &[p_clone(&p)], &ddp, &DdpBody::Zip(g), &mut tables, t);
         let (_, dest, _) = zip_of(&out[0]);
         assert_eq!(dest, &Dest::Broadcast);
     }
@@ -963,7 +983,7 @@ mod tests {
             let s = start.to_be_bytes();
             let a = Atp::request(0x1234, 1, None, [func, 0, s[0], s[1]], Vec::new());
             let ddp = to_us(&p, ZIP_SOCKET, DDP_ATP, &a);
-            let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Atp(a), &mut tables, t);
+            let (out, _) = l.handle(Some(&p), &p, &[p_clone(&p)], &ddp, &DdpBody::Atp(a), &mut tables, t);
             assert_eq!(out.len(), 1, "function {func}");
             let Emit::Route(ddp) = &out[0] else { panic!("{:?}", out[0]) };
             assert_eq!((ddp.dst, ddp.src_socket, ddp.dst_socket, ddp.typ), (PEER, ZIP_SOCKET, 200, DDP_ATP));
@@ -979,7 +999,7 @@ mod tests {
         // A start index past the end is legal: an empty last page.
         let a = Atp::request(1, 1, None, [8, 0, 0, 99], Vec::new());
         let ddp = to_us(&p, ZIP_SOCKET, DDP_ATP, &a);
-        let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Atp(a), &mut tables, t);
+        let (out, _) = l.handle(Some(&p), &p, &[p_clone(&p)], &ddp, &DdpBody::Atp(a), &mut tables, t);
         let Emit::Route(ddp) = &out[0] else { panic!("{:?}", out[0]) };
         let r = Atp::parse(&ddp.data).unwrap();
         assert_eq!(
@@ -990,7 +1010,7 @@ mod tests {
         // An ATP request to another socket is nobody's business here.
         let a = Atp::request(1, 1, None, [8, 0, 0, 1], Vec::new());
         let ddp = to_us(&p, 200, DDP_ATP, &a);
-        let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Atp(a), &mut tables, t);
+        let (out, _) = l.handle(Some(&p), &p, &[p_clone(&p)], &ddp, &DdpBody::Atp(a), &mut tables, t);
         assert_eq!(out, Vec::new());
     }
 
@@ -1009,7 +1029,7 @@ mod tests {
             let s = start.to_be_bytes();
             let a = Atp::request(7, 1, None, [8, 0, s[0], s[1]], Vec::new());
             let ddp = to_us(&p, ZIP_SOCKET, DDP_ATP, &a);
-            let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Atp(a), tables, t);
+            let (out, _) = l.handle(Some(&p), &p, &[p_clone(&p)], &ddp, &DdpBody::Atp(a), tables, t);
             let Emit::Route(ddp) = &out[0] else { panic!("{:?}", out[0]) };
             assert!(ddp.data.len() <= 8 + ATP_MAX, "{} bytes", ddp.data.len());
             let r = Atp::parse(&ddp.data).unwrap();
@@ -1075,7 +1095,7 @@ mod tests {
 
         let n = lookup(NbpFunc::BrRq, 7, PEER, 250, "=", "AFPServer", "Shared");
         let ddp = to_us(&a, NBP_SOCKET, DDP_NBP, &n);
-        let (out, changes) = l.handle(&a, &ports, &ddp, &DdpBody::Nbp(n), &mut tables, t);
+        let (out, changes) = l.handle(Some(&a), &a, &ports, &ddp, &DdpBody::Nbp(n), &mut tables, t);
         assert_eq!(changes, Vec::new());
         assert_eq!(out.len(), 2, "{out:?}");
 
@@ -1107,7 +1127,7 @@ mod tests {
         for asked in ["*", ""] {
             let n = lookup(NbpFunc::BrRq, 3, PEER, 250, "Fred", "AFPServer", asked);
             let ddp = to_us(&a, NBP_SOCKET, DDP_NBP, &n);
-            let (out, _) = l.handle(&a, &ports, &ddp, &DdpBody::Nbp(n), &mut tables, t);
+            let (out, _) = l.handle(Some(&a), &a, &ports, &ddp, &DdpBody::Nbp(n), &mut tables, t);
             assert_eq!(out.len(), 1, "asked for {asked:?}: {out:?}");
             let Emit::On { port, dest, ddp: sent } = &out[0] else { panic!() };
             assert_eq!((*port, dest), (0, &Dest::Zone(ZONE.into())));
@@ -1130,7 +1150,7 @@ mod tests {
 
         let n = lookup(NbpFunc::FwdReq, 9, PEER, 250, "Fred", "AFPServer", "Shared");
         let ddp = datagram(PEER, 200, Addr { net: NET, node: 0 }, NBP_SOCKET, DDP_NBP, n.to_bytes());
-        let (out, _) = l.handle(&a, &ports, &ddp, &DdpBody::Nbp(n), &mut tables, t);
+        let (out, _) = l.handle(Some(&a), &a, &ports, &ddp, &DdpBody::Nbp(n), &mut tables, t);
         assert_eq!(out.len(), 2, "{out:?}");
         for (i, want) in [(0usize, 0u8), (1, 1)] {
             let Emit::On { port, dest, ddp: sent } = &out[i] else { panic!("{:?}", out[i]) };
@@ -1158,7 +1178,7 @@ mod tests {
         ] {
             let n = lookup(NbpFunc::LkUp, 21, asking, 250, object, typ, zone);
             let ddp = to_us(&p, NBP_SOCKET, DDP_NBP, &n);
-            let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Nbp(n), &mut tables, t);
+            let (out, _) = l.handle(Some(&p), &p, &[p_clone(&p)], &ddp, &DdpBody::Nbp(n), &mut tables, t);
             assert_eq!(out.len(), 1, "{object}:{typ}@{zone}");
             // The requester's address comes from the tuple, not from DDP.
             let (sent, reply) = routed_nbp(&out[0]);
@@ -1189,7 +1209,7 @@ mod tests {
         ] {
             let n = lookup(NbpFunc::LkUp, 21, asking, 250, object, typ, zone);
             let ddp = to_us(&p, NBP_SOCKET, DDP_NBP, &n);
-            let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Nbp(n), &mut tables, t);
+            let (out, _) = l.handle(Some(&p), &p, &[p_clone(&p)], &ddp, &DdpBody::Nbp(n), &mut tables, t);
             assert_eq!(out, Vec::new(), "{object}:{typ}@{zone}");
         }
     }
@@ -1203,7 +1223,7 @@ mod tests {
 
         let a = Aep { func: Echo::Request, data: vec![0xde, 0xad, 0xbe, 0xef] };
         let ddp = to_us(&p, AEP_SOCKET, DDP_AEP, &a);
-        let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Aep(a), &mut tables, t);
+        let (out, _) = l.handle(Some(&p), &p, &[p_clone(&p)], &ddp, &DdpBody::Aep(a), &mut tables, t);
         assert_eq!(out.len(), 1);
         let Emit::Route(sent) = &out[0] else { panic!("{:?}", out[0]) };
         assert_eq!((sent.dst, sent.dst_socket), (PEER, 200));
@@ -1216,7 +1236,7 @@ mod tests {
         // A reply is somebody else's answer to somebody else's ping.
         let a = Aep { func: Echo::Reply, data: vec![1] };
         let ddp = to_us(&p, AEP_SOCKET, DDP_AEP, &a);
-        let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Aep(a), &mut tables, t);
+        let (out, _) = l.handle(Some(&p), &p, &[p_clone(&p)], &ddp, &DdpBody::Aep(a), &mut tables, t);
         assert_eq!(out, Vec::new());
     }
 
@@ -1230,18 +1250,18 @@ mod tests {
         // A LkUp-Reply is forwarded like any datagram, not answered here.
         let n = Nbp { func: NbpFunc::LkUpReply, id: 1, tuples: Vec::new() };
         let ddp = to_us(&p, NBP_SOCKET, DDP_NBP, &n);
-        let out = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Nbp(n), &mut tables, t);
+        let out = l.handle(Some(&p), &p, &[p_clone(&p)], &ddp, &DdpBody::Nbp(n), &mut tables, t);
         assert_eq!(out, (Vec::new(), Vec::new()));
 
         let ddp = datagram(PEER, 200, p.addr().unwrap(), 200, 7, vec![1, 2, 3]);
-        let out = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Unknown, &mut tables, t);
+        let out = l.handle(Some(&p), &p, &[p_clone(&p)], &ddp, &DdpBody::Unknown, &mut tables, t);
         assert_eq!(out, (Vec::new(), Vec::new()));
 
         // Every service listens on one socket, and only that one: an RTMP Data
         // sent somewhere else is not addressed to the RTMP process.
         let data = Rtmp::Data { sender: PEER, range: Some((NET, NET)), tuples: vec![ext(4000, 4000, 1)] };
         let ddp = datagram(PEER, 200, p.addr().unwrap(), 200, DDP_RTMP_DATA, data.to_bytes());
-        let out = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Rtmp(data), &mut tables, t);
+        let out = l.handle(Some(&p), &p, &[p_clone(&p)], &ddp, &DdpBody::Rtmp(data), &mut tables, t);
         assert_eq!(out, (Vec::new(), Vec::new()));
         assert!(tables.best(4000).is_none());
     }
