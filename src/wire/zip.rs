@@ -17,9 +17,14 @@ use super::{mac, mac_bytes, put_pstring, pstring, Encode};
 pub enum Zip {
     /// "Which zones are on these networks?"
     Query { nets: Vec<u16> },
-    /// Network-to-zone-name answers. `extended` marks command 8, used when one
-    /// network's zone list does not fit in a single reply.
-    Reply { zones: Vec<(u16, String)>, extended: bool },
+    /// Network-to-zone-name answers.
+    ///
+    /// `total` is `Some` on an Extended Reply (command 8), which carries one
+    /// network's list and may be one page of several: the header count is then
+    /// the number of names in the *whole* list, not in this packet (PDF 185).
+    /// `None` is a plain Reply (command 2), whose count is exactly the pairs it
+    /// carries and whose every network's list is entirely inside it.
+    Reply { zones: Vec<(u16, String)>, total: Option<u8> },
     /// A booting node asking a router for its cable range and zone.
     GetNetInfo { zone: String },
     NetInfoReply {
@@ -50,16 +55,27 @@ impl Zip {
                 Some(Zip::Query { nets })
             }
             cmd @ (2 | 8) => {
-                let count = *p.get(1)? as usize;
+                let count = *p.get(1)?;
                 let mut rest = p.get(2..)?;
-                let mut zones = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let net = u16::from_be_bytes([*rest.first()?, *rest.get(1)?]);
-                    let (name, r) = pstring(rest.get(2..)?)?;
-                    zones.push((net, name));
-                    rest = r;
+                let mut zones = Vec::new();
+                if cmd == 8 {
+                    // The count is the whole list's size, which may span more
+                    // packets than this one, so read pairs to the end of the
+                    // buffer instead of counting them out.
+                    while !rest.is_empty() {
+                        let (z, r) = zone_pair(rest)?;
+                        zones.push(z);
+                        rest = r;
+                    }
+                } else {
+                    // A plain Reply carries exactly the pairs it counts.
+                    for _ in 0..count {
+                        let (z, r) = zone_pair(rest)?;
+                        zones.push(z);
+                        rest = r;
+                    }
                 }
-                Some(Zip::Reply { zones, extended: cmd == 8 })
+                Some(Zip::Reply { zones, total: (cmd == 8).then_some(count) })
             }
             // Command, flags, then 4 zero bytes, then the zone being asked about.
             5 => Some(Zip::GetNetInfo { zone: pstring(p.get(6..)?)?.0 }),
@@ -93,6 +109,13 @@ impl Zip {
     }
 }
 
+/// A network number and the length-prefixed zone name after it, plus the rest.
+fn zone_pair(p: &[u8]) -> Option<((u16, String), &[u8])> {
+    let net = u16::from_be_bytes([*p.first()?, *p.get(1)?]);
+    let (name, rest) = pstring(p.get(2..)?)?;
+    Some(((net, name), rest))
+}
+
 impl fmt::Display for Zip {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
@@ -100,10 +123,12 @@ impl fmt::Display for Zip {
                 let list: Vec<String> = nets.iter().map(|n| n.to_string()).collect();
                 write!(f, "query nets {}", list.join(", "))
             }
-            Zip::Reply { zones, extended } => {
+            Zip::Reply { zones, total } => {
                 let list: Vec<String> = zones.iter().map(|(n, z)| format!("{n}={z}")).collect();
-                let kind = if *extended { "ext-reply" } else { "reply" };
-                write!(f, "{kind} {}", list.join(", "))
+                match total {
+                    Some(t) => write!(f, "ext-reply ({} of {t}) {}", zones.len(), list.join(", ")),
+                    None => write!(f, "reply {}", list.join(", ")),
+                }
             }
             Zip::GetNetInfo { zone } => write!(f, "get-net-info zone {zone}"),
             Zip::NetInfoReply { flags, range, zone, multicast, default_zone } => {
@@ -236,9 +261,12 @@ impl Encode for Zip {
                     out.extend(n.to_be_bytes());
                 }
             }
-            Zip::Reply { zones, extended } => {
-                out.push(if *extended { 8 } else { 2 });
-                out.push(zones.len().min(255) as u8);
+            Zip::Reply { zones, total } => {
+                out.push(if total.is_some() { 8 } else { 2 });
+                // A plain Reply's count is derived from what it carries; an
+                // Extended Reply announces the whole list, which only the
+                // sender knows.
+                out.push(total.unwrap_or(zones.len().min(255) as u8));
                 for (net, name) in zones {
                     out.extend(net.to_be_bytes());
                     put_pstring(out, name);
@@ -417,9 +445,43 @@ mod tests {
     }
 
     #[test]
-    fn zip_extended_reply_round_trips() {
-        let z = Zip::Reply { zones: vec![(3, "Engineering".into())], extended: true };
+    fn zip_extended_reply_announces_the_whole_list_not_the_page() {
+        // PDF 185: "The network count in the header indicates, not the number
+        // of zone names in the packet, but the number of zone names in the
+        // entire zones list for the requested network, which may span more
+        // than one packet." So a page of 2 out of 30 parses, and round-trips
+        // with the 30 intact.
+        let mut page = vec![8, 30];
+        page.extend([0, 3]);
+        page.extend(ps("Engineering"));
+        page.extend([0, 3]);
+        page.extend(ps("Marketing"));
+        let z = Zip::parse(&page).unwrap();
+        assert_eq!(
+            z,
+            Zip::Reply {
+                zones: vec![(3, "Engineering".into()), (3, "Marketing".into())],
+                total: Some(30),
+            }
+        );
+        assert_eq!(z.to_string(), "ext-reply (2 of 30) 3=Engineering, 3=Marketing");
+        assert_eq!(z.to_bytes(), page);
         assert_eq!(Zip::parse(&z.to_bytes()), Some(z));
+
+        // A plain Reply still means exactly what it counts, and still fails
+        // closed when the count overruns the pairs.
+        let mut short = vec![2, 4];
+        short.extend([0, 3]);
+        short.extend(ps("Engineering"));
+        assert!(Zip::parse(&short).is_none());
+
+        // An Extended Reply reads to the end of the buffer, so a half pair is
+        // still a reject rather than a guess.
+        let mut ragged = vec![8, 30];
+        ragged.extend([0, 3]);
+        ragged.extend(ps("Engineering"));
+        ragged.extend([0, 3, 9, b'x']); // a name that claims nine bytes
+        assert!(Zip::parse(&ragged).is_none());
     }
 
     #[test]

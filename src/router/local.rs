@@ -67,13 +67,24 @@ impl Local {
         tables: &mut Tables,
         now: Instant,
     ) -> (Vec<Emit>, Vec<RouteChange>) {
+        // Each service listens on one well-known socket; a datagram of the
+        // right type sent anywhere else is not addressed to it.
         match body {
-            DdpBody::Rtmp(r) => self.rtmp(port, ports, ddp, r, tables, now),
-            DdpBody::Zip(z) => self.zip(port, ddp, z, tables),
-            DdpBody::Atp(a) => (zone_list(port, ddp, a, tables).into_iter().collect(), Vec::new()),
-            DdpBody::Nbp(n) => (self.nbp(port, ports, ddp, n, tables), Vec::new()),
-            DdpBody::Aep(a) => (echo(port, ddp, a).into_iter().collect(), Vec::new()),
-            DdpBody::Unknown => (Vec::new(), Vec::new()),
+            DdpBody::Rtmp(r) if ddp.dst_socket == RTMP_SOCKET => {
+                self.rtmp(port, ports, ddp, r, tables, now)
+            }
+            DdpBody::Zip(z) if ddp.dst_socket == ZIP_SOCKET => self.zip(port, ddp, z, tables),
+            // ZIP's three ATP calls are the only ATP a router answers.
+            DdpBody::Atp(a) if ddp.dst_socket == ZIP_SOCKET => {
+                (zone_list(port, ddp, a, tables).into_iter().collect(), Vec::new())
+            }
+            DdpBody::Nbp(n) if ddp.dst_socket == NBP_SOCKET => {
+                (self.nbp(port, ports, ddp, n, tables), Vec::new())
+            }
+            DdpBody::Aep(a) if ddp.dst_socket == AEP_SOCKET => {
+                (echo(port, ddp, a).into_iter().collect(), Vec::new())
+            }
+            _ => (Vec::new(), Vec::new()),
         }
     }
 
@@ -151,7 +162,7 @@ impl Local {
     ) -> (Vec<Emit>, Vec<RouteChange>) {
         match z {
             Zip::Query { nets } => (query_reply(port, ddp, nets, tables), Vec::new()),
-            Zip::Reply { zones, extended } => (Vec::new(), learn_zones(zones, *extended, tables)),
+            Zip::Reply { zones, total } => (Vec::new(), learn_zones(zones, *total, tables)),
             Zip::GetNetInfo { zone } => (net_info(port, ddp, zone).into_iter().collect(), Vec::new()),
             // A NetInfoReply is somebody else's answer, and Notify is not
             // decoded; neither is ours to act on.
@@ -294,7 +305,7 @@ fn query_reply(port: &Port, ddp: &Ddp, nets: &[u16], tables: &Tables) -> Vec<Emi
         // A network's zones list has to be whole inside one Reply, so flush
         // before starting a network that will not fit alongside it (PDF 184).
         if !batch.is_empty() && (alone || size + bytes > DDP_MAX) {
-            replies.push(Zip::Reply { zones: std::mem::take(&mut batch), extended: false });
+            replies.push(Zip::Reply { zones: std::mem::take(&mut batch), total: None });
             size = ZIP_HEAD;
         }
         if alone {
@@ -305,39 +316,39 @@ fn query_reply(port: &Port, ddp: &Ddp, nets: &[u16], tables: &Tables) -> Vec<Emi
         size += bytes;
     }
     if !batch.is_empty() {
-        replies.push(Zip::Reply { zones: batch, extended: false });
+        replies.push(Zip::Reply { zones: batch, total: None });
     }
+    // Routed, not pinned to this port: a Query can come from a router a
+    // network away, and its source node means nothing on our cable.
     replies
         .into_iter()
-        .filter_map(|r| {
-            let reply = from(port, ZIP_SOCKET, ddp.src, ddp.src_socket, DDP_ZIP, &r)?;
-            Some(Emit::On { port: port.id, dest: Dest::Node(ddp.src.node), ddp: reply })
-        })
+        .filter_map(|r| Some(Emit::Route(from(port, ZIP_SOCKET, ddp.src, ddp.src_socket, DDP_ZIP, &r)?)))
         .collect()
 }
 
-/// One network's list split across Extended Replies.
+/// One network's list split across Extended Replies. Every page announces the
+/// size of the whole list, not of the page, so the receiver knows how many more
+/// to wait for (PDF 185).
 ///
-/// ponytail: the book's network count on an Extended Reply is the size of the
-/// *whole* list, not of this packet, but `Zip::Reply` derives the count from
-/// the pairs it carries and `Zip::parse` reads exactly that many back. A
-/// receiver therefore sees each page as a complete list. Carry the total on
-/// `Zip::Reply` if a network ever really has more than a packet of zones.
+/// ponytail: the count is one byte on the wire, so a list of more than 255
+/// zones on one network announces 255 and the receiver stops early. ZIP cannot
+/// express more; a network that big needs AURP's ZI-Rsp instead.
 fn pages(pairs: Vec<(u16, String)>) -> Vec<Zip> {
+    let total = Some(u8::try_from(pairs.len()).unwrap_or(u8::MAX));
     let mut out = Vec::new();
     let mut batch: Vec<(u16, String)> = Vec::new();
     let mut size = ZIP_HEAD;
     for p in pairs {
         let n = pair_bytes(&p.1);
         if size + n > DDP_MAX && !batch.is_empty() {
-            out.push(Zip::Reply { zones: std::mem::take(&mut batch), extended: true });
+            out.push(Zip::Reply { zones: std::mem::take(&mut batch), total });
             size = ZIP_HEAD;
         }
         size += n;
         batch.push(p);
     }
     if !batch.is_empty() {
-        out.push(Zip::Reply { zones: batch, extended: true });
+        out.push(Zip::Reply { zones: batch, total });
     }
     out
 }
@@ -348,8 +359,10 @@ fn pair_bytes(name: &str) -> usize {
 }
 
 /// A ZIP Reply fills in the zone table. The names for one network are
-/// contiguous, so they are gathered per network before being stored.
-fn learn_zones(zones: &[(u16, String)], extended: bool, tables: &mut Tables) -> Vec<RouteChange> {
+/// contiguous, so they are gathered per network before being stored. An
+/// Extended Reply's `total` is the whole list's size, which is what tells the
+/// zone table whether the pages so far add up to a complete list.
+fn learn_zones(zones: &[(u16, String)], total: Option<u8>, tables: &mut Tables) -> Vec<RouteChange> {
     let mut by_net: Vec<(u16, Vec<String>)> = Vec::new();
     for (net, name) in zones {
         match by_net.iter_mut().find(|(n, _)| n == net) {
@@ -359,8 +372,7 @@ fn learn_zones(zones: &[(u16, String)], extended: bool, tables: &mut Tables) -> 
     }
     let mut changes = Vec::new();
     for (net, names) in by_net {
-        let expected = extended.then_some(names.len());
-        changes.extend(tables.add_zones(net, &names, expected));
+        changes.extend(tables.add_zones(net, &names, total.map(usize::from)));
     }
     changes
 }
@@ -411,7 +423,7 @@ fn net_info(port: &Port, ddp: &Ddp, zone: &str) -> Option<Emit> {
 /// GetZoneList, GetLocalZones and GetMyZone: one ATP response with as many
 /// names as fit, and the last-packet flag when the list runs out (PDF 186).
 fn zone_list(port: &Port, ddp: &Ddp, a: &Atp, tables: &Tables) -> Option<Emit> {
-    if a.func != Func::Req || ddp.dst_socket != ZIP_SOCKET {
+    if a.func != Func::Req {
         return None;
     }
     let (all, start) = match ZipAtp::parse_request(&a.user_bytes, &a.data)? {
@@ -434,11 +446,9 @@ fn zone_list(port: &Port, ddp: &Ddp, a: &Atp, tables: &Tables) -> Option<Emit> {
     }
     let (user, data) = ZipAtp::reply_parts(names.len() == rest.len(), &names);
     let body = Atp::response(a.tid, 0, true, false, user, data);
-    Some(Emit::On {
-        port: port.id,
-        dest: Dest::Node(ddp.src.node),
-        ddp: from(port, ZIP_SOCKET, ddp.src, ddp.src_socket, DDP_ATP, &body)?,
-    })
+    // Routed: a GetZoneList is legal from off-cable, and the router already
+    // knows the way back.
+    Some(Emit::Route(from(port, ZIP_SOCKET, ddp.src, ddp.src_socket, DDP_ATP, &body)?))
 }
 
 /// A datagram from one of our sockets on `port`. `None` until the port holds
@@ -735,6 +745,14 @@ mod tests {
         }
     }
 
+    /// The `Zip` inside an `Emit::Route`, with the datagram that carried it.
+    fn routed_zip(e: &Emit) -> (&Ddp, Zip) {
+        match e {
+            Emit::Route(ddp) => (ddp, Zip::parse(&ddp.data).expect("ZIP")),
+            other => panic!("expected a routed emit, got {other:?}"),
+        }
+    }
+
     /// A table with our cable on port 0, a routed network 2905, and a routed
     /// network 100 nobody has told us the zones of yet.
     fn internet(t: Instant) -> Tables {
@@ -758,19 +776,19 @@ mod tests {
         let (out, changes) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Zip(q), &mut tables, t);
         assert_eq!(changes, Vec::new());
         assert_eq!(out.len(), 1);
-        let (port, dest, z) = zip_of(&out[0]);
-        assert_eq!((port, dest), (0, &Dest::Node(PEER.node)));
+        // Routed, not pinned to a node on this cable: the asking router may be
+        // a network away.
+        let (sent, z) = routed_zip(&out[0]);
+        assert_eq!((sent.dst, sent.src_socket, sent.dst_socket, sent.typ), (PEER, ZIP_SOCKET, 200, DDP_ZIP));
         // 100 has no zones and 999 no route at all, so neither appears.
         assert_eq!(
             z,
             Zip::Reply {
                 zones: vec![(NET, ZONE.into()), (2905, "BabCom".into())],
-                extended: false,
+                total: None,
             }
         );
         assert_eq!(z.to_string(), "reply 6800=68k Mac Club, 2905=BabCom");
-        let Emit::On { ddp, .. } = &out[0] else { panic!() };
-        assert_eq!((ddp.src_socket, ddp.dst_socket, ddp.typ), (ZIP_SOCKET, 200, DDP_ZIP));
 
         // Nothing known about any network named: no reply at all.
         let q = Zip::Query { nets: vec![100, 999] };
@@ -795,12 +813,12 @@ mod tests {
         assert_eq!(out.len(), 2);
         let mut seen = Vec::new();
         for (i, e) in out.iter().enumerate() {
-            let (_, _, z) = zip_of(e);
-            let Zip::Reply { zones, extended } = z else { panic!() };
-            assert!(extended, "page {i} is not an Extended Reply");
+            let (sent, z) = routed_zip(e);
+            let Zip::Reply { zones, total } = z else { panic!() };
+            // Every page announces the whole list, not the page (PDF 185).
+            assert_eq!(total, Some(21), "page {i} announces the wrong total");
             assert!(zones.iter().all(|(n, _)| *n == 2905), "one network per packet");
-            let Emit::On { ddp, .. } = e else { panic!() };
-            assert!(ddp.data.len() <= DDP_MAX, "page {i} is {} bytes", ddp.data.len());
+            assert!(sent.data.len() <= DDP_MAX, "page {i} is {} bytes", sent.data.len());
             seen.extend(zones.into_iter().map(|(_, n)| n));
         }
         // "BabCom" was already there, then the twenty long ones.
@@ -817,7 +835,7 @@ mod tests {
 
         let r = Zip::Reply {
             zones: vec![(100, "Engineering".into()), (100, "Marketing".into())],
-            extended: false,
+            total: None,
         };
         let ddp = to_us(&p, ZIP_SOCKET, DDP_ZIP, &r);
         let (out, changes) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Zip(r), &mut tables, t);
@@ -829,12 +847,13 @@ mod tests {
         assert_eq!(list.names, vec!["Engineering".to_string(), "Marketing".into()]);
         assert_eq!(list.expected, None);
 
-        // An Extended Reply announces the total, so the list is only complete
-        // once that many names are in.
-        let r = Zip::Reply { zones: vec![(100, "Sales".into())], extended: true };
+        // An Extended Reply announces the size of the whole list, so one page
+        // of a longer list does not make it complete.
+        let r = Zip::Reply { zones: vec![(100, "Sales".into())], total: Some(30) };
         let ddp = to_us(&p, ZIP_SOCKET, DDP_ZIP, &r);
         l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Zip(r), &mut tables, t);
-        assert_eq!(tables.zones(100).unwrap().expected, Some(1));
+        assert_eq!(tables.zones(100).unwrap().expected, Some(30));
+        assert!(!tables.zones(100).unwrap().complete(), "three names of thirty is not a list");
     }
 
     #[test]
@@ -949,9 +968,8 @@ mod tests {
             let ddp = to_us(&p, ZIP_SOCKET, DDP_ATP, &a);
             let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Atp(a), &mut tables, t);
             assert_eq!(out.len(), 1, "function {func}");
-            let Emit::On { port, dest, ddp } = &out[0] else { panic!() };
-            assert_eq!((*port, dest), (0, &Dest::Node(PEER.node)));
-            assert_eq!((ddp.src_socket, ddp.dst_socket, ddp.typ), (ZIP_SOCKET, 200, DDP_ATP));
+            let Emit::Route(ddp) = &out[0] else { panic!("{:?}", out[0]) };
+            assert_eq!((ddp.dst, ddp.src_socket, ddp.dst_socket, ddp.typ), (PEER, ZIP_SOCKET, 200, DDP_ATP));
             let r = Atp::parse(&ddp.data).unwrap();
             assert_eq!((r.func, r.tid, r.bitmap, r.eom()), (Func::Resp, 0x1234, 0, true));
             assert_eq!(
@@ -965,7 +983,7 @@ mod tests {
         let a = Atp::request(1, 1, None, [8, 0, 0, 99], Vec::new());
         let ddp = to_us(&p, ZIP_SOCKET, DDP_ATP, &a);
         let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Atp(a), &mut tables, t);
-        let Emit::On { ddp, .. } = &out[0] else { panic!() };
+        let Emit::Route(ddp) = &out[0] else { panic!("{:?}", out[0]) };
         let r = Atp::parse(&ddp.data).unwrap();
         assert_eq!(
             ZipAtp::parse_reply(&r.user_bytes, &r.data).unwrap(),
@@ -995,7 +1013,7 @@ mod tests {
             let a = Atp::request(7, 1, None, [8, 0, s[0], s[1]], Vec::new());
             let ddp = to_us(&p, ZIP_SOCKET, DDP_ATP, &a);
             let (out, _) = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Atp(a), tables, t);
-            let Emit::On { ddp, .. } = &out[0] else { panic!() };
+            let Emit::Route(ddp) = &out[0] else { panic!("{:?}", out[0]) };
             assert!(ddp.data.len() <= 8 + ATP_MAX, "{} bytes", ddp.data.len());
             let r = Atp::parse(&ddp.data).unwrap();
             let ZipAtp::Reply { last, zones } = ZipAtp::parse_reply(&r.user_bytes, &r.data).unwrap()
@@ -1221,6 +1239,14 @@ mod tests {
         let ddp = datagram(PEER, 200, p.addr().unwrap(), 200, 7, vec![1, 2, 3]);
         let out = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Unknown, &mut tables, t);
         assert_eq!(out, (Vec::new(), Vec::new()));
+
+        // Every service listens on one socket, and only that one: an RTMP Data
+        // sent somewhere else is not addressed to the RTMP process.
+        let data = Rtmp::Data { sender: PEER, range: Some((NET, NET)), tuples: vec![ext(4000, 4000, 1)] };
+        let ddp = datagram(PEER, 200, p.addr().unwrap(), 200, DDP_RTMP_DATA, data.to_bytes());
+        let out = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Rtmp(data), &mut tables, t);
+        assert_eq!(out, (Vec::new(), Vec::new()));
+        assert!(tables.best(4000).is_none());
     }
 
     #[test]
