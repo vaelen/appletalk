@@ -13,3 +13,4 @@ docs/superpowers/
 
 # Third-party routers cloned for reference (tashrouter, jrouter). Never checked in.
 repos/
+/appletalk.toml
