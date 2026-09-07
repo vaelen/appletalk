@@ -101,6 +101,10 @@ struct Outstanding {
 struct Out {
     acts: Vec<Action>,
     chs: Vec<RouteChange>,
+    /// Why the connection state is about to move, set by whichever branch
+    /// knows and taken by `report` when it names the transition. Left `None`
+    /// where the transition speaks for itself.
+    reason: Option<String>,
 }
 
 pub struct Peer {
@@ -203,12 +207,6 @@ impl Peer {
 
     /// Close as data receiver. The next Open-Req must carry a different
     /// connection ID or the peer takes it for a retransmission (RFC p. 43).
-    /// ponytail: neither this nor `close_sender` reports the transition, so
-    /// the spec's "peer receiver/sender state transitions, with the reason on
-    /// the way down" is not on stderr. The state is set at fifteen places and
-    /// only some of them hold an `Out` to push a `Log` onto; give `Peer` a
-    /// `set_receiver`/`set_sender` pair that takes one, and route every
-    /// assignment through it, if the tunnels ever need watching live.
     fn close_receiver(&mut self) {
         self.receiver = Receiver::Unconnected;
         self.conn_local = succ(self.conn_local);
@@ -330,6 +328,7 @@ impl Peer {
                 if conn == self.conn_local && self.receiver == Receiver::WaitOpenRsp =>
             {
                 if rate_or_err < 0 {
+                    out.reason = Some(format!("open-rsp error {rate_or_err}"));
                     self.close_receiver();
                     return;
                 }
@@ -358,7 +357,10 @@ impl Peer {
                         }
                     }
                     Seq::Dup => out.acts.push(self.send(conn, seq, Cmd::RiAck { szi: true })),
-                    Seq::Ahead => self.close_receiver(),
+                    Seq::Ahead => {
+                        out.reason = Some("sequence number n+1".into());
+                        self.close_receiver();
+                    }
                     Seq::Stale => {}
                 }
             }
@@ -377,13 +379,17 @@ impl Peer {
                     // jrouter re-acks a duplicate with SZI, and a lost ZI-Rsp
                     // is the likelier reason to be here than a lost ack.
                     Seq::Dup => out.acts.push(self.send(conn, seq, Cmd::RiAck { szi: true })),
-                    Seq::Ahead => self.close_receiver(),
+                    Seq::Ahead => {
+                        out.reason = Some("sequence number n+1".into());
+                        self.close_receiver();
+                    }
                     Seq::Stale => {}
                 }
             }
-            Cmd::Rd { .. } if conn == self.conn_local && self.receiver_open() => {
+            Cmd::Rd { code } if conn == self.conn_local && self.receiver_open() => {
                 out.acts.push(self.send(conn, seq, Cmd::RiAck { szi: false }));
                 out.chs.extend(tables.remove_target(Target::Peer(self.addr)));
+                out.reason = Some(format!("router down, code {code}"));
                 self.close_receiver();
                 self.close_sender();
             }
@@ -604,7 +610,9 @@ impl Peers {
             }
             Aurp::Routing { dh, conn, seq, cmd } => {
                 peer.di = named_by(dh.src, from);
+                let was = (peer.receiver, peer.sender);
                 peer.routing(conn, seq, cmd, tables, now, &mut out);
+                report(peer, was, &mut out);
                 (out.acts, out.chs, None)
             }
         }
@@ -623,6 +631,7 @@ impl Peers {
             self.last_zi = now;
         }
         for peer in self.peers.values_mut() {
+            let was = (peer.receiver, peer.sender);
             if scan {
                 reconnect(peer, now, &mut out);
             }
@@ -631,6 +640,7 @@ impl Peers {
             if zi {
                 zi_rerequest(peer, tables, &mut out);
             }
+            report(peer, was, &mut out);
         }
         // An open-peered entry with neither connection up is one stranger's
         // packet and nothing more; let it go rather than keep it for ever.
@@ -757,6 +767,21 @@ impl Peers {
 
 // ----------------------------------------------------------------- timers
 
+/// One log line per connection whose state moved, so the spec's "peer
+/// receiver/sender state transitions, with the reason on the way down" is on
+/// stderr. `was` is the pair snapshotted before whatever just ran.
+fn report(peer: &Peer, was: (Receiver, Sender), out: &mut Out) {
+    let why = out.reason.take().map_or(String::new(), |r| format!(" ({r})"));
+    if was.0 != peer.receiver {
+        let line = format!("aurp: {} receiver {} -> {}{why}", peer.addr, was.0, peer.receiver);
+        out.acts.push(Action::Log(line));
+    }
+    if was.1 != peer.sender {
+        let line = format!("aurp: {} sender {} -> {}{why}", peer.addr, was.1, peer.sender);
+        out.acts.push(Action::Log(line));
+    }
+}
+
 fn reconnect(peer: &mut Peer, now: Instant, out: &mut Out) {
     if peer.configured.is_none() || peer.receiver != Receiver::Unconnected {
         return;
@@ -773,6 +798,7 @@ fn receiver_timers(peer: &mut Peer, tables: &mut Tables, now: Instant, out: &mut
             if now.saturating_duration_since(peer.recv_at) >= RETRY =>
         {
             if peer.recv_tries >= RETRIES {
+                out.reason = Some(format!("no answer after {RETRIES} tries"));
                 peer.close_receiver();
                 return;
             }
@@ -796,6 +822,7 @@ fn receiver_timers(peer: &mut Peer, tables: &mut Tables, now: Instant, out: &mut
         Receiver::WaitTickleAck if now.saturating_duration_since(peer.recv_at) >= RETRY => {
             if peer.recv_tries >= TICKLE_RETRIES {
                 out.chs.extend(tables.remove_target(Target::Peer(peer.addr)));
+                out.reason = Some(format!("{TICKLE_RETRIES} tickles unanswered"));
                 peer.close_receiver();
                 // One direction is dead; find out about the other (RFC p. 40).
                 if peer.sender == Sender::Connected {
@@ -816,6 +843,7 @@ fn sender_timers(peer: &mut Peer, now: Instant, out: &mut Out) {
     if let Some(o) = &peer.outstanding {
         if now.saturating_duration_since(o.at) >= RETRY {
             if o.tries >= RETRIES {
+                out.reason = Some(format!("no ack after {RETRIES} tries"));
                 peer.close_sender();
                 return;
             }
@@ -1037,6 +1065,16 @@ mod tests {
             .collect()
     }
 
+    /// Every `Log` action's text.
+    fn logs(acts: &[Action]) -> Vec<String> {
+        acts.iter()
+            .filter_map(|a| match a {
+                Action::Log(m) => Some(m.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn cmds(acts: &[Action]) -> Vec<(u16, u16, Cmd)> {
         sent(acts)
             .into_iter()
@@ -1069,6 +1107,7 @@ mod tests {
 
         // The reconnect scan opens our receiver connection.
         let (a, _) = ps.tick(&mut tb, t0 + RECONNECT_SCAN);
+        assert_eq!(logs(&a), [format!("aurp: {REMOTE} receiver unconnected -> wait open-rsp")]);
         let a1 = match cmds(&a).as_slice() {
             [(c, 0, Cmd::OpenReq { sui, version, options })] => {
                 assert_eq!((*sui, *version, options.len()), (Cmd::ALL_SUI, 1, 0));
@@ -1080,12 +1119,14 @@ mod tests {
         // Open-Rsp accepted: we ask for their routes.
         let (a, ..) = ps.packet(REMOTE, &routing(a1, 0, open_rsp(1)), &mut tb, t0);
         assert_eq!(cmds(&a), vec![(a1, 0, Cmd::RiReq { sui: Cmd::ALL_SUI })]);
+        assert_eq!(logs(&a), [format!("aurp: {REMOTE} receiver wait open-rsp -> wait ri-rsp")]);
         assert_eq!(ps.peers[&REMOTE].receiver, Receiver::WaitRiRsp);
 
         // Their Open-Req opens the other direction; we are their data sender.
         let b1 = 0xb001;
         let (a, ..) = ps.packet(REMOTE, &routing(b1, 0, open_req()), &mut tb, t0);
         assert_eq!(cmds(&a), vec![(b1, 0, open_rsp(1))]);
+        assert_eq!(logs(&a), [format!("aurp: {REMOTE} sender unconnected -> connected")]);
         assert_eq!(ps.peers[&REMOTE].sender, Sender::Connected);
 
         // Their routes arrive.
@@ -1094,6 +1135,7 @@ mod tests {
         assert_eq!(cmds(&a), vec![(a1, 1, Cmd::RiAck { szi: true })]);
         assert_eq!(ch.len(), 1);
         assert_eq!(tb.best(2905).unwrap().distance, 1);
+        assert_eq!(logs(&a), [format!("aurp: {REMOTE} receiver wait ri-rsp -> connected")]);
         assert_eq!(ps.peers[&REMOTE].receiver, Receiver::Connected);
 
         // The zones for them, which nothing acknowledges.
@@ -1130,7 +1172,8 @@ mod tests {
         assert_eq!(cmds(&a), vec![(a1, 0, Cmd::Tickle)]);
         assert_eq!(ps.peers[&REMOTE].receiver, Receiver::WaitTickleAck);
         let (a, ..) = ps.packet(REMOTE, &routing(a1, 0, Cmd::TickleAck), &mut tb, quiet);
-        assert!(a.is_empty());
+        assert!(sent(&a).is_empty());
+        assert_eq!(logs(&a), [format!("aurp: {REMOTE} receiver wait tickle-ack -> connected")]);
         assert_eq!(ps.peers[&REMOTE].receiver, Receiver::Connected);
 
         // They go down.
@@ -1139,6 +1182,13 @@ mod tests {
         assert!(!ch.is_empty());
         assert!(tb.best(2905).is_none() && tb.best(3000).is_none());
         assert!(tb.best(6800).is_some()); // our own cable survives
+        assert_eq!(
+            logs(&a),
+            [
+                format!("aurp: {REMOTE} receiver connected -> unconnected (router down, code -1)"),
+                format!("aurp: {REMOTE} sender connected -> unconnected (router down, code -1)"),
+            ]
+        );
         assert_eq!(ps.peers[&REMOTE].receiver, Receiver::Unconnected);
         assert_eq!(ps.peers[&REMOTE].sender, Sender::Unconnected);
     }
@@ -1196,7 +1246,11 @@ mod tests {
         let ev = EventTuple { code: NA, tuple: t((3000, 3000), 0) };
         let upd = Cmd::RiUpd { events: vec![ev] };
         let (a, ch, _) = ps.packet(REMOTE, &routing(a1, 3, upd), &mut tb, t0);
-        assert!(a.is_empty() && ch.is_empty());
+        assert!(sent(&a).is_empty() && ch.is_empty());
+        assert_eq!(
+            logs(&a),
+            [format!("aurp: {REMOTE} receiver connected -> unconnected (sequence number n+1)")]
+        );
         assert!(tb.best(3000).is_none());
         assert_eq!(ps.peers[&REMOTE].receiver, Receiver::Unconnected);
         assert_eq!(ps.peers[&REMOTE].conn_local, succ(a1));
@@ -1211,7 +1265,11 @@ mod tests {
         let (a, _) = ps.tick(&mut tb, t0 + RECONNECT_SCAN);
         let a1 = match cmds(&a).as_slice() { [(c, ..)] => *c, o => panic!("{o:?}") };
         let (a, ..) = ps.packet(REMOTE, &routing(a1, 0, open_rsp(-5)), &mut tb, t0);
-        assert!(a.is_empty());
+        assert!(sent(&a).is_empty());
+        assert_eq!(
+            logs(&a),
+            [format!("aurp: {REMOTE} receiver wait open-rsp -> unconnected (open-rsp error -5)")]
+        );
         assert_eq!(ps.peers[&REMOTE].receiver, Receiver::Unconnected);
         assert_eq!(ps.peers[&REMOTE].conn_local, succ(a1));
     }
