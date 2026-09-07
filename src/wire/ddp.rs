@@ -23,7 +23,7 @@ pub(crate) fn checksum(bytes: &[u8]) -> u16 {
 /// A DDP datagram with the 13-byte extended (long) header — the only form
 /// EtherTalk carries. The 5-byte short header is LocalTalk-only, where LLAP's
 /// type field tells the two apart.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ddp {
     pub hops: u8,
     /// Header + data, per the wire. Compare against `data` to spot truncation.
@@ -95,7 +95,6 @@ impl Ddp {
     ///
     /// ponytail: silently truncates a length over 1023, as `encode` does; real
     /// DDP data tops out at 586, so this cannot happen on the wire.
-    #[allow(dead_code)] // stub: Task 8
     pub fn to_short_bytes(&self) -> Vec<u8> {
         let len = (5 + self.data.len()) as u16;
         let mut out = Vec::with_capacity(len as usize);

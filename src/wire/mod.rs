@@ -43,8 +43,6 @@ pub use ddp::Ddp;
 pub use llap::{Llap, LLAP_ACK, LLAP_ENQ, LLAP_LONG_DDP, LLAP_SHORT_DDP};
 pub use nbp::{Nbp, NbpFunc, NbpTuple};
 pub use rtmp::{NetworkTuple, Rtmp};
-// stub: Task 8 gives `zone_multicast` its first caller.
-#[allow(unused_imports)]
 pub use zip::{zone_multicast, Zip, ZipAtp};
 
 pub const DDP: u16 = 0x809b; // AppleTalk Datagram Delivery Protocol
