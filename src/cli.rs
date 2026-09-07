@@ -53,6 +53,10 @@ impl Cli {
     }
 }
 
+// `RouterArgs` makes this enum wide, which clippy dislikes. It is parsed once
+// per process and immediately consumed; boxing it would only add an
+// indirection to keep a lint quiet.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 pub enum Command {
     /// Print AppleTalk traffic as it arrives. The default.
@@ -79,6 +83,79 @@ pub enum Command {
     Bridge {
         #[command(subcommand)]
         link: Link,
+    },
+    /// Route between local links and AURP peers over UDP 387.
+    Router(RouterArgs),
+    /// Maintain the peer list in the config file.
+    Peers {
+        #[command(subcommand)]
+        cmd: PeersCmd,
+    },
+}
+
+/// Every router setting. A list flag replaces the config file's list, `--add-*` appends to
+/// it, `--no-*` empties it; the three are mutually exclusive per list.
+#[derive(Args, Clone, Debug, Default, PartialEq)]
+pub struct RouterArgs {
+    /// Config file; default ./appletalk.toml, then /etc/appletalk/appletalk.toml
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<std::path::PathBuf>,
+    /// NBP object name, type AppleRouter
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Our public IPv4 address, used as our AURP domain identifier
+    #[arg(long, value_name = "IP")]
+    pub public_ip: Option<std::net::Ipv4Addr>,
+    /// UDP address to listen on for AURP
+    #[arg(long, value_name = "ADDR:PORT")]
+    pub listen: Option<std::net::SocketAddrV4>,
+    /// Refuse peers that are not configured
+    #[arg(long)]
+    pub no_open_peering: bool,
+
+    /// AURP peer (IP or hostname); replaces the file's list. Repeatable.
+    #[arg(long, value_name = "HOST", conflicts_with_all = ["add_peer", "no_peers"])]
+    pub peer: Vec<String>,
+    /// AURP peer to add to the file's list. Repeatable.
+    #[arg(long, value_name = "HOST", conflicts_with = "no_peers")]
+    pub add_peer: Vec<String>,
+    /// Use no configured peers
+    #[arg(long)]
+    pub no_peers: bool,
+
+    /// EtherTalk port as IFACE:NET[-NET]:ZONE[,ZONE...]; replaces the file's list
+    #[arg(long, value_name = "SPEC", conflicts_with_all = ["add_ethertalk", "no_ethertalk"])]
+    pub ethertalk: Vec<String>,
+    #[arg(long, value_name = "SPEC", conflicts_with = "no_ethertalk")]
+    pub add_ethertalk: Vec<String>,
+    #[arg(long)]
+    pub no_ethertalk: bool,
+
+    /// LToUDP port as [IFACE_IP:]NET:ZONE[,ZONE...]; replaces the file's list
+    #[arg(long, value_name = "SPEC", conflicts_with_all = ["add_ltoudp", "no_ltoudp"])]
+    pub ltoudp: Vec<String>,
+    #[arg(long, value_name = "SPEC", conflicts_with = "no_ltoudp")]
+    pub add_ltoudp: Vec<String>,
+    #[arg(long)]
+    pub no_ltoudp: bool,
+
+    /// TashTalk port as DEVICE:NET:ZONE[,ZONE...]; replaces the file's list
+    #[arg(long, value_name = "SPEC", conflicts_with_all = ["add_tashtalk", "no_tashtalk"])]
+    pub tashtalk: Vec<String>,
+    #[arg(long, value_name = "SPEC", conflicts_with = "no_tashtalk")]
+    pub add_tashtalk: Vec<String>,
+    #[arg(long)]
+    pub no_tashtalk: bool,
+}
+
+#[derive(Subcommand, Clone, Debug, PartialEq)]
+pub enum PeersCmd {
+    /// Merge a text file of peers (one IP or hostname per line) into the config file.
+    Import {
+        file: std::path::PathBuf,
+        /// Config file to update; default as for `router`
+        #[arg(long, value_name = "PATH")]
+        config: Option<std::path::PathBuf>,
     },
 }
 
@@ -354,5 +431,28 @@ mod tests {
         assert!(!out.shows(&ddp(5)));
         assert!(!out.shows(&ddp(7)));
         assert!(out.shows(&ddp(3)));
+    }
+
+    #[test]
+    fn router_list_flags_are_exclusive_per_list() {
+        assert!(Cli::try_parse_from(["appletalk", "router", "--peer", "a", "--add-peer", "b"]).is_err());
+        assert!(Cli::try_parse_from(["appletalk", "router", "--peer", "a", "--no-peers"]).is_err());
+        assert!(Cli::try_parse_from(["appletalk", "router", "--ethertalk", "x", "--no-ethertalk"]).is_err());
+        // Different lists may mix.
+        let cli = parse(&["appletalk", "router", "--ethertalk", "eth0:1:Z", "--add-ltoudp", "2:Y", "--no-peers"]);
+        match cli.command {
+            Some(Command::Router(a)) => {
+                assert_eq!(a.ethertalk, ["eth0:1:Z"]);
+                assert_eq!(a.add_ltoudp, ["2:Y"]);
+                assert!(a.no_peers);
+            }
+            _ => panic!("expected router"),
+        }
+    }
+
+    #[test]
+    fn peers_import_parses() {
+        let cli = parse(&["appletalk", "peers", "import", "list.txt", "--config", "c.toml"]);
+        assert!(matches!(cli.command, Some(Command::Peers { cmd: PeersCmd::Import { .. } })));
     }
 }

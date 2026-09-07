@@ -8,9 +8,12 @@
 mod bridge;
 mod capture;
 mod cli;
+mod config;
 mod ltoudp;
 mod node;
+mod router;
 mod session;
+mod tashtalk;
 mod text;
 mod wire;
 
@@ -22,6 +25,34 @@ fn main() {
         eprintln!("appletalk: output flags before a subcommand name are ambiguous; put them after it");
         std::process::exit(2);
     }
+    // Handled before a NIC is opened: a router opens the ports its config
+    // names, not the one this flag would pick, and `peers import` touches no
+    // network at all.
+    match &args.command {
+        Some(cli::Command::Router(ra)) => {
+            let cfg = config::load(ra).unwrap_or_else(|e| {
+                eprintln!("appletalk: {e}");
+                std::process::exit(2)
+            });
+            if let Err(e) = router::run(cfg) {
+                eprintln!("appletalk: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Some(cli::Command::Peers { cmd: cli::PeersCmd::Import { file, config } }) => {
+            match config::import_peers(config.as_deref(), file) {
+                Ok((added, present)) => println!("added {added}, {present} already present"),
+                Err(e) => {
+                    eprintln!("appletalk: {e}");
+                    std::process::exit(1)
+                }
+            }
+            return;
+        }
+        _ => {}
+    }
+
     let cap = match capture::spawn(args.interface.as_deref()) {
         Ok(v) => v,
         Err(e) => {
@@ -142,5 +173,8 @@ fn run_node(
             bridge::run(tx, rx, lt, addr, amt)
         }
         cli::Command::Monitor { .. } => unreachable!("handled by the passive path"),
+        cli::Command::Router(_) | cli::Command::Peers { .. } => {
+            unreachable!("handled before the NIC is opened")
+        }
     }
 }

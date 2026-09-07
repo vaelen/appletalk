@@ -54,6 +54,7 @@ fn print_packet(at: SystemTime, p: &Packet, o: &Output) {
                         hexdump(&a.data);
                     }
                 }
+                DdpBody::Rtmp(r) => println!("    {r}"),
                 DdpBody::Nbp(n) => println!("    {n}"),
                 DdpBody::Zip(z) => println!("    {z}"),
                 // No protocol line to print: without --hex this packet shows

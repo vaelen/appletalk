@@ -26,17 +26,23 @@ pub trait Encode {
 mod aarp;
 mod aep;
 mod atp;
+mod aurp;
 mod ddp;
 mod llap;
 mod nbp;
+mod rtmp;
 mod zip;
 
 pub use aarp::Aarp;
 pub use aep::{Aep, Echo};
 pub use atp::{Atp, Func};
+// stub: Task 3 gives these a parser; Task 10 the first caller.
+#[allow(unused_imports)]
+pub use aurp::{Aurp, Cmd, Di, DomainHeader, EventTuple};
 pub use ddp::Ddp;
 pub use llap::{Llap, LLAP_ACK, LLAP_ENQ, LLAP_LONG_DDP, LLAP_SHORT_DDP};
 pub use nbp::{Nbp, NbpFunc, NbpTuple};
+pub use rtmp::{NetworkTuple, Rtmp};
 pub use zip::{Zip, ZipAtp};
 
 pub const DDP: u16 = 0x809b; // AppleTalk Datagram Delivery Protocol
@@ -48,6 +54,8 @@ const SNAP_DDP: [u8; 5] = [0x08, 0x00, 0x07, 0x80, 0x9b];
 const SNAP_AARP: [u8; 5] = [0x00, 0x00, 0x00, 0x80, 0xf3];
 
 // DDP protocol types.
+pub const DDP_RTMP_DATA: u8 = 1;
+pub const DDP_RTMP_REQ: u8 = 5;
 pub const DDP_NBP: u8 = 2;
 pub const DDP_ATP: u8 = 3;
 pub const DDP_AEP: u8 = 4;
@@ -213,6 +221,7 @@ pub enum Body {
 #[derive(Debug, PartialEq, Eq)]
 pub enum DdpBody {
     Atp(Atp),
+    Rtmp(Rtmp),
     Aep(Aep),
     Nbp(Nbp),
     Zip(Zip),
@@ -234,6 +243,9 @@ pub fn decode(bytes: &[u8]) -> Option<Packet> {
         DDP => match Ddp::parse(&frame.payload) {
             Some(d) => {
                 let inner = match d.typ {
+                    DDP_RTMP_DATA | DDP_RTMP_REQ => {
+                        Rtmp::parse(d.typ, &d.data).map_or(DdpBody::Unknown, DdpBody::Rtmp)
+                    }
                     DDP_NBP => Nbp::parse(&d.data).map_or(DdpBody::Unknown, DdpBody::Nbp),
                     DDP_ATP => Atp::parse(&d.data).map_or(DdpBody::Unknown, DdpBody::Atp),
                     DDP_AEP => Aep::parse(&d.data).map_or(DdpBody::Unknown, DdpBody::Aep),
