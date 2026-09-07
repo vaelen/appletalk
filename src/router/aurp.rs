@@ -273,7 +273,15 @@ impl Peer {
             Cmd::OpenReq { version, options, .. } => {
                 self.open_req(conn, version, &options, now, out)
             }
-            Cmd::RiReq { .. } if conn == self.conn_remote && self.sender != Sender::Unconnected => {
+            // Not during WaitRdAck: we are on the way down, and restarting
+            // the export would abandon the RD.
+            Cmd::RiReq { .. }
+                if conn == self.conn_remote
+                    && matches!(
+                        self.sender,
+                        Sender::Connected | Sender::WaitRiRspAck | Sender::WaitRiUpdAck
+                    ) =>
+            {
                 // A refresh at any time: the sequence restarts at 1.
                 self.seq_send = 0;
                 self.outstanding = None;
@@ -284,18 +292,26 @@ impl Peer {
             Cmd::Tickle if conn == self.conn_remote && self.sender != Sender::Unconnected => {
                 out.acts.push(self.send(conn, 0, Cmd::TickleAck))
             }
-            Cmd::ZiReq { nets } if conn == self.conn_remote => {
+            // `conn_remote` is 0 until a peer opens its connection, so
+            // without the state guard a stranger's ZI-Req carrying conn 0
+            // would turn us into a reflector.
+            Cmd::ZiReq { nets } if conn == self.conn_remote && self.sender != Sender::Unconnected => {
                 for cmd in zi_pages(&nets, tables) {
                     out.acts.push(self.send(conn, 0, cmd));
                 }
             }
-            // Neither is supported, and neither costs any state to refuse.
-            Cmd::GznReq { zone } => out.acts.push(self.send(conn, 0, Cmd::GznRsp { zone, tuples: None })),
-            Cmd::GdzlReq { .. } => out.acts.push(self.send(
-                conn,
-                0,
-                Cmd::GdzlRsp { last: true, start: -1, zones: Vec::new() },
-            )),
+            // Neither is supported, and neither costs any state to refuse --
+            // but both still answer only on an open connection.
+            Cmd::GznReq { zone } if conn == self.conn_remote && self.sender != Sender::Unconnected => {
+                out.acts.push(self.send(conn, 0, Cmd::GznRsp { zone, tuples: None }))
+            }
+            Cmd::GdzlReq { .. } if conn == self.conn_remote && self.sender != Sender::Unconnected => {
+                out.acts.push(self.send(
+                    conn,
+                    0,
+                    Cmd::GdzlRsp { last: true, start: -1, zones: Vec::new() },
+                ))
+            }
 
             // ----------------------------------------- as the data receiver
             Cmd::OpenRsp { rate_or_err, .. }
@@ -309,7 +325,8 @@ impl Peer {
                 // every peer. Honour it per peer if one ever asks for slower.
                 self.receiver = Receiver::WaitRiRsp;
                 self.seq_recv = 1;
-                self.recv_tries = 0;
+                self.recv_tries = 1;
+                self.recv_at = now;
                 self.last_heard = now;
                 out.acts.push(self.send(self.conn_local, 0, Cmd::RiReq { sui: Cmd::ALL_SUI }));
             }
@@ -726,19 +743,23 @@ fn reconnect(peer: &mut Peer, now: Instant, out: &mut Out) {
 
 fn receiver_timers(peer: &mut Peer, tables: &mut Tables, now: Instant, out: &mut Out) {
     match peer.receiver {
-        Receiver::WaitOpenRsp if now.saturating_duration_since(peer.recv_at) >= RETRY => {
+        Receiver::WaitOpenRsp | Receiver::WaitRiRsp
+            if now.saturating_duration_since(peer.recv_at) >= RETRY =>
+        {
             if peer.recv_tries >= RETRIES {
                 peer.close_receiver();
                 return;
             }
             peer.recv_tries += 1;
             peer.recv_at = now;
-            // A retransmitted Open-Req is a fresh packet, same connection ID.
-            out.acts.push(peer.send(
-                peer.conn_local,
-                0,
-                Cmd::OpenReq { sui: Cmd::ALL_SUI, version: 1, options: Vec::new() },
-            ));
+            // Retransmitted Open-Reqs and RI-Reqs are both fresh packets on
+            // the same connection ID (`docs/AURP.md`, "Timers and limits").
+            let cmd = if peer.receiver == Receiver::WaitOpenRsp {
+                Cmd::OpenReq { sui: Cmd::ALL_SUI, version: 1, options: Vec::new() }
+            } else {
+                Cmd::RiReq { sui: Cmd::ALL_SUI }
+            };
+            out.acts.push(peer.send(peer.conn_local, 0, cmd));
         }
         Receiver::Connected if now.saturating_duration_since(peer.last_heard) > LAST_HEARD => {
             peer.receiver = Receiver::WaitTickleAck;
@@ -763,9 +784,6 @@ fn receiver_timers(peer: &mut Peer, tables: &mut Tables, now: Instant, out: &mut
         }
         _ => {}
     }
-    // ponytail: WaitRiRsp has no timeout of its own, as jrouter's does not
-    // either. Give it the Open-Req retransmit if a peer is ever seen to stall
-    // between the Open-Rsp and its first RI-Rsp.
 }
 
 fn sender_timers(peer: &mut Peer, now: Instant, out: &mut Out) {
@@ -978,6 +996,16 @@ mod tests {
         acts.iter()
             .filter_map(|a| match a {
                 Action::ToPeer { bytes, .. } => Some(Aurp::parse(bytes).expect("we emit valid AURP")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The `ToPeer` payloads as they go on the wire.
+    fn raw(acts: &[Action]) -> Vec<Vec<u8>> {
+        acts.iter()
+            .filter_map(|a| match a {
+                Action::ToPeer { bytes, .. } => Some(bytes.clone()),
                 _ => None,
             })
             .collect()
@@ -1334,12 +1362,14 @@ mod tests {
         let mut tb = Tables::new();
         tb.add_port(0, (6800, 6800), true, vec!["A".into()], t0);
         let (mut ps, _, _) = connected(&mut tb, t0);
-        ps.packet(REMOTE, &routing(0xb002, 0, open_req()), &mut tb, t0);
+        let (a, ..) = ps.packet(REMOTE, &routing(0xb002, 0, open_req()), &mut tb, t0);
+        let probe = raw(&a);
         let mut now = t0;
         for _ in 1..RETRIES {
             now += RETRY;
             let (a, _) = ps.tick(&mut tb, now);
-            assert_eq!(sent(&a).len(), 1); // byte-identical retransmissions
+            // An RI-Upd retransmission is the same bytes, same sequence number.
+            assert_eq!(raw(&a), probe);
         }
         now += RETRY;
         ps.tick(&mut tb, now);
@@ -1433,12 +1463,147 @@ mod tests {
     fn gzn_and_gdzl_are_answered_not_supported() {
         let t0 = Instant::now();
         let mut tb = Tables::new();
-        let mut ps = Peers::new(Di::Ip(LOCAL), true, &[], t0);
-        let (a, ..) = ps.packet(REMOTE, &routing(5, 0, Cmd::GznReq { zone: "A".into() }), &mut tb, t0);
-        assert_eq!(cmds(&a), vec![(5, 0, Cmd::GznRsp { zone: "A".into(), tuples: None })]);
-        let (a, ..) = ps.packet(REMOTE, &routing(5, 0, Cmd::GdzlReq { start: 0 }), &mut tb, t0);
+        tb.add_port(0, (6800, 6800), true, vec!["A".into()], t0);
+        let (mut ps, _, b1) = connected(&mut tb, t0);
+        let req = Cmd::GznReq { zone: "A".into() };
+        let (a, ..) = ps.packet(REMOTE, &routing(b1, 0, req), &mut tb, t0);
+        assert_eq!(cmds(&a), vec![(b1, 0, Cmd::GznRsp { zone: "A".into(), tuples: None })]);
+        let (a, ..) = ps.packet(REMOTE, &routing(b1, 0, Cmd::GdzlReq { start: 0 }), &mut tb, t0);
         let rsp = Cmd::GdzlRsp { last: true, start: -1, zones: Vec::new() };
-        assert_eq!(cmds(&a), vec![(5, 0, rsp)]);
+        assert_eq!(cmds(&a), vec![(b1, 0, rsp)]);
+    }
+
+    #[test]
+    fn a_stranger_gets_nothing_back_before_we_are_its_data_sender() {
+        let t0 = Instant::now();
+        let mut tb = Tables::new();
+        tb.add_port(0, (6800, 6800), true, vec!["68k Mac Club".into()], t0);
+        let mut ps = Peers::new(Di::Ip(LOCAL), true, &[], t0);
+        // Open peering makes a peer of whoever writes to us, and a fresh peer
+        // has `conn_remote` 0 -- so conn 0 is exactly the forger's guess.
+        for cmd in [
+            Cmd::ZiReq { nets: vec![6800] },
+            Cmd::GznReq { zone: "68k Mac Club".into() },
+            Cmd::GdzlReq { start: 0 },
+            Cmd::Tickle,
+            Cmd::RiReq { sui: Cmd::ALL_SUI },
+        ] {
+            let (a, ..) = ps.packet(REMOTE, &routing(0, 0, cmd), &mut tb, t0);
+            assert!(sent(&a).is_empty(), "answered a stranger: {a:?}");
+        }
+        assert_eq!(ps.peers[&REMOTE].sender, Sender::Unconnected);
+    }
+
+    #[test]
+    fn an_ri_req_during_wait_rd_ack_does_not_abandon_the_rd() {
+        let t0 = Instant::now();
+        let mut tb = Tables::new();
+        tb.add_port(0, (6800, 6800), true, vec!["A".into()], t0);
+        let (mut ps, _, b1) = connected(&mut tb, t0);
+        ps.shutdown(t0);
+        let (a, ..) = ps.packet(REMOTE, &routing(b1, 0, Cmd::RiReq { sui: Cmd::ALL_SUI }), &mut tb, t0);
+        assert!(sent(&a).is_empty());
+        assert_eq!(ps.peers[&REMOTE].sender, Sender::WaitRdAck);
+        // The RD is still the packet outstanding, so it is what retransmits.
+        let (a, _) = ps.tick(&mut tb, t0 + RETRY);
+        assert_eq!(cmds(&a), vec![(b1, 2, Cmd::Rd { code: -1 })]);
+    }
+
+    #[test]
+    fn five_unanswered_ri_reqs_close_the_receiver() {
+        let t0 = Instant::now();
+        let mut tb = Tables::new();
+        let mut ps = Peers::new(Di::Ip(LOCAL), true, &["peer".to_string()], t0);
+        ps.resolved("peer", REMOTE, t0);
+        let (a, _) = ps.tick(&mut tb, t0 + RECONNECT_SCAN);
+        let a1 = match cmds(&a).as_slice() { [(c, ..)] => *c, o => panic!("{o:?}") };
+        let (a, ..) = ps.packet(REMOTE, &routing(a1, 0, open_rsp(1)), &mut tb, t0);
+        assert_eq!(cmds(&a), vec![(a1, 0, Cmd::RiReq { sui: Cmd::ALL_SUI })]);
+        // Four retransmissions, five RI-Reqs in all, and the peer never answers.
+        let mut now = t0;
+        for _ in 1..RETRIES {
+            now += RETRY;
+            let (a, _) = ps.tick(&mut tb, now);
+            assert_eq!(cmds(&a), vec![(a1, 0, Cmd::RiReq { sui: Cmd::ALL_SUI })]);
+        }
+        now += RETRY;
+        let (a, _) = ps.tick(&mut tb, now);
+        assert!(sent(&a).is_empty());
+        assert_eq!(ps.peers[&REMOTE].receiver, Receiver::Unconnected);
+        assert_eq!(ps.peers[&REMOTE].conn_local, succ(a1));
+        // Unconnected again, so the reconnect scan can have another go.
+        now += RECONNECT_BACKOFF + RECONNECT_SCAN;
+        let (a, _) = ps.tick(&mut tb, now);
+        match cmds(&a).as_slice() {
+            [(c, 0, Cmd::OpenReq { .. })] => assert_eq!(*c, succ(a1)),
+            o => panic!("expected a fresh Open-Req, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn five_unanswered_open_reqs_close_the_receiver() {
+        let t0 = Instant::now();
+        let mut tb = Tables::new();
+        let mut ps = Peers::new(Di::Ip(LOCAL), true, &["peer".to_string()], t0);
+        ps.resolved("peer", REMOTE, t0);
+        let (a, _) = ps.tick(&mut tb, t0 + RECONNECT_SCAN);
+        let a1 = match cmds(&a).as_slice() { [(c, ..)] => *c, o => panic!("{o:?}") };
+        let mut now = t0 + RECONNECT_SCAN;
+        for _ in 1..RETRIES {
+            now += RETRY;
+            let (a, _) = ps.tick(&mut tb, now);
+            assert_eq!(cmds(&a), vec![(a1, 0, open_req())]);
+        }
+        now += RETRY;
+        let (a, _) = ps.tick(&mut tb, now);
+        assert!(sent(&a).is_empty());
+        assert_eq!(ps.peers[&REMOTE].receiver, Receiver::Unconnected);
+    }
+
+    #[test]
+    fn an_inbound_open_req_opens_our_own_direction_at_once() {
+        let t0 = Instant::now();
+        let mut tb = Tables::new();
+        let mut ps = Peers::new(Di::Ip(LOCAL), true, &[], t0);
+        let (a, ..) = ps.packet(REMOTE, &routing(0xb001, 0, open_req()), &mut tb, t0);
+        match cmds(&a).as_slice() {
+            [(0xb001, 0, rsp), (c, 0, req @ Cmd::OpenReq { .. })] => {
+                assert_eq!(*rsp, open_rsp(1));
+                assert_eq!(*req, open_req());
+                assert_ne!(*c, 0xb001); // our own ID, not theirs
+            }
+            o => panic!("expected an Open-Rsp then our own Open-Req, got {o:?}"),
+        }
+        assert_eq!(ps.peers[&REMOTE].receiver, Receiver::WaitOpenRsp);
+    }
+
+    #[test]
+    fn pending_events_collapse_per_network() {
+        let t0 = Instant::now();
+        let mut tb = Tables::new();
+        tb.add_port(0, (6800, 6800), true, vec!["A".into()], t0);
+        let (mut ps, _, _) = connected(&mut tb, t0);
+        let pending = |ps: &Peers| ps.peers[&REMOTE].pending.clone();
+        let queue = |ps: &mut Peers, code: u8, d: u8| {
+            ps.peers.get_mut(&REMOTE).unwrap().queue(EventTuple { code, tuple: t((7100, 7100), d) })
+        };
+        // NA then NDC stays an addition, at the new distance.
+        queue(&mut ps, NA, 1);
+        queue(&mut ps, NDC, 4);
+        assert_eq!(pending(&ps), vec![EventTuple { code: NA, tuple: t((7100, 7100), 4) }]);
+        // ND then NA is a distance change: the peer never lost the network.
+        ps.peers.get_mut(&REMOTE).unwrap().pending.clear();
+        queue(&mut ps, ND, 0);
+        queue(&mut ps, NA, 2);
+        assert_eq!(pending(&ps), vec![EventTuple { code: NDC, tuple: t((7100, 7100), 2) }]);
+        // NDC after NDC: the last one wins.
+        queue(&mut ps, NDC, 3);
+        queue(&mut ps, NDC, 7);
+        assert_eq!(pending(&ps), vec![EventTuple { code: NDC, tuple: t((7100, 7100), 7) }]);
+        // One entry per network throughout, whatever else is queued.
+        queue(&mut ps, NA, 1);
+        ps.peers.get_mut(&REMOTE).unwrap().queue(EventTuple { code: NA, tuple: t((7200, 7200), 1) });
+        assert_eq!(pending(&ps).len(), 2);
     }
 
     #[test]
