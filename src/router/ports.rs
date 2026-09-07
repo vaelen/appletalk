@@ -10,7 +10,6 @@
 //! looks different on Ethernet, on LToUDP and on a TashTalk UART, and the
 //! router upstream should not have to know which.
 
-
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};

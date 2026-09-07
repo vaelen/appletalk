@@ -20,7 +20,6 @@
 //!
 //! Reference: `repos/tashtalk/documentation/protocol.md`.
 
-
 use std::io::{self, Read, Write};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};

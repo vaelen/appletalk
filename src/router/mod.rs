@@ -151,7 +151,7 @@ impl Router {
             In::Aurp { from, bytes } => {
                 let (mut out, changes, ddp) =
                     self.peers.packet(from, bytes, &mut self.tables, now);
-                self.changed(changes);
+                out.extend(self.changed(changes));
                 // A datagram off a tunnel enters the forwarding rules where a
                 // local one does, minus the arriving port and the hop
                 // increment (spec, "DDP forwarding").
@@ -167,13 +167,13 @@ impl Router {
                     out.extend(self.ports[i].tick(now));
                 }
                 let changes = self.tables.age(now);
-                self.changed(changes);
+                out.extend(self.changed(changes));
                 for e in self.local.tick(&self.ports, &self.tables, now) {
                     out.extend(self.emit(e, now));
                 }
                 let (acts, changes) = self.peers.tick(&mut self.tables, now);
                 out.extend(acts);
-                self.changed(changes);
+                out.extend(self.changed(changes));
                 out
             }
             In::Dump => {
@@ -231,7 +231,7 @@ impl Router {
                 &mut self.tables,
                 now,
             );
-            self.changed(changes);
+            out.extend(self.changed(changes));
             for e in emits {
                 out.extend(self.emit(e, now));
             }
@@ -289,10 +289,42 @@ impl Router {
         }
     }
 
-    /// Route changes are what an AURP data sender reports to its peers.
-    fn changed(&mut self, changes: Vec<RouteChange>) {
-        if !changes.is_empty() {
-            self.peers.route_changed(&changes, &self.tables);
+    /// Route changes are what an AURP data sender reports to its peers, and
+    /// the only place the routing and zone tables' movements are visible to
+    /// anyone watching stderr (spec, "Observability").
+    fn changed(&mut self, changes: Vec<RouteChange>) -> Vec<Action> {
+        if changes.is_empty() {
+            return Vec::new();
+        }
+        self.peers.route_changed(&changes, &self.tables);
+        changes.iter().map(|c| Action::Log(self.describe(c))).collect()
+    }
+
+    /// One route change as a line. `Tables::add_zones` reports a network
+    /// becoming exportable the same way it reports a new route, so the added
+    /// line doubles as "zones learned for a network" — which is why it names
+    /// the zones we now hold.
+    fn describe(&self, c: &RouteChange) -> String {
+        let range = format!("{}-{}", c.range.0, c.range.1);
+        let zones = match self.tables.zones(c.range.0) {
+            Some(z) if !z.names.is_empty() => format!(", zones {}", z.names.join(", ")),
+            _ => String::new(),
+        };
+        match (&c.old, &c.new) {
+            (None, Some(n)) => {
+                format!("route {range} via {} distance {}{zones}", via(n.target), n.distance)
+            }
+            (Some(o), None) => {
+                format!("route {range} deleted, was via {} distance {}", via(o.target), o.distance)
+            }
+            (Some(o), Some(n)) => format!(
+                "route {range} now via {} distance {}, was via {} distance {}{zones}",
+                via(n.target),
+                n.distance,
+                via(o.target),
+                o.distance
+            ),
+            (None, None) => format!("route {range} unchanged"),
         }
     }
 
@@ -329,6 +361,14 @@ impl Router {
             ));
         }
         s
+    }
+}
+
+/// How a route is reached, for a log line: `Tables::dump` says it the same way.
+fn via(t: Target) -> String {
+    match t {
+        Target::Port(p) => format!("port {p}"),
+        Target::Peer(ip) => ip.to_string(),
     }
 }
 
@@ -552,16 +592,21 @@ fn resolve(names: &[String], peers: &mut Peers, now: Instant) {
 /// One action on its wire. Every failure is reported and dropped: a router
 /// that exits because one frame would not go out is worse than one that says
 /// so and carries on.
+fn wrong_link(port: PortId, what: &str) -> io::Result<()> {
+    eprintln!("router: port {port} is not a link that carries {what}; dropped");
+    Ok(())
+}
+
 fn execute(a: Action, links: &mut HashMap<PortId, Link>, sock: &UdpSocket) {
     let result = match a {
         Action::ToEther { port, ref frame } => match links.get_mut(&port) {
             Some(Link::Ether(tx)) => tx.send(frame),
-            _ => Ok(()),
+            _ => wrong_link(port, "an Ethernet frame"),
         },
         Action::ToLlap { port, ref llap } => match links.get(&port) {
             Some(Link::Ltoudp(lt)) => lt.send(llap),
             Some(Link::Tashtalk(tt)) => tt.send(llap),
-            _ => Ok(()),
+            _ => wrong_link(port, "an LLAP frame"),
         },
         Action::ToPeer { peer, ref bytes } => sock
             .send_to(bytes, SocketAddrV4::new(peer, AURP_PORT))
@@ -571,7 +616,7 @@ fn execute(a: Action, links: &mut HashMap<PortId, Link>, sock: &UdpSocket) {
         // the bitmap can never be set for the illegal 0 or 255.
         Action::SetNode { port, node } => match links.get(&port) {
             Some(Link::Tashtalk(tt)) => tt.set_node(node),
-            _ => Ok(()),
+            _ => wrong_link(port, "a node-ID bitmap"),
         },
         Action::Log(m) => {
             eprintln!("router: {m}");
@@ -588,9 +633,11 @@ mod tests {
     use super::*;
     use crate::node::{datagram, frame};
     use crate::router::local::AEP_SOCKET;
+    use crate::router::local::RTMP_SOCKET;
+    use crate::router::table::VALIDITY;
     use crate::wire::{
-        Addr, Aep, Aurp, DomainHeader, Echo, NetworkTuple, DDP, DDP_AEP, LLAP_LONG_DDP,
-        LLAP_SHORT_DDP,
+        Addr, Aep, Aurp, DomainHeader, Echo, NetworkTuple, Rtmp, DDP, DDP_AEP, DDP_RTMP_DATA,
+        LLAP_LONG_DDP, LLAP_SHORT_DDP,
     };
     use pnet::util::MacAddr;
 
@@ -795,6 +842,81 @@ mod tests {
             Aurp::Data { ddp, .. } => assert_eq!(ddp, expected.to_bytes()),
             other => panic!("not a Data packet: {other:?}"),
         }
+    }
+
+    /// The deviation that made the AURP arm call `arrived` rather than
+    /// `forward`: node 0 means "any router on that network", and over a tunnel
+    /// that is how an NBP FwdReq and everything like it reaches us. Forwarding
+    /// it would have put it on our own cable addressed to the illegal node 0.
+    #[test]
+    fn a_tunnelled_datagram_for_node_zero_of_our_cable_is_delivered_here() {
+        let now = Instant::now();
+        let mut r = router(now);
+        route(&mut r, 2905, Target::Peer(PEER), Addr { net: 0, node: 0 }, now);
+        let req = echo_request(Addr { net: 2905, node: 5 }, Addr { net: ETHER, node: 0 });
+        let wrapped = Aurp::Data {
+            dh: DomainHeader { dst: Di::Ip(Ipv4Addr::new(203, 0, 113, 1)), src: Di::Ip(PEER) },
+            ddp: req.to_bytes(),
+        }
+        .to_bytes();
+        let out = r.step(In::Aurp { from: PEER, bytes: &wrapped }, now);
+        // Answered by us, back down the tunnel — not repeated onto the cable.
+        assert_eq!(out.len(), 1, "{out:?}");
+        let Action::ToPeer { bytes, .. } = &out[0] else { panic!("not tunnelled: {out:?}") };
+        let Aurp::Data { ddp, .. } = Aurp::parse(bytes).expect("an AURP packet") else {
+            panic!("not a Data packet")
+        };
+        let reply = Ddp::parse(&ddp).expect("a datagram");
+        assert_eq!(reply.src, Addr { net: ETHER, node: ETHER_NODE });
+        assert_eq!(reply.dst, Addr { net: 2905, node: 5 });
+        assert_eq!(aep_of(&reply).func, Echo::Reply);
+    }
+
+    #[test]
+    fn a_route_learned_and_then_aged_out_is_reported_on_stderr() {
+        let now = Instant::now();
+        let mut r = router(now);
+        // Another router on the LToUDP cable advertising network 3000.
+        let beacon = Rtmp::Data {
+            sender: Addr { net: LOCAL, node: 5 },
+            range: None,
+            tuples: vec![NetworkTuple { range: (3000, 3000), extended: true, distance: 0 }],
+        };
+        let ddp = datagram(
+            Addr { net: LOCAL, node: 5 },
+            RTMP_SOCKET,
+            Addr { net: LOCAL, node: 255 },
+            RTMP_SOCKET,
+            DDP_RTMP_DATA,
+            beacon.to_bytes(),
+        );
+        let out = r.step(In::Llap { port: 1, llap: &on_llap(&ddp, 255, 5) }, now);
+        let logs: Vec<&String> = out
+            .iter()
+            .filter_map(|a| match a {
+                Action::Log(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(logs.len(), 1, "{out:?}");
+        assert!(logs[0].contains("3000-3000"), "{}", logs[0]);
+        assert!(logs[0].contains("port 1"), "{}", logs[0]);
+        // A tuple distance of 0 is one hop away through the router that sent it.
+        assert!(logs[0].contains("distance 1"), "{}", logs[0]);
+
+        // Good -> suspect -> bad -> worst -> gone, one step per validity period.
+        let mut deleted = Vec::new();
+        for step in 1..=4 {
+            deleted.extend(r.step(In::Tick, now + VALIDITY * step).into_iter().filter_map(|a| {
+                match a {
+                    Action::Log(m) if m.contains("deleted") => Some(m),
+                    _ => None,
+                }
+            }));
+        }
+        assert_eq!(deleted.len(), 1, "{deleted:?}");
+        assert!(deleted[0].contains("3000-3000"), "{}", deleted[0]);
+        assert!(deleted[0].contains("distance 1"), "{}", deleted[0]);
     }
 
     #[test]

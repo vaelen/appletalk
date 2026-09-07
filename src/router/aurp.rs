@@ -10,7 +10,6 @@
 //! machines and nothing else. It never touches a socket -- the run loop feeds
 //! it datagrams and sends the `Action::ToPeer`s it hands back.
 
-
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Write as _};
 use std::net::Ipv4Addr;
@@ -194,6 +193,12 @@ impl Peer {
 
     /// Close as data receiver. The next Open-Req must carry a different
     /// connection ID or the peer takes it for a retransmission (RFC p. 43).
+    /// ponytail: neither this nor `close_sender` reports the transition, so
+    /// the spec's "peer receiver/sender state transitions, with the reason on
+    /// the way down" is not on stderr. The state is set at fifteen places and
+    /// only some of them hold an `Out` to push a `Log` onto; give `Peer` a
+    /// `set_receiver`/`set_sender` pair that takes one, and route every
+    /// assignment through it, if the tunnels ever need watching live.
     fn close_receiver(&mut self) {
         self.receiver = Receiver::Unconnected;
         self.conn_local = succ(self.conn_local);
@@ -702,15 +707,6 @@ impl Peers {
             );
         }
         s
-    }
-
-    /// Whether we already hold a connection to this address. Nothing in the
-    /// run loop asks: `packet` decides for itself what to do with a stranger,
-    /// and `resolved` is idempotent. Kept because it is the only read-only
-    /// window onto the peer set a caller has.
-    #[allow(dead_code)]
-    pub fn known(&self, addr: Ipv4Addr) -> bool {
-        self.peers.contains_key(&addr)
     }
 
     fn take_conn(&mut self) -> u16 {
@@ -1390,7 +1386,7 @@ mod tests {
         let (a, ..) = ps.packet(REMOTE, &p, &mut tb, t0);
         assert!(sent(&a).is_empty());
         assert!(matches!(a.as_slice(), [Action::Log(_)]));
-        assert!(!ps.known(REMOTE));
+        assert!(!ps.peers.contains_key(&REMOTE));
         // One log per address per minute, no more.
         let (a, ..) = ps.packet(REMOTE, &p, &mut tb, t0 + Duration::from_secs(30));
         assert!(a.is_empty());

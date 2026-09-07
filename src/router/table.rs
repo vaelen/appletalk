@@ -3,7 +3,6 @@
 
 //! The routing and zone tables: what the router knows about every network on
 //! the internet, and which zones sit on each.
-//!
 
 use std::collections::HashMap;
 use std::fmt::{self, Write};

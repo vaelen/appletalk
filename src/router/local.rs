@@ -7,7 +7,6 @@
 //! update the tables, and hand back datagrams for the runtime to send. No I/O,
 //! no clock of their own.
 
-
 use std::time::{Duration, Instant};
 
 use super::ports::Port;
