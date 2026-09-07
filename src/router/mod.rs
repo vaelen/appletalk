@@ -95,6 +95,9 @@ pub struct Router {
 }
 
 impl Router {
+    /// `cfg.public_ip` is read here as the AURP domain identifier, so `run`
+    /// resolves it before calling this.
+    ///
     /// `port_kinds` is one entry per configured port, in the config's own
     /// order — every EtherTalk port, then every LToUDP port, then every
     /// TashTalk one — carrying the name the link actually opened under and
@@ -194,7 +197,10 @@ impl Router {
         now: Instant,
     ) -> Vec<Action> {
         // A length field that disagrees with the bytes means a truncated or
-        // padded datagram; fail closed rather than pass it on.
+        // padded datagram; fail closed rather than pass it on. (A Phase 1
+        // frame carries its Ethernet padding into the payload, so a short one
+        // lands here too — Phase 1 is not a link this router claims to
+        // route.)
         if ddp.length as usize != 13 + ddp.data.len() {
             return Vec::new();
         }
@@ -483,6 +489,10 @@ fn spawn_aurp(sock: &UdpSocket, tx: SyncSender<Event>) -> io::Result<()> {
         loop {
             match sock.recv_from(&mut buf) {
                 Ok((n, std::net::SocketAddr::V4(from))) => {
+                    // Blocks rather than dropping, unlike the link readers:
+                    // the run loop is the only consumer and never sends into
+                    // this channel, so it cannot deadlock, and a dropped
+                    // routing packet costs a whole retransmit interval.
                     let event = Event::Aurp { from, bytes: buf[..n].to_vec() };
                     if tx.send(event).is_err() {
                         return;
