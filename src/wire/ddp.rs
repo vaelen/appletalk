@@ -12,8 +12,7 @@ use super::{Addr, Encode, DDP_AEP, DDP_ATP, DDP_NBP, DDP_ZIP};
 /// a zero checksum on the wire means "not computed".
 ///
 /// ponytail: checksums are optional on the wire; unused until a node transmits.
-#[allow(dead_code)]
-pub fn checksum(bytes: &[u8]) -> u16 {
+pub(crate) fn checksum(bytes: &[u8]) -> u16 {
     let mut sum: u16 = 0;
     for &b in bytes {
         sum = sum.wrapping_add(b as u16).rotate_left(1);
@@ -24,7 +23,7 @@ pub fn checksum(bytes: &[u8]) -> u16 {
 /// A DDP datagram with the 13-byte extended (long) header — the only form
 /// EtherTalk carries. The 5-byte short header is LocalTalk-only, where LLAP's
 /// type field tells the two apart.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ddp {
     pub hops: u8,
     /// Header + data, per the wire. Compare against `data` to spot truncation.
@@ -62,9 +61,9 @@ impl Ddp {
     ///
     /// A short header omits what its context already supplies: the node IDs come
     /// from the LLAP header, and both network numbers from the single network a
-    /// short header is only legal on. There is no inverse — PDF 118 permits
-    /// extended headers even when both sockets share a network, so nothing here
-    /// ever needs to write one back.
+    /// short header is only legal on. `to_short_bytes` writes one back; PDF 118
+    /// permits an extended header there too, so it is only worth doing when the
+    /// far side is known to prefer the short form.
     pub fn from_short(p: &[u8], net: u16, dst_node: u8, src_node: u8) -> Option<Ddp> {
         let h = p.get(..5)?;
         // The upper 6 bits of the length are not significant (PDF 118).
@@ -87,6 +86,26 @@ impl Ddp {
             typ: h[4],
             data,
         })
+    }
+
+    /// The 5-byte short header (PDF 118) plus data: a 10-bit length covering
+    /// header and data, the two socket numbers, and the DDP type. Everything
+    /// else the extended header carries — hops, checksum, network numbers, node
+    /// IDs — is dropped, because LLAP already said it.
+    ///
+    /// ponytail: silently truncates a length over 1023, as `encode` does; real
+    /// DDP data tops out at 586, so this cannot happen on the wire.
+    pub fn to_short_bytes(&self) -> Vec<u8> {
+        let len = (5 + self.data.len()) as u16;
+        let mut out = Vec::with_capacity(len as usize);
+        // byte 0: 6 reserved zero bits, then the top 2 of a 10-bit length.
+        out.push((len >> 8) as u8 & 0x03);
+        out.push(len as u8);
+        out.push(self.dst_socket);
+        out.push(self.src_socket);
+        out.push(self.typ);
+        out.extend(&self.data);
+        out
     }
 
     pub fn type_name(&self) -> &'static str {
@@ -315,5 +334,13 @@ mod tests {
         assert!(Ddp::from_short(&p, 6800, 12, 3).is_none());
         p[1] = 0x05; // claims 5
         assert!(Ddp::from_short(&p, 6800, 12, 3).is_none());
+    }
+
+    #[test]
+    fn short_header_encode_round_trips_through_from_short() {
+        let d = Ddp { hops: 0, length: 0, checksum: 0, dst: Addr { net: 5, node: 3 }, dst_socket: 4, src: Addr { net: 5, node: 9 }, src_socket: 128, typ: 2, data: vec![1, 2, 3] };
+        let s = d.to_short_bytes();
+        assert_eq!(s, [0x00, 8, 4, 128, 2, 1, 2, 3]);
+        assert_eq!(Ddp::from_short(&s, 5, 3, 9).unwrap().data, [1, 2, 3]);
     }
 }

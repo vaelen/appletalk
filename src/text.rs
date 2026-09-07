@@ -54,6 +54,7 @@ fn print_packet(at: SystemTime, p: &Packet, o: &Output) {
                         hexdump(&a.data);
                     }
                 }
+                DdpBody::Rtmp(r) => println!("    {r}"),
                 DdpBody::Nbp(n) => println!("    {n}"),
                 DdpBody::Zip(z) => println!("    {z}"),
                 // No protocol line to print: without --hex this packet shows
@@ -83,7 +84,7 @@ pub fn run(events: Receiver<Event>, output: &Output) {
     let mut session = Session::new();
     for event in events {
         match event {
-            Event::Packet { at, packet } => {
+            Event::Packet { at, packet, .. } => {
                 // Hidden packets still reassemble — only the printing stops —
                 // so a filter can never break a transaction. Their completed
                 // messages are suppressed with them.
@@ -99,7 +100,7 @@ pub fn run(events: Receiver<Event>, output: &Output) {
             }
             // The text frontend never opens a LocalTalk link, so it never
             // sees one of these.
-            Event::Ltoudp { .. } => {}
+            Event::Llap { .. } | Event::Aurp { .. } => {}
             Event::Dropped(n) => {
                 // Any gap could have hit any transaction in flight.
                 session.flush();

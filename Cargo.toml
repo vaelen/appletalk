@@ -9,3 +9,7 @@ authors = ["Andrew C. Young <andrew@vaelen.org>"]
 clap = { version = "4.6.6", features = ["derive"] }
 pnet = "0.35.0"
 socket2 = { version = "0.5", features = ["all"] }
+serde = { version = "1", features = ["derive"] }
+toml_edit = { version = "0.22", features = ["serde"] }
+serialport = "4"
+libc = "0.2"

@@ -7,7 +7,8 @@ use std::fmt;
 
 use pnet::util::MacAddr;
 
-use super::{mac, mac_bytes, put_pstring, pstring, Encode};
+use super::ddp::checksum;
+use super::{mac, mac_bytes, printable, pstring, put_pstring, Encode};
 
 /// A ZIP packet sent directly over DDP. The GetZoneList / GetLocalZones /
 /// GetMyZone calls are a separate thing entirely — those ride on ATP with the
@@ -16,9 +17,19 @@ use super::{mac, mac_bytes, put_pstring, pstring, Encode};
 pub enum Zip {
     /// "Which zones are on these networks?"
     Query { nets: Vec<u16> },
-    /// Network-to-zone-name answers. `extended` marks command 8, used when one
-    /// network's zone list does not fit in a single reply.
-    Reply { zones: Vec<(u16, String)>, extended: bool },
+    /// Network-to-zone-name answers.
+    ///
+    /// `total` is `Some` on an Extended Reply (command 8), which carries one
+    /// network's list and may be one page of several: the header count is then
+    /// the number of names in the *whole* list, not in this packet (PDF 185).
+    /// `None` is a plain Reply (command 2), whose count is exactly the pairs it
+    /// carries and whose every network's list is entirely inside it.
+    ///
+    /// Writing this straight back out is a deliberate exemption from "recompute
+    /// derived fields at encode time": an Extended Reply's count is not derived
+    /// from the packet at all, only from the whole list, which only the sender
+    /// knows. The plain Reply's count *is* recomputed.
+    Reply { zones: Vec<(u16, String)>, total: Option<u8> },
     /// A booting node asking a router for its cable range and zone.
     GetNetInfo { zone: String },
     NetInfoReply {
@@ -49,16 +60,27 @@ impl Zip {
                 Some(Zip::Query { nets })
             }
             cmd @ (2 | 8) => {
-                let count = *p.get(1)? as usize;
+                let count = *p.get(1)?;
                 let mut rest = p.get(2..)?;
-                let mut zones = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let net = u16::from_be_bytes([*rest.first()?, *rest.get(1)?]);
-                    let (name, r) = pstring(rest.get(2..)?)?;
-                    zones.push((net, name));
-                    rest = r;
+                let mut zones = Vec::new();
+                if cmd == 8 {
+                    // The count is the whole list's size, which may span more
+                    // packets than this one, so read pairs to the end of the
+                    // buffer instead of counting them out.
+                    while !rest.is_empty() {
+                        let (z, r) = zone_pair(rest)?;
+                        zones.push(z);
+                        rest = r;
+                    }
+                } else {
+                    // A plain Reply carries exactly the pairs it counts.
+                    for _ in 0..count {
+                        let (z, r) = zone_pair(rest)?;
+                        zones.push(z);
+                        rest = r;
+                    }
                 }
-                Some(Zip::Reply { zones, extended: cmd == 8 })
+                Some(Zip::Reply { zones, total: (cmd == 8).then_some(count) })
             }
             // Command, flags, then 4 zero bytes, then the zone being asked about.
             5 => Some(Zip::GetNetInfo { zone: pstring(p.get(6..)?)?.0 }),
@@ -92,6 +114,13 @@ impl Zip {
     }
 }
 
+/// A network number and the length-prefixed zone name after it, plus the rest.
+fn zone_pair(p: &[u8]) -> Option<((u16, String), &[u8])> {
+    let net = u16::from_be_bytes([*p.first()?, *p.get(1)?]);
+    let (name, rest) = pstring(p.get(2..)?)?;
+    Some(((net, name), rest))
+}
+
 impl fmt::Display for Zip {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
@@ -99,17 +128,21 @@ impl fmt::Display for Zip {
                 let list: Vec<String> = nets.iter().map(|n| n.to_string()).collect();
                 write!(f, "query nets {}", list.join(", "))
             }
-            Zip::Reply { zones, extended } => {
-                let list: Vec<String> = zones.iter().map(|(n, z)| format!("{n}={z}")).collect();
-                let kind = if *extended { "ext-reply" } else { "reply" };
-                write!(f, "{kind} {}", list.join(", "))
+            Zip::Reply { zones, total } => {
+                let list: Vec<String> =
+                    zones.iter().map(|(n, z)| format!("{n}={}", printable(z))).collect();
+                match total {
+                    Some(t) => write!(f, "ext-reply ({} of {t}) {}", zones.len(), list.join(", ")),
+                    None => write!(f, "reply {}", list.join(", ")),
+                }
             }
-            Zip::GetNetInfo { zone } => write!(f, "get-net-info zone {zone}"),
+            Zip::GetNetInfo { zone } => write!(f, "get-net-info zone {}", printable(zone)),
             Zip::NetInfoReply { flags, range, zone, multicast, default_zone } => {
                 let mcast = match multicast {
                     Some(m) => m.to_string(),
                     None => "none".to_string(),
                 };
+                let zone = printable(zone);
                 write!(f, "net-info-reply nets {}-{} zone {zone} mcast {mcast}", range.0, range.1)?;
                 if flags & 0x80 != 0 {
                     f.write_str(" zone-invalid")?;
@@ -121,7 +154,7 @@ impl fmt::Display for Zip {
                     f.write_str(" one-zone")?;
                 }
                 match default_zone {
-                    Some(z) => write!(f, " default {z}"),
+                    Some(z) => write!(f, " default {}", printable(z)),
                     None => Ok(()),
                 }
             }
@@ -135,22 +168,14 @@ impl fmt::Display for Zip {
 /// the transaction reassembler rather than through `decode`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ZipAtp {
-    // Only `parse_request` constructs these three, and nothing calls it
-    // outside tests yet: `Session` classifies completed responses, not
-    // requests. Wire this in once a frontend wants to show the request that
-    // prompted a reply.
-    #[allow(dead_code)]
     GetMyZone,
-    #[allow(dead_code)]
     GetZoneList { start: u16 },
-    #[allow(dead_code)]
     GetLocalZones { start: u16 },
     Reply { last: bool, zones: Vec<String> },
 }
 
 impl ZipAtp {
     /// `user` is the ATP request's four user bytes.
-    #[allow(dead_code)] // only tests call this; no production request-side caller yet
     pub fn parse_request(user: &[u8], _data: &[u8]) -> Option<Self> {
         let u: &[u8; 4] = user.get(..4)?.try_into().ok()?;
         let start = u16::from_be_bytes([u[2], u[3]]);
@@ -176,6 +201,42 @@ impl ZipAtp {
         }
         Some(ZipAtp::Reply { last: u[0] != 0, zones })
     }
+
+    /// The ATP user bytes and data for a GetZoneList, GetLocalZones or
+    /// GetMyZone reply (PDF 186): a last-packet flag, a reserved zero, then the
+    /// zone count, with the names length-prefixed in the data.
+    ///
+    /// The count is derived from `zones` here rather than passed in, so a reply
+    /// cannot claim more names than it carries.
+    pub fn reply_parts(last: bool, zones: &[String]) -> ([u8; 4], Vec<u8>) {
+        let mut data = Vec::new();
+        for z in zones {
+            put_pstring(&mut data, z);
+        }
+        let n = (zones.len() as u16).to_be_bytes();
+        ([last as u8, 0, n[0], n[1]], data)
+    }
+}
+
+/// The zone multicast address to broadcast into `zone` on Ethernet.
+///
+/// PDF 191: uppercase the name, run the DDP checksum over its bytes (not the
+/// length byte), substituting $FFFF for zero, then index that hash modulo the
+/// number of addresses the link offers. PDF 98 gives Ethernet 253 of them,
+/// 09:00:07:00:00:00 through 09:00:07:00:00:FC.
+///
+/// The hash runs over the name's own wire bytes, one per char as `pstring`
+/// read them — not over its UTF-8, which would put an accented zone's lookups
+/// on the wrong multicast address.
+///
+/// ponytail: ASCII uppercasing only. PDF 191 defers to Appendix D for Mac OS
+/// Roman's accented forms, which fold differently; a zone whose name differs
+/// from another's only in an accent's case would share this address.
+pub fn zone_multicast(zone: &str) -> MacAddr {
+    const N: u16 = 253;
+    let raw: Vec<u8> = zone.chars().map(|c| (c as u32 as u8).to_ascii_uppercase()).collect();
+    let h = checksum(&raw);
+    MacAddr::new(0x09, 0x00, 0x07, 0x00, 0x00, (h % N) as u8)
 }
 
 impl fmt::Display for ZipAtp {
@@ -186,7 +247,8 @@ impl fmt::Display for ZipAtp {
             ZipAtp::GetLocalZones { start } => write!(f, "get-local-zones from {start}"),
             ZipAtp::Reply { last, zones } => {
                 let tail = if *last { "last" } else { "more" };
-                write!(f, "zones ({tail}) {}", zones.join(", "))
+                let names: Vec<String> = zones.iter().map(|z| printable(z)).collect();
+                write!(f, "zones ({tail}) {}", names.join(", "))
             }
         }
     }
@@ -202,9 +264,12 @@ impl Encode for Zip {
                     out.extend(n.to_be_bytes());
                 }
             }
-            Zip::Reply { zones, extended } => {
-                out.push(if *extended { 8 } else { 2 });
-                out.push(zones.len().min(255) as u8);
+            Zip::Reply { zones, total } => {
+                out.push(if total.is_some() { 8 } else { 2 });
+                // A plain Reply's count is derived from what it carries; an
+                // Extended Reply announces the whole list, which only the
+                // sender knows.
+                out.push(total.unwrap_or(zones.len().min(255) as u8));
                 for (net, name) in zones {
                     out.extend(net.to_be_bytes());
                     put_pstring(out, name);
@@ -244,6 +309,28 @@ impl Encode for Zip {
 mod tests {
     use super::*;
     use crate::wire::testkit::*;
+
+    /// A Mac OS Roman zone name has to survive the round trip byte for byte,
+    /// and the zone multicast has to hash those same raw bytes -- the router
+    /// sends lookups to the address this returns.
+    #[test]
+    fn a_zone_name_with_a_high_byte_round_trips_and_prints_as_a_dot() {
+        let mut p = vec![2, 1, 0x1a, 0x90];
+        p.extend([4, b'C', b'a', b'f', 0x8e]);
+        let z = Zip::parse(&p).unwrap();
+        assert_eq!(z, Zip::Reply { zones: vec![(6800, "Caf\u{8e}".into())], total: None });
+        assert_eq!(z.to_bytes(), p);
+        assert_eq!(z.to_string(), "reply 6800=Caf.");
+    }
+
+    #[test]
+    fn zone_multicast_hashes_the_raw_uppercased_bytes() {
+        let want = checksum(&[b'C', b'A', b'F', 0x8e]);
+        assert_eq!(
+            zone_multicast("Caf\u{8e}"),
+            MacAddr::new(0x09, 0x00, 0x07, 0x00, 0x00, (want % 253) as u8)
+        );
+    }
 
     #[test]
     fn zip_query() {
@@ -383,9 +470,43 @@ mod tests {
     }
 
     #[test]
-    fn zip_extended_reply_round_trips() {
-        let z = Zip::Reply { zones: vec![(3, "Engineering".into())], extended: true };
+    fn zip_extended_reply_announces_the_whole_list_not_the_page() {
+        // PDF 185: "The network count in the header indicates, not the number
+        // of zone names in the packet, but the number of zone names in the
+        // entire zones list for the requested network, which may span more
+        // than one packet." So a page of 2 out of 30 parses, and round-trips
+        // with the 30 intact.
+        let mut page = vec![8, 30];
+        page.extend([0, 3]);
+        page.extend(ps("Engineering"));
+        page.extend([0, 3]);
+        page.extend(ps("Marketing"));
+        let z = Zip::parse(&page).unwrap();
+        assert_eq!(
+            z,
+            Zip::Reply {
+                zones: vec![(3, "Engineering".into()), (3, "Marketing".into())],
+                total: Some(30),
+            }
+        );
+        assert_eq!(z.to_string(), "ext-reply (2 of 30) 3=Engineering, 3=Marketing");
+        assert_eq!(z.to_bytes(), page);
         assert_eq!(Zip::parse(&z.to_bytes()), Some(z));
+
+        // A plain Reply still means exactly what it counts, and still fails
+        // closed when the count overruns the pairs.
+        let mut short = vec![2, 4];
+        short.extend([0, 3]);
+        short.extend(ps("Engineering"));
+        assert!(Zip::parse(&short).is_none());
+
+        // An Extended Reply reads to the end of the buffer, so a half pair is
+        // still a reject rather than a guess.
+        let mut ragged = vec![8, 30];
+        ragged.extend([0, 3]);
+        ragged.extend(ps("Engineering"));
+        ragged.extend([0, 3, 9, b'x']); // a name that claims nine bytes
+        assert!(Zip::parse(&ragged).is_none());
     }
 
     #[test]
@@ -437,5 +558,24 @@ mod tests {
             ZipAtp::parse_reply(&[1, 0, 0, 0], &[]),
             Some(ZipAtp::Reply { last: true, zones: Vec::new() })
         );
+    }
+
+    #[test]
+    fn atp_reply_parts_round_trip_through_parse_reply() {
+        let (user, data) = ZipAtp::reply_parts(true, &["A".into(), "Bee".into()]);
+        assert_eq!(user, [1, 0, 0, 2]);
+        assert_eq!(data, [1, b'A', 3, b'B', b'e', b'e']);
+        assert_eq!(ZipAtp::parse_reply(&user, &data).unwrap(), ZipAtp::Reply { last: true, zones: vec!["A".into(), "Bee".into()] });
+    }
+
+    #[test]
+    fn zone_multicast_is_case_insensitive_and_in_range() {
+        assert_eq!(zone_multicast("68k Mac Club"), zone_multicast("68K MAC CLUB"));
+        let m = zone_multicast("Anything");
+        assert_eq!((m.0, m.1, m.2, m.3, m.4), (0x09, 0x00, 0x07, 0x00, 0x00));
+        assert!(m.5 <= 0xfc);
+        // The hash is the DDP checksum (ddp::checksum) of the uppercased bytes.
+        let h = crate::wire::ddp::checksum(b"ANYTHING");
+        assert_eq!(m.5, (h % 253) as u8);
     }
 }

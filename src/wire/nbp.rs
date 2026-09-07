@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use super::{put_pstring, pstring, Addr, Encode};
+use super::{printable, pstring, put_pstring, Addr, Encode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NbpFunc {
@@ -66,7 +66,11 @@ impl fmt::Display for NbpTuple {
         write!(
             f,
             "{}:{}@{} at {}:{}",
-            self.object, self.typ, self.zone, self.addr, self.socket
+            printable(&self.object),
+            printable(&self.typ),
+            printable(&self.zone),
+            self.addr,
+            self.socket
         )?;
         if self.enumerator != 0 {
             write!(f, " #{}", self.enumerator)?;
@@ -178,6 +182,23 @@ mod tests {
             n.to_string(),
             "LkUp-Reply id 7  Mac IIci:AFPServer@Engineering at 65280.128:253  \
              SE/30:AFPServer@Engineering at 65280.129:253 #3"
+        );
+    }
+
+    /// Mac OS Roman is not ASCII: a name with a high byte has to come back out
+    /// exactly as it went in, however a dump chooses to print it.
+    #[test]
+    fn nbp_names_round_trip_every_byte_and_print_as_dots() {
+        let mut p = vec![(3 << 4) | 1, 7, 0xff, 0x00, 128, 253, 0];
+        p.extend([4, b'C', b'a', b'f', 0x8e]); // "Cafe" with an acute e
+        p.extend(ps("AFPServer"));
+        p.extend(ps("Engineering"));
+        let n = Nbp::parse(&p).unwrap();
+        assert_eq!(n.tuples[0].object, "Caf\u{8e}");
+        assert_eq!(n.to_bytes(), p);
+        assert_eq!(
+            n.to_string(),
+            "LkUp-Reply id 7  Caf.:AFPServer@Engineering at 65280.128:253"
         );
     }
 

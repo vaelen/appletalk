@@ -26,18 +26,22 @@ pub trait Encode {
 mod aarp;
 mod aep;
 mod atp;
+mod aurp;
 mod ddp;
 mod llap;
 mod nbp;
+mod rtmp;
 mod zip;
 
 pub use aarp::Aarp;
 pub use aep::{Aep, Echo};
 pub use atp::{Atp, Func};
+pub use aurp::{Aurp, Cmd, Di, DomainHeader, EventTuple};
 pub use ddp::Ddp;
 pub use llap::{Llap, LLAP_ACK, LLAP_ENQ, LLAP_LONG_DDP, LLAP_SHORT_DDP};
 pub use nbp::{Nbp, NbpFunc, NbpTuple};
-pub use zip::{Zip, ZipAtp};
+pub use rtmp::{NetworkTuple, Rtmp};
+pub use zip::{zone_multicast, Zip, ZipAtp};
 
 pub const DDP: u16 = 0x809b; // AppleTalk Datagram Delivery Protocol
 pub const AARP: u16 = 0x80f3; // AppleTalk Address Resolution Protocol
@@ -48,6 +52,8 @@ const SNAP_DDP: [u8; 5] = [0x08, 0x00, 0x07, 0x80, 0x9b];
 const SNAP_AARP: [u8; 5] = [0x00, 0x00, 0x00, 0x80, 0xf3];
 
 // DDP protocol types.
+pub const DDP_RTMP_DATA: u8 = 1;
+pub const DDP_RTMP_REQ: u8 = 5;
 pub const DDP_NBP: u8 = 2;
 pub const DDP_ATP: u8 = 3;
 pub const DDP_AEP: u8 = 4;
@@ -63,26 +69,35 @@ pub(crate) fn mac_bytes(m: MacAddr) -> [u8; 6] {
 
 /// Reads a length-prefixed (Pascal) string, returning it and the rest.
 ///
-/// ponytail: AppleTalk names are Mac OS Roman; non-ASCII bytes become '.'
-/// rather than mangling them. Swap in encoding_rs::MACINTOSH if accented zone
-/// names start mattering.
+/// The mapping is Latin-1 — byte `b` becomes the char with code point `b` —
+/// so every byte survives and `put_pstring` maps it straight back. AppleTalk
+/// names are really Mac OS Roman, so a high byte is *not* the character it
+/// looks like here; nothing but a dump ever interprets one, and `printable`
+/// is what a dump shows.
+///
+/// ponytail: swap in encoding_rs::MACINTOSH on both sides if a dump ever has
+/// to spell an accented zone name properly. The wire bytes are unaffected.
 fn pstring(p: &[u8]) -> Option<(String, &[u8])> {
     let len = *p.first()? as usize;
     let s = p.get(1..1 + len)?;
-    let text = s
-        .iter()
-        .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
-        .collect();
-    Some((text, &p[1 + len..]))
+    Some((s.iter().map(|&b| b as char).collect(), &p[1 + len..]))
 }
 
-/// Writes a length-prefixed (Pascal) string. Names are capped at 32 bytes by
-/// the protocol; anything longer is truncated rather than corrupting the
-/// length byte.
+/// Writes a length-prefixed (Pascal) string, undoing `pstring`'s mapping.
+/// Names are capped at 32 characters by the protocol; anything longer is
+/// truncated rather than corrupting the length byte. A char above U+00FF
+/// cannot have come off the wire, and `config::validate` refuses one, so the
+/// cast never loses anything a real name carried.
 pub(crate) fn put_pstring(out: &mut Vec<u8>, s: &str) {
-    let bytes = &s.as_bytes()[..s.len().min(32)];
+    let bytes: Vec<u8> = s.chars().take(32).map(|c| c as u32 as u8).collect();
     out.push(bytes.len() as u8);
     out.extend(bytes);
+}
+
+/// A name as a dump prints it: anything outside printable ASCII as '.'. The
+/// bytes themselves are never changed — only what is shown.
+pub(crate) fn printable(s: &str) -> String {
+    s.chars().map(|c| if (' '..'\u{7f}').contains(&c) { c } else { '.' }).collect()
 }
 
 /// An AppleTalk network address: 16-bit network, 8-bit node.
@@ -213,6 +228,7 @@ pub enum Body {
 #[derive(Debug, PartialEq, Eq)]
 pub enum DdpBody {
     Atp(Atp),
+    Rtmp(Rtmp),
     Aep(Aep),
     Nbp(Nbp),
     Zip(Zip),
@@ -233,13 +249,7 @@ pub fn decode(bytes: &[u8]) -> Option<Packet> {
         AARP => Aarp::parse(&frame.payload).map_or(Body::Unknown, Body::Aarp),
         DDP => match Ddp::parse(&frame.payload) {
             Some(d) => {
-                let inner = match d.typ {
-                    DDP_NBP => Nbp::parse(&d.data).map_or(DdpBody::Unknown, DdpBody::Nbp),
-                    DDP_ATP => Atp::parse(&d.data).map_or(DdpBody::Unknown, DdpBody::Atp),
-                    DDP_AEP => Aep::parse(&d.data).map_or(DdpBody::Unknown, DdpBody::Aep),
-                    DDP_ZIP => Zip::parse(&d.data).map_or(DdpBody::Unknown, DdpBody::Zip),
-                    _ => DdpBody::Unknown,
-                };
+                let inner = decode_ddp_body(&d);
                 Body::Ddp(d, inner)
             }
             None => Body::Unknown,
@@ -247,6 +257,22 @@ pub fn decode(bytes: &[u8]) -> Option<Packet> {
         _ => return None,
     };
     Some(Packet { frame, body })
+}
+
+/// The protocol inside a datagram, by its DDP type. Split out of `decode` so a
+/// datagram lifted off a LocalTalk link — which never went through `decode` —
+/// reaches the same parsers.
+pub fn decode_ddp_body(d: &Ddp) -> DdpBody {
+    match d.typ {
+        DDP_RTMP_DATA | DDP_RTMP_REQ => {
+            Rtmp::parse(d.typ, &d.data).map_or(DdpBody::Unknown, DdpBody::Rtmp)
+        }
+        DDP_NBP => Nbp::parse(&d.data).map_or(DdpBody::Unknown, DdpBody::Nbp),
+        DDP_ATP => Atp::parse(&d.data).map_or(DdpBody::Unknown, DdpBody::Atp),
+        DDP_AEP => Aep::parse(&d.data).map_or(DdpBody::Unknown, DdpBody::Aep),
+        DDP_ZIP => Zip::parse(&d.data).map_or(DdpBody::Unknown, DdpBody::Zip),
+        _ => DdpBody::Unknown,
+    }
 }
 
 /// Fixture builders shared by the protocol modules' tests.
@@ -363,6 +389,17 @@ mod tests {
             }
             other => panic!("expected ATP over DDP, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decode_follows_rtmp_data() {
+        let mut dgram = vec![0x00, 0, 0x00, 0x00, 0x00, 0x00, 0x1a, 0x90, 255, 1, 1, 1, DDP_RTMP_DATA];
+        dgram.extend([0x1a, 0x90, 8, 1, 0x1a, 0x90, 0x80, 0x1a, 0x90, 0x82]);
+        dgram[1] = dgram.len() as u8;
+        let mut body = vec![0xaa, 0xaa, 0x03, 0x08, 0x00, 0x07, 0x80, 0x9b];
+        body.extend(&dgram);
+        let p = decode(&frame(body.len() as u16, &body)).unwrap();
+        assert!(matches!(p.body, Body::Ddp(_, DdpBody::Rtmp(Rtmp::Data { .. }))));
     }
 
     #[test]

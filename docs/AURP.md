@@ -127,6 +127,11 @@ datagram arriving from a tunnel is passed to the local cable **without** a
 second increment. Whole tunnel, one hop. Do the same, or hop counts drift by
 one per tunnel relative to every AIR out there.
 
+Relaying from one tunnel to the next is the case that rule leaves implicit: we
+are the *sending* side of the second tunnel, so that tunnel's hop is ours to
+apply. A datagram arriving from peer A and leaving to peer B is incremented
+once; only peer-to-cable is free.
+
 ### What crosses and what does not
 
 Only unicast datagrams whose destination network is behind the peer cross the
@@ -747,23 +752,37 @@ Two checks worth doing before trusting an implementation on a live tunnel:
 
 ## Where this stack stands
 
-Nothing in `src/` speaks AURP yet, and the stack has no router at all:
-`bridge` repeats frames between links at the link layer, and `node` is one
-node on one cable. Becoming an exterior router means becoming a router first.
-The pieces, in the order they are needed:
+`appletalk router` speaks all of this. The wire layer and the peer runtime are
+in place; what remains is the live network, because none of it has met one yet
+(`CLAUDE.md` keeps that list).
 
-| Piece                 | Have                                   | Need                                                                                                                              |
-|-----------------------|----------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------|
-| RTMP parse and encode | Nothing — RTMP is still a hexdump      | Data, Request, Response packets (PDF 136–138); tuples are reused by AURP                                                          |
-| Routing table         | Nothing                                | Per-network best route + alternatives, aging, split horizon per port, observers for AURP events                                   |
-| Router core           | `bridge.rs` forwards at the link layer | DDP forwarding with hop count, `net.0` delivery to self, BrRq/FwdReq/LkUp translation, ZIP Query/Reply and GetNetInfo as a router |
-| Port abstraction      | `capture.rs` (EtherTalk), `ltoudp.rs`  | One trait over EtherTalk, LToUDP and a tunnel peer — what tashrouter's `Port` and jrouter's `RouteTarget` are                     |
-| AURP codec            | Nothing                                | `wire/aurp.rs`: domain header, routing header, every body above. Pure, testable from byte literals                                |
-| AURP peer runtime     | Nothing                                | The two state machines, timers, UDP 387 socket, peer table                                                                        |
+| Piece                   | Where                 | State                                                                                       |
+|-------------------------|-----------------------|---------------------------------------------------------------------------------------------|
+| RTMP parse and encode   | `src/wire/rtmp.rs`    | Data, Request, Response and RDR, with the `NetworkTuple` AURP reuses                        |
+| AURP codec              | `src/wire/aurp.rs`    | Domain header, routing header and every body below, including optimized zone tuples         |
+| Routing and zone tables | `src/router/table.rs` | Best route per network, the book's aging, split horizon per port, `RouteChange` for AURP    |
+| Ports                   | `src/router/ports.rs` | EtherTalk, LToUDP and TashTalk links: the address claim, defence and per-link framing       |
+| Router services         | `src/router/local.rs` | RTMP, ZIP, NBP and AEP as a router owes them to its own cables                              |
+| AURP peer runtime       | `src/router/aurp.rs`  | Both state machines, the timers, the peer table, split RI-Rsp/ZI-Rsp, event collapsing      |
+| Router core             | `src/router/mod.rs`   | DDP forwarding with the hop count, and the run loop that opens the ports and the UDP socket |
+| Configuration           | `src/config.rs`       | The TOML file, the `router` flags, and `peers import`                                       |
 
-The codec is the same shape as every other `wire/` module and can be built
-and tested against the layouts in this document alone. Everything else
-depends on the router existing.
+Only the required protocol of RFC 1504 chapter 3 is implemented. What is left
+out is left out deliberately, and each omission has a defined answer on the
+wire rather than silence:
+
+- **GZN-Req** is answered with a GZN-Rsp whose tuple count is -1, and
+  **GDZL-Req** with a GDZL-Rsp whose start index is -1: not supported.
+- An **Open-Req carrying options** is refused with error -4, and one naming a
+  version other than 1 with -5. Our own Open-Req sends no options.
+- **Open-Rsp environment flags are 0**: no remapping, no hop-count reduction.
+- **Network hiding, remapping, clustering, hop-count reduction and loop
+  probes** are out entirely, as are AURP over PPP, authentication and IPv6.
+
+Two behaviours go beyond what jrouter does, both from the RFC: RI-Rsp, ZI-Rsp
+and ZI-Req bodies are split at 1400 bytes with each RI-Rsp in a sequence acked
+before the next, and a network that arrives over a tunnel without zones gets a
+fresh ZI-Req every 30 seconds until it has some.
 
 ## References
 
