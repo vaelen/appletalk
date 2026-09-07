@@ -31,6 +31,7 @@ protocol overview and the planned build order.
 | `bridge.md`           | The bridge's behaviour, for whoever has to debug it.                                               |
 | `docs/AURP.md`        | The AURP tunnel protocol (RFC 1504) as GlobalTalk runs it, and what this stack implements.         |
 | `repos/`              | Reference clones of jrouter and tashrouter. Gitignored; re-clone if missing.                       |
+| `contrib/`            | A systemd unit for `router`: dynamic user, ambient capabilities, config in `/etc/appletalk`.       |
 
 Keep parsing pure and in `wire/` — it stays testable without a NIC.
 

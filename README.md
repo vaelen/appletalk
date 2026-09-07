@@ -413,6 +413,29 @@ capability than the rest of the stack:
 sudo setcap cap_net_raw,cap_net_bind_service+ep target/release/appletalk
 ```
 
+#### Running as a service
+
+`contrib/appletalk-router.service` is a systemd unit that runs the router as an
+unprivileged dynamic user with the two capabilities granted by systemd, so the
+installed binary needs no `setcap`. It expects the binary at
+`/usr/local/bin/appletalk` and the config at `/etc/appletalk/appletalk.toml`:
+
+```sh
+sudo install -m 755 target/release/appletalk /usr/local/bin/appletalk
+sudo install -d /etc/appletalk
+sudo install -m 644 appletalk.toml /etc/appletalk/appletalk.toml
+sudo install -m 644 contrib/appletalk-router.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now appletalk-router
+```
+
+Logs go to the journal (`journalctl -u appletalk-router -f`), `systemctl stop`
+sends the `SIGTERM` the router shuts down politely on, and the dump is
+`systemctl kill -s USR1 appletalk-router`. A TashTalk port needs the serial
+device let through; the unit has the two lines to uncomment. Edit the peer
+list with `sudo appletalk peers import ... --config
+/etc/appletalk/appletalk.toml` and restart the service to pick it up.
+
 `docs/AURP.md` is the tunnel protocol itself — the dialog, the packet layouts
 and what this stack implements of it.
 

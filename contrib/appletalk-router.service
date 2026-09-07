@@ -1,0 +1,52 @@
+# systemd unit for `appletalk router`.
+#
+#   sudo install -m 755 target/release/appletalk /usr/local/bin/appletalk
+#   sudo install -d /etc/appletalk
+#   sudo install -m 644 appletalk.toml /etc/appletalk/appletalk.toml
+#   sudo install -m 644 contrib/appletalk-router.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now appletalk-router
+#
+# The binary needs no setcap: the two capabilities it wants are granted here
+# as ambient capabilities to an unprivileged dynamic user.
+
+[Unit]
+Description=AppleTalk seed router with AURP tunnelling
+Documentation=https://github.com/vaelen/appletalk
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/appletalk router --config /etc/appletalk/appletalk.toml
+# stderr carries every log line; journalctl -u appletalk-router shows them.
+StandardOutput=journal
+StandardError=journal
+
+# SIGTERM makes the router tell its AURP peers it is going (an RD each) and
+# wait up to two seconds for their acks before exiting.
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=5
+
+# Raw Ethernet frames need CAP_NET_RAW; UDP 387 needs CAP_NET_BIND_SERVICE.
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+
+# The router reads its config and writes nothing.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_PACKET AF_INET AF_UNIX
+
+# A TashTalk port needs its serial device. Uncomment both lines and name the
+# device the config uses.
+#SupplementaryGroups=dialout
+#DeviceAllow=/dev/ttyAMA0 rw
+
+[Install]
+WantedBy=multi-user.target
