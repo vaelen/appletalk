@@ -53,23 +53,70 @@ guessing — a wrong decode is worse than a hex dump.
 
 ## Building
 
-Rust 1.85 or newer (the crate is edition 2024).
+Rust 1.85 or newer (the crate is edition 2024). The TashTalk port uses the
+`serialport` crate, which on Debian and Ubuntu needs `libudev-dev` at build
+time:
 
 ```sh
+sudo apt install libudev-dev     # Debian/Ubuntu only
 cargo build --release
 ```
 
+The binary is `target/release/appletalk`. Copy it wherever you like — it has no
+runtime files, and the router looks for its config next to the working
+directory or in `/etc/appletalk`, not next to the binary. A debug build
+(`cargo build`, giving `target/debug/appletalk`) works the same way and is what
+the test suite exercises.
+
 ## Running
 
-Capturing and transmitting raw frames needs `CAP_NET_RAW`. Grant it to the
-binary once rather than running the whole thing as root:
+Capturing and transmitting raw Ethernet frames needs `CAP_NET_RAW`, and the
+router additionally binds UDP 387, which needs `CAP_NET_BIND_SERVICE`. Grant
+them to the binary once rather than running the whole thing as root:
 
 ```sh
+# everything except router
 sudo setcap cap_net_raw+ep target/release/appletalk
+
+# everything, including router
+sudo setcap cap_net_raw,cap_net_bind_service+ep target/release/appletalk
 ```
 
-By default it picks the first interface that is up, isn't loopback, and has a
-MAC. Use `-i` to choose:
+`cargo build` writes a fresh file, so **re-run `setcap` after every rebuild**.
+Running as root (`sudo ./target/release/appletalk ...`) works too, and is the
+fallback on a filesystem that does not carry capabilities.
+
+### Commands
+
+| Command                 | What it does                                               | Needs                                 |
+|-------------------------|------------------------------------------------------------|---------------------------------------|
+| `monitor` (the default) | Print decoded AppleTalk traffic as it arrives              | `cap_net_raw`                         |
+| `zones`                 | List the zones on the internet                             | `cap_net_raw`                         |
+| `nodes [ZONE]`          | List the entities registered in a zone                     | `cap_net_raw`                         |
+| `ping TARGET [-c N]`    | Echo a node by `net.node` or `object:type@zone`            | `cap_net_raw`                         |
+| `bridge udp`            | Bridge LToUDP emulators onto this Ethernet, as one network | `cap_net_raw`                         |
+| `router [FLAGS]`        | Route between links and AURP peers, from a config or flags | `cap_net_raw`, `cap_net_bind_service` |
+| `peers import FILE`     | Merge a peer list into the router config file              | nothing                               |
+
+`appletalk --help` lists them, `appletalk <command> --help` details one, and
+`appletalk --version` prints the crate version.
+
+### Global flags
+
+These are accepted before or after the command name and apply to every
+command that opens a NIC:
+
+| Flag                  | Effect                                                                   |
+|-----------------------|--------------------------------------------------------------------------|
+| `-i, --interface NIC` | NIC to use. Default: the first one that is up, isn't loopback, has a MAC |
+| `--net NET`           | Claim an address on this network; the node number is chosen for you      |
+| `--node NET.NODE`     | Claim exactly this address                                               |
+| `-h, --help`          | Usage, for the whole program or one command                              |
+| `-V, --version`       | Print the version and exit                                               |
+
+`--net` and `--node` are mutually exclusive, and `monitor` ignores both since
+it never claims an address. The router does not use `-i`: each of its EtherTalk
+ports names its own interface.
 
 ```sh
 appletalk -i eth0 monitor
@@ -94,8 +141,13 @@ packet: the Ethernet frame, the DDP datagram, then the decoded protocol.
 | `--only <list>`  | Show only these protocols, comma separated        |
 | `--hide <list>`  | Hide these protocols, comma separated             |
 
-`--only` and `--hide` are mutually exclusive. Filtering happens at display
-time, so hidden traffic is still captured and reassembled.
+`--only` and `--hide` are mutually exclusive and take these names: `aarp`,
+`rtmp`, `nbp`, `atp`, `aep`, `zip`, `adsp`, and `other` for any DDP type the
+list does not name. Filtering happens at display time, so hidden traffic is
+still captured and reassembled.
+
+The flags may follow the command name or stand alone (`appletalk --hide rtmp`
+means `appletalk monitor --hide rtmp`); they may not precede another command.
 
 Monitoring is entirely passive — it claims no address and transmits nothing.
 
@@ -146,8 +198,9 @@ appletalk ping -c 10 6800.3
 ```
 
 A target containing `:` or `@` is looked up through NBP first; anything else is
-parsed as `net.node`. AEP has no sequence number, so the round-trip time comes
-from a marker planted in the echo data. Exits non-zero if nothing answers.
+parsed as `net.node`. `-c, --count N` sets how many echoes to send (default 4,
+minimum 1). AEP has no sequence number, so the round-trip time comes from a
+marker planted in the echo data. Exits non-zero if nothing answers.
 
 ### bridge — put emulated Macs on the real network
 
@@ -200,6 +253,14 @@ known limits, for when something does not arrive and you need to know why.
 
 ```sh
 appletalk router --config appletalk.toml
+```
+
+Before the first run, grant the extra capability the AURP port needs (see
+[Running](#running)):
+
+```sh
+cargo build --release
+sudo setcap cap_net_raw,cap_net_bind_service+ep target/release/appletalk
 ```
 
 Where `bridge` makes two links look like one network, `router` gives each link
@@ -274,7 +335,20 @@ appletalk router --ethertalk 'eth0:6800-6800:68k Mac Club' --ltoudp 6801:Emulato
 
 Per list, the replace, `--add-*` and `--no-*` flags are mutually exclusive. A
 zone name containing a colon cannot go in a spec — the colon is the field
-separator — so put that port in the config file.
+separator — so put that port in the config file. Flags override the file: a
+scalar flag replaces the file's value, and each list follows the rule above.
+The global `-i`, `--net` and `--node` flags are ignored by `router`.
+
+| Setting        | File key              | Flag                | Default                       |
+|----------------|-----------------------|---------------------|-------------------------------|
+| Router name    | `router.name`         | `--name`            | `appletalk`                   |
+| Public IP      | `router.public_ip`    | `--public-ip`       | the socket's, else a NIC's IP |
+| AURP listen    | `router.listen`       | `--listen`          | `0.0.0.0:387`                 |
+| Open peering   | `router.open_peering` | `--no-open-peering` | `true`                        |
+| Peers          | `router.peers`        | `--peer` and kin    | none                          |
+| EtherTalk port | `[[ethertalk]]`       | `--ethertalk`       | none                          |
+| LToUDP port    | `[[ltoudp]]`          | `--ltoudp`          | none                          |
+| TashTalk port  | `[[tashtalk]]`        | `--tashtalk`        | none                          |
 
 #### peers import — merge a peer list
 
