@@ -5,7 +5,7 @@
 //! results as events. Knows nothing about how they are displayed.
 
 use std::io;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -21,19 +21,36 @@ use crate::wire::{self, Encode};
 /// matter.
 const QUEUE: usize = 1024;
 
+/// Which link an event arrived on. A router numbers its ports; everything
+/// else has one link and uses port 0.
+pub type PortId = u8;
+
 #[derive(Debug)]
 pub enum Event {
     Packet {
         /// Stamped in userspace after the read, so it lags the wire by however
         /// long the frame sat in the kernel buffer.
         at: SystemTime,
+        // stub: Task 11 routes on this; today's frontends have one link.
+        #[allow(dead_code)]
+        port: PortId,
         packet: wire::Packet,
     },
-    /// An LLAP frame off a LocalTalk-shaped link. Posted by `ltoudp`, which
-    /// holds a clone of the same sender the capture thread uses. No
-    /// timestamp: nothing reads one — `text` never opens a LocalTalk link,
-    /// and `bridge::run` works in `Instant`, not wall-clock time.
-    Ltoudp { llap: wire::Llap },
+    /// An LLAP frame off any LocalTalk-shaped link (LToUDP or TashTalk).
+    /// Posted by the link's own reader thread, which holds a clone of the
+    /// same sender the capture thread uses. No timestamp: nothing reads one —
+    /// `text` never opens a LocalTalk link, and `bridge::run` works in
+    /// `Instant`, not wall-clock time.
+    Llap {
+        // stub: Task 11 routes on this; today's frontends have one link.
+        #[allow(dead_code)]
+        port: PortId,
+        llap: wire::Llap,
+    },
+    /// One UDP datagram off the AURP socket.
+    // stub: Task 11 posts these; nothing consumes them yet.
+    #[allow(dead_code)]
+    Aurp { from: SocketAddrV4, bytes: Vec<u8> },
     /// Frames discarded because the queue was full, counted since the last
     /// report. A frontend that ignores this shows a gap with no explanation.
     Dropped(u64),
@@ -81,6 +98,36 @@ pub struct Capture {
 /// CAP_NET_RAW — surfaces here rather than killing a thread nobody is
 /// watching.
 pub fn spawn(want: Option<&str>) -> io::Result<Capture> {
+    let (iface, ip, sender_half, rx, mac) = open(want)?;
+    let (tx, events) = sync_channel(QUEUE);
+    let sender = tx.clone();
+    thread::spawn(move || capture_loop(rx, tx, 0));
+    Ok(Capture { iface, ip, tx: Tx { inner: sender_half, mac }, sender, events })
+}
+
+/// A NIC opened for a router port: it shares the router's event channel
+/// instead of owning one.
+// stub: Task 11 opens router ports with this.
+#[allow(dead_code)]
+pub struct Nic {
+    pub iface: String,
+    pub ip: Option<Ipv4Addr>,
+    pub tx: Tx,
+}
+
+// stub: Task 11.
+#[allow(dead_code)]
+pub fn spawn_into(want: Option<&str>, port: PortId, tx: SyncSender<Event>) -> io::Result<Nic> {
+    let (iface, ip, sender_half, rx, mac) = open(want)?;
+    thread::spawn(move || capture_loop(rx, tx, port));
+    Ok(Nic { iface, ip, tx: Tx { inner: sender_half, mac } })
+}
+
+/// Picks the interface and opens its datalink channel. Everything up to the
+/// point where a caller decides who owns the event queue.
+type Opened = (String, Option<Ipv4Addr>, Box<dyn DataLinkSender>, Box<dyn DataLinkReceiver>, MacAddr);
+
+fn open(want: Option<&str>) -> io::Result<Opened> {
     let iface = datalink::interfaces()
         .into_iter()
         .find(|i| match want {
@@ -116,18 +163,15 @@ pub fn spawn(want: Option<&str>) -> io::Result<Capture> {
         _ => None,
     });
 
-    let (tx, events) = sync_channel(QUEUE);
-    let sender = tx.clone();
-    thread::spawn(move || capture_loop(rx, tx));
-    Ok(Capture { iface: iface.name, ip, tx: Tx { inner: sender_half, mac }, sender, events })
+    Ok((iface.name, ip, sender_half, rx, mac))
 }
 
-fn capture_loop(mut rx: Box<dyn DataLinkReceiver>, tx: SyncSender<Event>) {
+fn capture_loop(mut rx: Box<dyn DataLinkReceiver>, tx: SyncSender<Event>, port: PortId) {
     let mut dropped = 0u64;
     loop {
         let event = match rx.next() {
             Ok(bytes) => match wire::decode(bytes) {
-                Some(packet) => Event::Packet { at: SystemTime::now(), packet },
+                Some(packet) => Event::Packet { at: SystemTime::now(), port, packet },
                 None => continue, // not AppleTalk
             },
             // A read error that keeps recurring (the NIC going away, say)
@@ -165,9 +209,9 @@ mod tests {
         let (tx, rx) = sync_channel(QUEUE);
         let second = tx.clone();
         let llap = Llap::control(42, 42, 0x81);
-        second.try_send(Event::Ltoudp { llap: llap.clone() }).unwrap();
+        second.try_send(Event::Llap { port: 0, llap: llap.clone() }).unwrap();
         match rx.recv().unwrap() {
-            Event::Ltoudp { llap: got } => assert_eq!(got, llap),
+            Event::Llap { port: 0, llap: got } => assert_eq!(got, llap),
             other => panic!("wrong event: {other:?}"),
         }
     }

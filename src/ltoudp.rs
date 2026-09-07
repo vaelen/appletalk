@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use socket2::{Domain, Protocol, Socket, Type};
 
-use crate::capture::Event;
+use crate::capture::{Event, PortId};
 use crate::wire::{Encode, Llap};
 
 /// The group's last two octets spell "LT".
@@ -107,7 +107,7 @@ impl Ltoudp {
     /// Joins the group and starts the reader thread. Same contract as the
     /// capture thread: it drops rather than blocking when the consumer falls
     /// behind, and reports the count so a gap is never silent.
-    pub fn spawn(&self, tx: SyncSender<Event>) -> io::Result<()> {
+    pub fn spawn(&self, port: PortId, tx: SyncSender<Event>) -> io::Result<()> {
         let iface = self.iface.unwrap_or(Ipv4Addr::UNSPECIFIED);
         self.sock.join_multicast_v4(&GROUP, &iface)?;
         // `set_multicast_if_v4` has no std API (LToUDP.md: "set the outgoing
@@ -116,12 +116,12 @@ impl Ltoudp {
         Socket::from(self.sock.try_clone()?).set_multicast_if_v4(&iface)?;
         let sock = self.sock.try_clone()?;
         let id = self.id;
-        thread::spawn(move || read_loop(sock, id, tx));
+        thread::spawn(move || read_loop(sock, id, port, tx));
         Ok(())
     }
 }
 
-fn read_loop(sock: UdpSocket, id: [u8; 4], tx: SyncSender<Event>) {
+fn read_loop(sock: UdpSocket, id: [u8; 4], port: PortId, tx: SyncSender<Event>) {
     // One byte larger than the largest legal datagram (MAX), so that a
     // datagram filling the buffer to capacity is unambiguous truncation
     // rather than being confused with a coincidentally maximum-size frame.
@@ -130,7 +130,7 @@ fn read_loop(sock: UdpSocket, id: [u8; 4], tx: SyncSender<Event>) {
     loop {
         let event = match sock.recv_from(&mut buf) {
             Ok((n, _)) => match inbound(&buf[..n], id) {
-                Some(llap) => Event::Ltoudp { llap },
+                Some(llap) => Event::Llap { port, llap },
                 None => continue,
             },
             // A recv_from error that keeps recurring (the interface going

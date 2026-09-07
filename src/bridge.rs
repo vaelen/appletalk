@@ -594,7 +594,9 @@ pub fn run(
         let now = Instant::now();
         let actions = match event {
             Ok(Event::Packet { packet, .. }) => b.step(In::Ether(&packet), now),
-            Ok(Event::Ltoudp { llap, .. }) => b.step(In::Local(&llap), now),
+            Ok(Event::Llap { llap, .. }) => b.step(In::Local(&llap), now),
+            // The bridge opens no AURP socket; only a router does.
+            Ok(Event::Aurp { .. }) => Vec::new(),
             Ok(Event::Dropped(n)) => {
                 eprintln!("dropped {n} frames (queue full)");
                 b.step(In::Tick, now)

@@ -137,7 +137,7 @@ fn run_node(
             let (tx, rx, addr, amt) = n.into_parts();
             // Started only now: until the address is claimed there is nothing
             // to bridge, and `Node::wait` would discard these anyway.
-            lt.spawn(sender)?;
+            lt.spawn(0, sender)?;
             eprintln!("bridging {addr} <-> LToUDP {}:{}", ltoudp::GROUP, ltoudp::PORT);
             bridge::run(tx, rx, lt, addr, amt)
         }

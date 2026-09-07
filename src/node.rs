@@ -645,7 +645,7 @@ impl Node {
         loop {
             let left = deadline.checked_duration_since(Instant::now())?;
             match self.rx.recv_timeout(left) {
-                Ok(Event::Packet { at, packet }) => {
+                Ok(Event::Packet { at, packet, .. }) => {
                     glean(&mut self.amt, &packet);
                     self.messages.extend(self.session.push(at, &packet));
                     // Only `zone_list` drains this; every other caller must
@@ -668,7 +668,7 @@ impl Node {
                 }
                 // Only the bridge opens a LocalTalk link; a node command
                 // never sees one.
-                Ok(Event::Ltoudp { .. }) => {}
+                Ok(Event::Llap { .. }) | Ok(Event::Aurp { .. }) => {}
                 Ok(Event::Dropped(_)) => self.session.flush(),
                 Ok(Event::Error(e)) => eprintln!("rx: {e}"),
                 Err(RecvTimeoutError::Timeout) => return None,
