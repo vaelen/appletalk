@@ -112,10 +112,6 @@ impl Router {
             tables.add_port(p.id, range, p.extended(), zones, now);
             ports.push(p);
         }
-        // ponytail: a peer created under open peering, or one whose configured
-        // name later disappears, is never evicted — the peer table only grows.
-        // Evict peers with both connections Unconnected if a public router
-        // ever meets enough strangers for that to matter.
         let peers = Peers::new(
             cfg.public_ip.map_or(Di::Null, Di::Ip),
             cfg.open_peering,

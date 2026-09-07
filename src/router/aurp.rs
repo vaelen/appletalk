@@ -54,6 +54,16 @@ const NO_NEXT: Addr = Addr { net: 0, node: 0 };
 /// One log line per unknown address per this long.
 const LOG_EVERY: Duration = Duration::from_secs(60);
 
+/// The most peers open peering will hold. UDP 387 faces the internet and a
+/// stranger's single parseable packet is enough to create an entry, so without
+/// a ceiling the peer table is a remote memory-exhaustion vector. Configured
+/// peers are exempt: they are named in the config, not by whoever sends to us.
+///
+/// ponytail: a flat cap, first come first served -- once it is full no new
+/// stranger gets in until an idle one ages out on `tick`. Evict the least
+/// recently heard from instead if a public router ever needs to churn faster.
+const MAX_OPEN_PEERS: usize = 256;
+
 /// Our side of the connection we opened: the peer is the data sender on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Receiver {
@@ -574,6 +584,14 @@ impl Peers {
                 }
                 return (out.acts, out.chs, None);
             }
+            if self.peers.len() >= MAX_OPEN_PEERS {
+                if self.log_unknown(from, now) {
+                    out.acts.push(Action::Log(format!(
+                        "aurp: already holding {MAX_OPEN_PEERS} peers; ignoring {from}"
+                    )));
+                }
+                return (out.acts, out.chs, None);
+            }
             let conn = self.take_conn();
             self.peers.insert(from, Peer::new(from, None, conn, self.local, now));
         }
@@ -614,6 +632,14 @@ impl Peers {
                 zi_rerequest(peer, tables, &mut out);
             }
         }
+        // An open-peered entry with neither connection up is one stranger's
+        // packet and nothing more; let it go rather than keep it for ever.
+        self.peers.retain(|_, p| {
+            p.configured.is_some()
+                || p.receiver != Receiver::Unconnected
+                || p.sender != Sender::Unconnected
+                || now.saturating_duration_since(p.last_heard) < LAST_HEARD
+        });
         (out.acts, out.chs)
     }
 
@@ -717,13 +743,15 @@ impl Peers {
 
     /// True if the unknown-peer log should name this address now.
     fn log_unknown(&mut self, from: Ipv4Addr, now: Instant) -> bool {
-        match self.logged.get(&from) {
-            Some(&t) if now.saturating_duration_since(t) < LOG_EVERY => false,
-            _ => {
-                self.logged.insert(from, now);
-                true
-            }
+        // Aged-out entries are dropped here rather than accumulating: this map
+        // is keyed by a spoofable source address, so it must never hold more
+        // than the addresses seen in the last `LOG_EVERY`.
+        self.logged.retain(|_, t| now.saturating_duration_since(*t) < LOG_EVERY);
+        if self.logged.contains_key(&from) {
+            return false;
         }
+        self.logged.insert(from, now);
+        true
     }
 }
 
@@ -1392,6 +1420,60 @@ mod tests {
         assert!(a.is_empty());
         let (a, ..) = ps.packet(REMOTE, &p, &mut tb, t0 + Duration::from_secs(61));
         assert!(matches!(a.as_slice(), [Action::Log(_)]));
+    }
+
+    /// UDP 387 faces the internet, so a stranger's packet must not be able to
+    /// buy permanent memory.
+    #[test]
+    fn open_peering_refuses_new_peers_past_the_cap() {
+        let t0 = Instant::now();
+        let mut tb = Tables::new();
+        let mut ps = Peers::new(Di::Ip(LOCAL), true, &[], t0);
+        let p = routing(1, 0, open_req());
+        for i in 0..300u32 {
+            let from = Ipv4Addr::from(0x0a000000 + i);
+            ps.packet(from, &p, &mut tb, t0);
+        }
+        assert_eq!(ps.peers.len(), MAX_OPEN_PEERS);
+        // And the refusal is logged at most once a minute per address.
+        let over = Ipv4Addr::new(203, 0, 113, 77);
+        let (a, ..) = ps.packet(over, &p, &mut tb, t0);
+        assert!(matches!(a.as_slice(), [Action::Log(_)]), "{a:?}");
+        let (a, ..) = ps.packet(over, &p, &mut tb, t0 + Duration::from_secs(30));
+        assert!(a.is_empty(), "{a:?}");
+    }
+
+    #[test]
+    fn an_idle_unconnected_peer_is_evicted_and_a_configured_one_is_not() {
+        let t0 = Instant::now();
+        let mut tb = Tables::new();
+        let mut ps = Peers::new(Di::Ip(LOCAL), true, &["peer".to_string()], t0);
+        ps.resolved("peer", REMOTE, t0);
+        // A stranger whose packet says nothing our state machines act on.
+        let stranger = Ipv4Addr::new(198, 51, 100, 4);
+        ps.packet(stranger, &routing(1, 0, Cmd::TickleAck), &mut tb, t0);
+        assert_eq!(ps.peers.len(), 2);
+
+        ps.tick(&mut tb, t0 + LAST_HEARD - Duration::from_secs(1));
+        assert_eq!(ps.peers.len(), 2, "not yet idle long enough");
+        ps.tick(&mut tb, t0 + LAST_HEARD + Duration::from_secs(1));
+        assert!(!ps.peers.contains_key(&stranger));
+        assert!(ps.peers.contains_key(&REMOTE), "a configured peer is never evicted");
+    }
+
+    #[test]
+    fn the_unknown_peer_log_forgets_addresses_older_than_a_minute() {
+        let t0 = Instant::now();
+        let mut tb = Tables::new();
+        let mut ps = Peers::new(Di::Ip(LOCAL), false, &[], t0);
+        let p = routing(1, 0, open_req());
+        for i in 0..300u32 {
+            ps.packet(Ipv4Addr::from(0x0a000000 + i), &p, &mut tb, t0);
+        }
+        assert_eq!(ps.logged.len(), 300);
+        // A minute on, one more source, and none of the old ones are kept.
+        ps.packet(REMOTE, &p, &mut tb, t0 + LOG_EVERY + Duration::from_secs(1));
+        assert_eq!(ps.logged.len(), 1);
     }
 
     #[test]
