@@ -171,6 +171,6 @@ sudo setcap cap_net_raw,cap_net_bind_service+ep target/debug/appletalk
 ./target/debug/appletalk ping <net.node | object:type@zone>         # echo a node
 ./target/debug/appletalk bridge udp                                 # join LToUDP and bridge it
 ./target/debug/appletalk router [--config appletalk.toml]           # route between links and peers
-./target/debug/appletalk peers import peers.txt                     # merge a peer list into the config
+./target/debug/appletalk peers import <file | url>                 # merge a peer list into the config
 kill -USR1 $(pidof appletalk)                                       # dump the router's tables
 ```

@@ -13,3 +13,4 @@ serde = { version = "1", features = ["derive"] }
 toml_edit = { version = "0.22", features = ["serde"] }
 serialport = "4"
 libc = "0.2"
+ureq = "3.4.1"

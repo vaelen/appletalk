@@ -152,7 +152,9 @@ pub struct RouterArgs {
 pub enum PeersCmd {
     /// Merge a text file of peers (one IP or hostname per line) into the config file.
     Import {
-        file: std::path::PathBuf,
+        /// A file path, or an http:// or https:// URL to fetch it from
+        #[arg(value_name = "FILE|URL")]
+        file: String,
         /// Config file to update; default as for `router`
         #[arg(long, value_name = "PATH")]
         config: Option<std::path::PathBuf>,

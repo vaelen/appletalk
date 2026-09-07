@@ -482,14 +482,19 @@ pub fn merge_peers(doc: &mut toml_edit::DocumentMut, new: &[String]) -> (usize, 
 
 /// Merge a peer list file into the config file, keeping its comments and
 /// formatting. Returns (added, already present).
-pub fn import_peers(config: Option<&Path>, list: &Path) -> io::Result<(usize, usize)> {
+/// `list` is a file path, or an `http://`/`https://` URL to fetch the list from.
+pub fn import_peers(config: Option<&Path>, list: &str) -> io::Result<(usize, usize)> {
     // Unlike `router`, the named file need not exist yet: we create it.
     let path = config
         .map(Path::to_path_buf)
         .or_else(default_config)
         .unwrap_or_else(|| PathBuf::from(DEFAULTS[0]));
-    let hosts = parse_peer_list(&fs::read_to_string(list)?)
-        .map_err(|e| bad(format!("{}: {e}", list.display())))?;
+    let text = if list.starts_with("http://") || list.starts_with("https://") {
+        fetch(list)?
+    } else {
+        fs::read_to_string(list)?
+    };
+    let hosts = parse_peer_list(&text).map_err(|e| bad(format!("{list}: {e}")))?;
     let text = match fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
@@ -511,6 +516,13 @@ pub fn import_peers(config: Option<&Path>, list: &Path) -> io::Result<(usize, us
     fs::write(&tmp, doc.to_string())?;
     fs::rename(&tmp, &path)?;
     Ok(counts)
+}
+
+/// GETs a peer list. A non-2xx status is an error, as is a body `ureq` will
+/// not read (its default 10 MB limit, far past any peer list).
+fn fetch(url: &str) -> io::Result<String> {
+    let mut rsp = ureq::get(url).call().map_err(|e| bad(format!("{url}: {e}")))?;
+    rsp.body_mut().read_to_string().map_err(|e| bad(format!("{url}: {e}")))
 }
 
 
@@ -644,8 +656,9 @@ zones = ["Emulators"]
         fs::remove_file(&cfg).ok();
         fs::write(&list, "# GlobalTalk\n192.0.2.7\n").unwrap();
 
-        assert_eq!(import_peers(Some(&cfg), &list).unwrap(), (1, 0));
-        assert_eq!(import_peers(Some(&cfg), &list).unwrap(), (0, 1));
+        let list = list.to_str().unwrap();
+        assert_eq!(import_peers(Some(&cfg), list).unwrap(), (1, 0));
+        assert_eq!(import_peers(Some(&cfg), list).unwrap(), (0, 1));
         assert!(!cfg.with_extension("toml.tmp").exists(), "temporary file left behind");
 
         let args = RouterArgs {
@@ -662,6 +675,42 @@ zones = ["Emulators"]
         assert!(load(&RouterArgs { config: Some(cfg), ..Default::default() }).is_err());
         let gone = RouterArgs { config: Some(dir.join("nope.toml")), ..Default::default() };
         assert!(load(&gone).is_err());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A one-shot HTTP server on loopback: enough to prove a URL is fetched
+    /// and parsed like a file, and that a non-2xx status is refused.
+    fn serve_once(status: &'static str, body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/peers.txt", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf);
+            let rsp = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            s.write_all(rsp.as_bytes()).unwrap();
+        });
+        url
+    }
+
+    #[test]
+    fn import_fetches_a_url() {
+        let dir = std::env::temp_dir().join(format!("appletalk-config-url-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("appletalk.toml");
+        fs::remove_file(&cfg).ok();
+
+        let url = serve_once("200 OK", "# GlobalTalk\n192.0.2.7\nA.example.net\n");
+        assert_eq!(import_peers(Some(&cfg), &url).unwrap(), (2, 0));
+        assert_eq!(parse_file(&fs::read_to_string(&cfg).unwrap()).unwrap().peers.len(), 2);
+
+        let url = serve_once("404 Not Found", "nope\n");
+        assert!(import_peers(Some(&cfg), &url).is_err());
+        assert_eq!(parse_file(&fs::read_to_string(&cfg).unwrap()).unwrap().peers.len(), 2);
         fs::remove_dir_all(&dir).ok();
     }
 }

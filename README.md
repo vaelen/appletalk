@@ -96,7 +96,7 @@ fallback on a filesystem that does not carry capabilities.
 | `ping TARGET [-c N]`    | Echo a node by `net.node` or `object:type@zone`            | `cap_net_raw`                         |
 | `bridge udp`            | Bridge LToUDP emulators onto this Ethernet, as one network | `cap_net_raw`                         |
 | `router [FLAGS]`        | Route between links and AURP peers, from a config or flags | `cap_net_raw`, `cap_net_bind_service` |
-| `peers import FILE`     | Merge a peer list into the router config file              | nothing                               |
+| `peers import SOURCE`   | Merge a peer list, a file or HTTP(S) URL, into the config  | nothing                               |
 
 `appletalk --help` lists them, `appletalk <command> --help` details one, and
 `appletalk --version` prints the crate version.
@@ -354,11 +354,13 @@ The global `-i`, `--net` and `--node` flags are ignored by `router`.
 
 ```sh
 appletalk peers import globaltalk-peers.txt
+appletalk peers import https://example.net/globaltalk/peers.txt
 appletalk peers import peers.txt --config /etc/appletalk/appletalk.toml
 ```
 
-One IPv4 literal or hostname per line; blank lines and `#` comments are
-skipped. Every bad line is reported at once and nothing is written. New entries
+The argument is a file path, or an `http://` or `https://` URL that is fetched
+with a plain GET; a non-2xx status is an error and nothing is written. One
+IPv4 literal or hostname per line; blank lines and `#` comments are skipped. Every bad line is reported at once and nothing is written. New entries
 are appended to `router.peers`, compared case-insensitively against what is
 already there, and the file is rewritten with `toml_edit` so its comments and
 formatting survive. A missing config file is created. It prints
