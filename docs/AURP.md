@@ -751,15 +751,16 @@ Two checks worth doing before trusting an implementation on a live tunnel:
 in place; what remains is the live network, because none of it has met one yet
 (`CLAUDE.md` keeps that list).
 
-| Piece                   | Where                 | State                                                                                    |
-|-------------------------|-----------------------|------------------------------------------------------------------------------------------|
-| RTMP parse and encode   | `src/wire/rtmp.rs`    | Data, Request, Response and RDR, with the `NetworkTuple` AURP reuses                     |
-| AURP codec              | `src/wire/aurp.rs`    | Domain header, routing header and every body below, including optimized zone tuples      |
-| Routing and zone tables | `src/router/table.rs` | Best route per network, the book's aging, split horizon per port, `RouteChange` for AURP |
-| Ports                   | `src/router/ports.rs` | EtherTalk, LToUDP and TashTalk links: the address claim, defence and per-link framing    |
-| Router services         | `src/router/local.rs` | RTMP, ZIP, NBP and AEP as a router owes them to its own cables                           |
-| AURP peer runtime       | `src/router/aurp.rs`  | Both state machines, the timers, the peer table, split RI-Rsp/ZI-Rsp, event collapsing   |
-| Configuration           | `src/config.rs`       | The TOML file, the `router` flags, and `peers import`                                    |
+| Piece                   | Where                 | State                                                                                       |
+|-------------------------|-----------------------|---------------------------------------------------------------------------------------------|
+| RTMP parse and encode   | `src/wire/rtmp.rs`    | Data, Request, Response and RDR, with the `NetworkTuple` AURP reuses                        |
+| AURP codec              | `src/wire/aurp.rs`    | Domain header, routing header and every body below, including optimized zone tuples         |
+| Routing and zone tables | `src/router/table.rs` | Best route per network, the book's aging, split horizon per port, `RouteChange` for AURP    |
+| Ports                   | `src/router/ports.rs` | EtherTalk, LToUDP and TashTalk links: the address claim, defence and per-link framing       |
+| Router services         | `src/router/local.rs` | RTMP, ZIP, NBP and AEP as a router owes them to its own cables                              |
+| AURP peer runtime       | `src/router/aurp.rs`  | Both state machines, the timers, the peer table, split RI-Rsp/ZI-Rsp, event collapsing      |
+| Router core             | `src/router/mod.rs`   | DDP forwarding with the hop count, and the run loop that opens the ports and the UDP socket |
+| Configuration           | `src/config.rs`       | The TOML file, the `router` flags, and `peers import`                                       |
 
 Only the required protocol of RFC 1504 chapter 3 is implemented. What is left
 out is left out deliberately, and each omission has a defined answer on the

@@ -13,9 +13,8 @@ the network number and the zone from the router through the bridge. The bridge
 claims one AppleTalk address for itself, defends it on both links, and is
 otherwise invisible.
 
-Router mode did not change any of this: `appletalk router` is a separate
-command with its own ports and tables, and the bridge behaves exactly as it
-always has. If you want two networks rather than one, use `router`.
+Router mode changed nothing here; for two networks rather than one, use
+`appletalk router`.
 
 ## Forwarding
 

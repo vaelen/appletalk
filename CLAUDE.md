@@ -139,12 +139,20 @@ bridge specifically, still unconfirmed: a node **moving** between the two links,
 a genuine duplicate node ID across the bridge, a second bridge on the same pair,
 entry aging after a node goes quiet, and that Ethernet-to-Ethernet traffic stays
 off the LToUDP group. The book settles byte layouts, not behavior — cross-check
-with `tcpdump -e -x` before trusting anything on that second list.
+with `tcpdump -e -x` before trusting anything on that second list. The router
+adds one known drop to that list: a Phase 1 EtherTalk frame fails `arrived`'s
+DDP length check, because Phase 1 carries its Ethernet padding into the payload.
 
-**Router mode: nothing is confirmed.** Everything under `router` — the ports,
-the routing and zone tables, the local services, the AURP tunnel and the config
-— has only ever met its own unit tests. Do not describe any of it as working.
-The four checks that would change that, in order:
+**Router mode: nothing is confirmed on a wire.** `router` runs end to end —
+`run` opens every configured port and the AURP socket, then drives `step` off a
+250 ms tick — but everything under it has only met its own tests plus `--help`,
+the no-ports exit-2 path and a release build. Do not describe any of it as
+working on a network. Two things to know before reading the logs: every line it
+prints is prefixed `router:`, and `SIGUSR1` prints the routing and zone table,
+the peer table and a per-port summary, in that order, as one log line.
+`SIGINT`/`SIGTERM` send RD to every peer we are data sender to and drain for
+two seconds before exiting. The four checks that would change the status, in
+order:
 
 | Live check                                                                                                                                          | State                               |
 |-----------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------|
@@ -164,4 +172,5 @@ sudo setcap cap_net_raw,cap_net_bind_service+ep target/debug/appletalk
 ./target/debug/appletalk bridge udp                                 # join LToUDP and bridge it
 ./target/debug/appletalk router [--config appletalk.toml]           # route between links and peers
 ./target/debug/appletalk peers import peers.txt                     # merge a peer list into the config
+kill -USR1 $(pidof appletalk)                                       # dump the router's tables
 ```

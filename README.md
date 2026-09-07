@@ -293,14 +293,36 @@ not disturbed.
 
 #### While it runs
 
-One line per event on stderr, prefixed `router:`: ports coming up with the
-address each claimed, peer connections opening and closing with the reason,
-routes added, dropped or changed, zones learned. `SIGUSR1` dumps the routing
-table, the zone table and the peer table to stderr in aligned columns:
+It opens every port, binds the AURP socket, settles on a domain identifier and
+says so, then routes:
+
+```
+router: appletalk on 2 port(s), AURP on 0.0.0.0:387 as 203.0.113.5
+```
+
+If that identifier is private, loopback or unset it says so too — such an
+address peers two routers on one LAN and nothing further, so set `public_ip`.
+Every line after that is on stderr and prefixed `router:`: ports claiming an
+address, peer connections opening and closing with the reason, routes added,
+dropped or changed, zones learned, plus `rx:` for a read error, `send failed:`
+for a frame that would not go out, and `dropped N events (queue full)` if the
+router falls behind its links.
+
+Configured peer names are re-resolved every 10 seconds, so a peer on a dynamic
+address reconnects on its own once DNS catches up.
+
+`SIGUSR1` dumps three things to stderr, in order: the routing and zone table,
+the peer table, then a line per port with its kind, name, network range,
+claimed node and zones. All in aligned columns.
 
 ```sh
 kill -USR1 $(pidof appletalk)
 ```
+
+`SIGINT` or `SIGTERM` shuts it down politely: it sends an RD to every peer it
+is data sender to, keeps running for up to two seconds so those can be
+acknowledged, and exits. Peers therefore drop our routes at once rather than
+waiting out their tickle timer.
 
 AURP listens on UDP 387, which is privileged, so the router wants one more
 capability than the rest of the stack:
@@ -348,11 +370,14 @@ group and machines on the Ethernet cable reach each other in both directions,
 and an emulator sees every zone on the internet, including those on the far side
 of the tunnel.
 
-Router mode is new, and **none of it has been verified against a live
+Router mode runs end to end, but **none of it has been verified against a live
 network**: not the ports, not the routing and zone tables, not the local
-services, not the AURP tunnel. It passes its own tests and nothing more. The
-TashTalk port is furthest out — the hardware has not arrived, so its serial
-framing has only ever been tested against byte literals.
+services, not the AURP tunnel. Its tests, `--help` and the config-error paths
+are all it has been through. The TashTalk port is furthest out — the hardware
+has not arrived, so its serial framing has only ever been tested against byte
+literals. A Phase 1 EtherTalk frame is dropped by the router rather than
+routed: Phase 1 carries no length field to trim Ethernet's padding by, so the
+datagram disagrees with its own length and fails closed.
 
 Not yet exercised on real hardware: retrying after an address collision — as
 opposed to detecting one, which works — zone lists long enough to need a second
