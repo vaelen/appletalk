@@ -79,14 +79,29 @@ impl Local {
 
     /// Every tick: an RTMP beacon on each claimed port every 10 s, and a ZIP
     /// Query for every RTMP-learned network still missing its zones.
-    pub fn tick(&mut self, _ports: &[Port], _tables: &Tables, _now: Instant) -> Vec<Emit> {
-        Vec::new()
+    pub fn tick(&mut self, ports: &[Port], tables: &Tables, now: Instant) -> Vec<Emit> {
+        let mut out = Vec::new();
+        if due(self.last_beacon, now, RTMP_INTERVAL) {
+            self.last_beacon = Some(now);
+            // A port still claiming has no legal source address to send from,
+            // so it stays quiet until it holds one.
+            for p in ports.iter().filter(|p| p.node.is_some()) {
+                let tuples = advertisable(tables, ports, tables.tuples_for(p.id));
+                let dst = Addr { net: p.range.0, node: 255 };
+                out.extend(rtmp_data(p, Dest::Broadcast, dst, RTMP_SOCKET, &tuples));
+            }
+        }
+        if due(self.last_query, now, ZIP_QUERY_INTERVAL) {
+            self.last_query = Some(now);
+            out.extend(zip_queries(ports, tables));
+        }
+        out
     }
 
     // ------------------------------------------------------------------ RTMP
 
     fn rtmp(
-        &mut self,
+        &self,
         port: &Port,
         ports: &[Port],
         ddp: &Ddp,
@@ -295,8 +310,8 @@ fn query_reply(port: &Port, ddp: &Ddp, nets: &[u16], tables: &Tables) -> Vec<Emi
     replies
         .into_iter()
         .filter_map(|r| {
-            let ddp = from(port, ZIP_SOCKET, ddp.src, ddp.src_socket, DDP_ZIP, &r)?;
-            Some(Emit::On { port: port.id, dest: Dest::Node(ddp.dst.node), ddp })
+            let reply = from(port, ZIP_SOCKET, ddp.src, ddp.src_socket, DDP_ZIP, &r)?;
+            Some(Emit::On { port: port.id, dest: Dest::Node(ddp.src.node), ddp: reply })
         })
         .collect()
 }
@@ -437,6 +452,36 @@ fn from(
     body: &impl Encode,
 ) -> Option<Ddp> {
     Some(datagram(port.addr()?, src_socket, dst, dst_socket, typ, body.to_bytes()))
+}
+
+fn due(last: Option<Instant>, now: Instant, every: Duration) -> bool {
+    last.is_none_or(|t| now.saturating_duration_since(t) >= every)
+}
+
+/// One ZIP Query per next-hop router, naming every network we still owe zones
+/// for. AURP peers answer a ZI-Req instead, so they are not asked here.
+fn zip_queries(ports: &[Port], tables: &Tables) -> Vec<Emit> {
+    let mut by_router: Vec<(PortId, Addr, Vec<u16>)> = Vec::new();
+    for r in tables.zoneless() {
+        let Target::Port(id) = r.target else { continue };
+        match by_router.iter_mut().find(|(p, next, _)| *p == id && *next == r.next) {
+            Some((_, _, nets)) => nets.push(r.range.0),
+            None => by_router.push((id, r.next, vec![r.range.0])),
+        }
+    }
+    let mut out = Vec::new();
+    for (id, next, nets) in by_router {
+        let Some(p) = ports.iter().find(|p| p.id == id) else { continue };
+        // The network count is one byte, so a very long list needs more than
+        // one Query.
+        for batch in nets.chunks(255) {
+            let q = Zip::Query { nets: batch.to_vec() };
+            if let Some(ddp) = from(p, ZIP_SOCKET, next, ZIP_SOCKET, DDP_ZIP, &q) {
+                out.push(Emit::On { port: id, dest: Dest::Node(next.node), ddp });
+            }
+        }
+    }
+    out
 }
 
 /// A port id no configured port holds. `tuples_for` drops the routes reached
@@ -1176,6 +1221,87 @@ mod tests {
         let ddp = datagram(PEER, 200, p.addr().unwrap(), 200, 7, vec![1, 2, 3]);
         let out = l.handle(&p, &[p_clone(&p)], &ddp, &DdpBody::Unknown, &mut tables, t);
         assert_eq!(out, (Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn tick_beacons_on_every_claimed_port_every_ten_seconds() {
+        let t = Instant::now();
+        let a = ether(0, (NET, NET), &[ZONE], 9, t);
+        let b = ether(1, (100, 100), &["Other"], 9, t);
+        // Still claiming, so it has no legal source address to beacon from.
+        let c = Port::new(2, "eth2".into(), Kind::Ether { mac: MAC }, (200, 200), vec![], t);
+        let ports = vec![a, b, c];
+        let mut tables = Tables::new();
+        tables.add_port(0, (NET, NET), true, vec![ZONE.into()], t);
+        tables.add_port(1, (100, 100), true, vec!["Other".into()], t);
+        let mut l = Local::new("router".into());
+
+        let out = l.tick(&ports, &tables, t);
+        assert_eq!(out.len(), 2, "{out:?}");
+        for (i, (id, net)) in [(0usize, (0u8, NET)), (1, (1, 100))] {
+            let (port, dest, r) = rtmp_of(&out[i]);
+            assert_eq!((port, dest), (id, &Dest::Broadcast));
+            let Emit::On { ddp, .. } = &out[i] else { panic!() };
+            assert_eq!(ddp.dst, Addr { net, node: 255 });
+            assert_eq!((ddp.src_socket, ddp.dst_socket), (RTMP_SOCKET, RTMP_SOCKET));
+            let Rtmp::Data { sender, range, tuples } = r else { panic!() };
+            assert_eq!((sender, range), (Addr { net, node: 9 }, Some((net, net))));
+            // Split horizon: each port hears about the other one, not itself.
+            let other = if net == NET { (100, 100) } else { (NET, NET) };
+            assert_eq!(tuples, vec![ext(other.0, other.1, 0)]);
+        }
+
+        // Not due yet.
+        assert_eq!(l.tick(&ports, &tables, t + Duration::from_secs(9)), Vec::new());
+        assert_eq!(l.tick(&ports, &tables, t + RTMP_INTERVAL).len(), 2);
+    }
+
+    #[test]
+    fn a_beacon_leaves_out_networks_whose_zones_we_do_not_know() {
+        let t = Instant::now();
+        let a = ether(0, (NET, NET), &[ZONE], 9, t);
+        // Configured with no zones at all: still ours, so still advertised.
+        let b = ether(1, (200, 200), &[], 9, t);
+        let ports = vec![a, b];
+        let mut tables = Tables::new();
+        tables.add_port(0, (NET, NET), true, vec![ZONE.into()], t);
+        tables.add_port(1, (200, 200), true, Vec::new(), t);
+        tables.learn(&ext(100, 100, 1), Target::Port(0), PEER, t);
+        tables.learn(&ext(2905, 2905, 1), Target::Port(0), PEER, t);
+        tables.add_zones(2905, &["BabCom".into()], None);
+        let mut l = Local::new("router".into());
+
+        let out = l.tick(&ports, &tables, t);
+        let (_, _, r) = rtmp_of(&out[1]);
+        let Rtmp::Data { tuples, .. } = r else { panic!() };
+        // 100 has no zone list, so nobody else may hear about it.
+        assert_eq!(tuples, vec![ext(NET, NET, 0), ext(2905, 2905, 2)]);
+    }
+
+    #[test]
+    fn tick_asks_the_next_router_for_the_zones_it_still_owes_us() {
+        let t = Instant::now();
+        let a = ether(0, (NET, NET), &[ZONE], 9, t);
+        let ports = vec![a];
+        let mut tables = Tables::new();
+        tables.add_port(0, (NET, NET), true, vec![ZONE.into()], t);
+        tables.learn(&ext(100, 100, 1), Target::Port(0), PEER, t);
+        tables.learn(&ext(2905, 2905, 1), Target::Port(0), PEER, t);
+        tables.add_zones(2905, &["BabCom".into()], None);
+        tables.learn(&ext(300, 300, 2), Target::Port(0), PEER, t);
+        let mut l = Local::new("router".into());
+
+        // One beacon, then one Query naming both networks we still lack.
+        let out = l.tick(&ports, &tables, t);
+        assert_eq!(out.len(), 2, "{out:?}");
+        let (port, dest, z) = zip_of(&out[1]);
+        assert_eq!((port, dest), (0, &Dest::Node(PEER.node)));
+        assert_eq!(z, Zip::Query { nets: vec![100, 300] });
+        let Emit::On { ddp, .. } = &out[1] else { panic!() };
+        assert_eq!((ddp.dst, ddp.src_socket, ddp.dst_socket), (PEER, ZIP_SOCKET, ZIP_SOCKET));
+
+        assert_eq!(l.tick(&ports, &tables, t + Duration::from_secs(9)), Vec::new());
+        assert_eq!(l.tick(&ports, &tables, t + ZIP_QUERY_INTERVAL).len(), 2);
     }
 
     /// `Port` is not `Clone`, and every test needs the port both as the one
