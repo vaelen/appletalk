@@ -7,6 +7,7 @@ use std::fmt;
 
 use pnet::util::MacAddr;
 
+use super::ddp::checksum;
 use super::{mac, mac_bytes, put_pstring, pstring, Encode};
 
 /// A ZIP packet sent directly over DDP. The GetZoneList / GetLocalZones /
@@ -176,6 +177,39 @@ impl ZipAtp {
         }
         Some(ZipAtp::Reply { last: u[0] != 0, zones })
     }
+
+    /// The ATP user bytes and data for a GetZoneList, GetLocalZones or
+    /// GetMyZone reply (PDF 186): a last-packet flag, a reserved zero, then the
+    /// zone count, with the names length-prefixed in the data.
+    ///
+    /// The count is derived from `zones` here rather than passed in, so a reply
+    /// cannot claim more names than it carries.
+    #[allow(dead_code)] // stub: Task 8
+    pub fn reply_parts(last: bool, zones: &[String]) -> ([u8; 4], Vec<u8>) {
+        let mut data = Vec::new();
+        for z in zones {
+            put_pstring(&mut data, z);
+        }
+        let n = (zones.len() as u16).to_be_bytes();
+        ([last as u8, 0, n[0], n[1]], data)
+    }
+}
+
+/// The zone multicast address to broadcast into `zone` on Ethernet.
+///
+/// PDF 191: uppercase the name, run the DDP checksum over its bytes (not the
+/// length byte), substituting $FFFF for zero, then index that hash modulo the
+/// number of addresses the link offers. PDF 98 gives Ethernet 253 of them,
+/// 09:00:07:00:00:00 through 09:00:07:00:00:FC.
+///
+/// ponytail: ASCII uppercasing only. PDF 191 defers to Appendix D for Mac OS
+/// Roman's accented forms; `pstring` already flattens those to '.', so a zone
+/// name with one would not round-trip anyway.
+#[allow(dead_code)] // stub: Task 8
+pub fn zone_multicast(zone: &str) -> MacAddr {
+    const N: u16 = 253;
+    let h = checksum(&zone.to_ascii_uppercase().into_bytes());
+    MacAddr::new(0x09, 0x00, 0x07, 0x00, 0x00, (h % N) as u8)
 }
 
 impl fmt::Display for ZipAtp {
@@ -437,5 +471,24 @@ mod tests {
             ZipAtp::parse_reply(&[1, 0, 0, 0], &[]),
             Some(ZipAtp::Reply { last: true, zones: Vec::new() })
         );
+    }
+
+    #[test]
+    fn atp_reply_parts_round_trip_through_parse_reply() {
+        let (user, data) = ZipAtp::reply_parts(true, &["A".into(), "Bee".into()]);
+        assert_eq!(user, [1, 0, 0, 2]);
+        assert_eq!(data, [1, b'A', 3, b'B', b'e', b'e']);
+        assert_eq!(ZipAtp::parse_reply(&user, &data).unwrap(), ZipAtp::Reply { last: true, zones: vec!["A".into(), "Bee".into()] });
+    }
+
+    #[test]
+    fn zone_multicast_is_case_insensitive_and_in_range() {
+        assert_eq!(zone_multicast("68k Mac Club"), zone_multicast("68K MAC CLUB"));
+        let m = zone_multicast("Anything");
+        assert_eq!((m.0, m.1, m.2, m.3, m.4), (0x09, 0x00, 0x07, 0x00, 0x00));
+        assert!(m.5 <= 0xfc);
+        // The hash is the DDP checksum (ddp::checksum) of the uppercased bytes.
+        let h = crate::wire::ddp::checksum(b"ANYTHING");
+        assert_eq!(m.5, (h % 253) as u8);
     }
 }
