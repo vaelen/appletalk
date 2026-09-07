@@ -41,7 +41,9 @@ ProtectHome=yes
 PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
-RestrictAddressFamilies=AF_PACKET AF_INET AF_UNIX
+# AF_NETLINK is how interfaces are enumerated (getifaddrs); without it every
+# NIC is "not found".
+RestrictAddressFamilies=AF_PACKET AF_INET AF_UNIX AF_NETLINK
 
 # A TashTalk port needs its serial device. Uncomment both lines and name the
 # device the config uses.
