@@ -603,6 +603,10 @@ impl Peers {
         for c in ch {
             // A route via a peer is never re-exported: every other peer on the
             // tunnel already hears about it from the peer behind it.
+            // Whether the old route's zones were complete at the time is gone
+            // from the table, so `was` does not ask: a peer ignores ND or NRC
+            // for a network it never heard of (RFC p. 34), and NDC is only
+            // ever reached when `is` holds and the zones are complete.
             let was = c.old.as_ref().is_some_and(|r| matches!(r.target, Target::Port(_)) && r.distance < 15);
             let is = c.new.as_ref().is_some_and(|r| {
                 matches!(r.target, Target::Port(_))
@@ -801,10 +805,10 @@ fn zi_rerequest(peer: &mut Peer, tables: &Tables, out: &mut Out) {
     let target = Target::Peer(peer.addr);
     let nets: Vec<u16> =
         tables.zoneless().iter().filter(|r| r.target == target).map(|r| r.range.0).collect();
-    if nets.is_empty() {
-        return;
+    // Two body bytes a network, behind the subcode.
+    for chunk in nets.chunks((MAX_BODY - 2) / 2) {
+        out.acts.push(peer.send(peer.conn_local, 0, Cmd::ZiReq { nets: chunk.to_vec() }));
     }
-    out.acts.push(peer.send(peer.conn_local, 0, Cmd::ZiReq { nets }));
 }
 
 // ---------------------------------------------------------------- helpers
@@ -1372,6 +1376,9 @@ mod tests {
         let a = ps.shutdown(t0);
         assert_eq!(cmds(&a), vec![(b1, 2, Cmd::Rd { code: -1 })]);
         assert_eq!(ps.peers[&REMOTE].sender, Sender::WaitRdAck);
+        let d = ps.dump();
+        assert!(d.contains("peer") && d.contains("192.0.2.2") && d.contains("wait rd ack"), "{d}");
+        assert!(d.contains("other") && d.contains("192.0.2.3"), "{d}");
     }
 
     #[test]
