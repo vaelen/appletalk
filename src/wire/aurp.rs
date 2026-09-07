@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::Ipv4Addr;
 
-use super::{pstring, put_pstring, Encode, NetworkTuple};
+use super::{printable, pstring, put_pstring, Encode, NetworkTuple};
 
 /// A domain identifier: the four-byte IP form, or the null form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -499,7 +499,7 @@ impl fmt::Display for Cmd {
                 nets.iter().try_for_each(|n| write!(f, " {n}"))
             }
             Cmd::ZiRsp { zones, .. } => write!(f, "zi-rsp {} zones", zones.len()),
-            Cmd::GznReq { zone } => write!(f, "gzn-req \"{zone}\""),
+            Cmd::GznReq { zone } => write!(f, "gzn-req \"{}\"", printable(zone)),
             Cmd::GznRsp { .. } => f.write_str("gzn-rsp"),
             Cmd::GdzlReq { start } => write!(f, "gdzl-req {start}"),
             Cmd::GdzlRsp { .. } => f.write_str("gdzl-rsp"),

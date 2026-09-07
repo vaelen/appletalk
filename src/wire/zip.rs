@@ -8,7 +8,7 @@ use std::fmt;
 use pnet::util::MacAddr;
 
 use super::ddp::checksum;
-use super::{mac, mac_bytes, put_pstring, pstring, Encode};
+use super::{mac, mac_bytes, printable, pstring, put_pstring, Encode};
 
 /// A ZIP packet sent directly over DDP. The GetZoneList / GetLocalZones /
 /// GetMyZone calls are a separate thing entirely — those ride on ATP with the
@@ -124,18 +124,20 @@ impl fmt::Display for Zip {
                 write!(f, "query nets {}", list.join(", "))
             }
             Zip::Reply { zones, total } => {
-                let list: Vec<String> = zones.iter().map(|(n, z)| format!("{n}={z}")).collect();
+                let list: Vec<String> =
+                    zones.iter().map(|(n, z)| format!("{n}={}", printable(z))).collect();
                 match total {
                     Some(t) => write!(f, "ext-reply ({} of {t}) {}", zones.len(), list.join(", ")),
                     None => write!(f, "reply {}", list.join(", ")),
                 }
             }
-            Zip::GetNetInfo { zone } => write!(f, "get-net-info zone {zone}"),
+            Zip::GetNetInfo { zone } => write!(f, "get-net-info zone {}", printable(zone)),
             Zip::NetInfoReply { flags, range, zone, multicast, default_zone } => {
                 let mcast = match multicast {
                     Some(m) => m.to_string(),
                     None => "none".to_string(),
                 };
+                let zone = printable(zone);
                 write!(f, "net-info-reply nets {}-{} zone {zone} mcast {mcast}", range.0, range.1)?;
                 if flags & 0x80 != 0 {
                     f.write_str(" zone-invalid")?;
@@ -147,7 +149,7 @@ impl fmt::Display for Zip {
                     f.write_str(" one-zone")?;
                 }
                 match default_zone {
-                    Some(z) => write!(f, " default {z}"),
+                    Some(z) => write!(f, " default {}", printable(z)),
                     None => Ok(()),
                 }
             }
@@ -227,13 +229,18 @@ impl ZipAtp {
 /// number of addresses the link offers. PDF 98 gives Ethernet 253 of them,
 /// 09:00:07:00:00:00 through 09:00:07:00:00:FC.
 ///
+/// The hash runs over the name's own wire bytes, one per char as `pstring`
+/// read them — not over its UTF-8, which would put an accented zone's lookups
+/// on the wrong multicast address.
+///
 /// ponytail: ASCII uppercasing only. PDF 191 defers to Appendix D for Mac OS
-/// Roman's accented forms; `pstring` already flattens those to '.', so a zone
-/// name with one would not round-trip anyway.
+/// Roman's accented forms, which fold differently; a zone whose name differs
+/// from another's only in an accent's case would share this address.
 #[allow(dead_code)] // stub: Task 8
 pub fn zone_multicast(zone: &str) -> MacAddr {
     const N: u16 = 253;
-    let h = checksum(&zone.to_ascii_uppercase().into_bytes());
+    let raw: Vec<u8> = zone.chars().map(|c| (c as u32 as u8).to_ascii_uppercase()).collect();
+    let h = checksum(&raw);
     MacAddr::new(0x09, 0x00, 0x07, 0x00, 0x00, (h % N) as u8)
 }
 
@@ -245,7 +252,8 @@ impl fmt::Display for ZipAtp {
             ZipAtp::GetLocalZones { start } => write!(f, "get-local-zones from {start}"),
             ZipAtp::Reply { last, zones } => {
                 let tail = if *last { "last" } else { "more" };
-                write!(f, "zones ({tail}) {}", zones.join(", "))
+                let names: Vec<String> = zones.iter().map(|z| printable(z)).collect();
+                write!(f, "zones ({tail}) {}", names.join(", "))
             }
         }
     }
@@ -306,6 +314,28 @@ impl Encode for Zip {
 mod tests {
     use super::*;
     use crate::wire::testkit::*;
+
+    /// A Mac OS Roman zone name has to survive the round trip byte for byte,
+    /// and the zone multicast has to hash those same raw bytes -- the router
+    /// sends lookups to the address this returns.
+    #[test]
+    fn a_zone_name_with_a_high_byte_round_trips_and_prints_as_a_dot() {
+        let mut p = vec![2, 1, 0x1a, 0x90];
+        p.extend([4, b'C', b'a', b'f', 0x8e]);
+        let z = Zip::parse(&p).unwrap();
+        assert_eq!(z, Zip::Reply { zones: vec![(6800, "Caf\u{8e}".into())], total: None });
+        assert_eq!(z.to_bytes(), p);
+        assert_eq!(z.to_string(), "reply 6800=Caf.");
+    }
+
+    #[test]
+    fn zone_multicast_hashes_the_raw_uppercased_bytes() {
+        let want = checksum(&[b'C', b'A', b'F', 0x8e]);
+        assert_eq!(
+            zone_multicast("Caf\u{8e}"),
+            MacAddr::new(0x09, 0x00, 0x07, 0x00, 0x00, (want % 253) as u8)
+        );
+    }
 
     #[test]
     fn zip_query() {

@@ -205,8 +205,25 @@ fn one_net(s: &str) -> Result<u16, String> {
 
 /// The last field of a spec: a comma-separated zone list. The first is the
 /// port's default zone.
-fn zone_list(s: &str) -> Vec<String> {
-    s.split(',').map(|z| z.trim().to_string()).collect()
+fn zone_list(s: &str) -> Result<Vec<String>, String> {
+    let zones: Vec<String> = s.split(',').map(|z| z.trim().to_string()).collect();
+    for z in &zones {
+        roman(z).map_err(|e| format!("zone name {z:?}: {e}"))?;
+    }
+    Ok(zones)
+}
+
+/// A name AppleTalk can carry: one wire byte a character, at most 32 of them.
+/// The wire is Mac OS Roman, which `wire::pstring` reads as Latin-1, so a
+/// character above U+00FF has no byte to be written as and must not get in.
+fn roman(name: &str) -> Result<(), String> {
+    if name.chars().any(|c| c > '\u{ff}') {
+        return Err("must be Mac OS Roman: no character above U+00FF".to_string());
+    }
+    match name.chars().count() {
+        1..=32 => Ok(()),
+        _ => Err("must be 1 to 32 characters".to_string()),
+    }
 }
 
 /// `eth0:6800-6805:Zone A,Zone B`
@@ -221,7 +238,7 @@ pub fn parse_ether_spec(s: &str) -> Result<EtherPort, String> {
     Ok(EtherPort {
         interface: interface.to_string(),
         net: parse_net(net)?,
-        zones: zone_list(zones),
+        zones: zone_list(zones)?,
     })
 }
 
@@ -242,7 +259,7 @@ pub fn parse_ltoudp_spec(s: &str) -> Result<LtoudpPort, String> {
             ));
         }
     };
-    Ok(LtoudpPort { interface, net: one_net(net)?, zones: zone_list(zones) })
+    Ok(LtoudpPort { interface, net: one_net(net)?, zones: zone_list(zones)? })
 }
 
 /// `/dev/ttyAMA0:6802:Zone`
@@ -252,7 +269,7 @@ pub fn parse_tashtalk_spec(s: &str) -> Result<TashtalkPort, String> {
             "tashtalk port {s:?}: expected DEVICE:NET:ZONE[,ZONE...] (a zone name containing a colon has to go in the config file)"
         ));
     };
-    Ok(TashtalkPort { device: device.to_string(), net: one_net(net)?, zones: zone_list(zones) })
+    Ok(TashtalkPort { device: device.to_string(), net: one_net(net)?, zones: zone_list(zones)? })
 }
 
 // ---- merge and validate ---------------------------------------------------
@@ -330,6 +347,7 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
     for p in &cfg.tashtalk {
         ports.push((p.device.clone(), (p.net, p.net), &p.zones));
     }
+    roman(&cfg.name).map_err(|e| format!("router name {:?} {e}", cfg.name))?;
     if ports.is_empty() {
         return Err("no ports configured: name at least one ethertalk, ltoudp or tashtalk port".into());
     }
@@ -350,8 +368,8 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
         if zones.is_empty() {
             return Err(format!("port {name} has no zones"));
         }
-        if let Some(z) = zones.iter().find(|z| z.is_empty() || z.len() > 32) {
-            return Err(format!("port {name}: zone name {z:?} must be 1 to 32 bytes"));
+        for z in zones.iter() {
+            roman(z).map_err(|e| format!("port {name}: zone name {z:?} {e}"))?;
         }
     }
     Ok(())
@@ -574,6 +592,22 @@ zones = ["Emulators"]
         let mut c = parse_file(FILE).unwrap();
         c.ltoudp[0].zones = vec!["x".repeat(33)];
         assert!(validate(&c).is_err());
+        // Names go on the wire one byte a character, so a character with no
+        // byte cannot be one. Caught for zones, for the router's own NBP name,
+        // and on the command line as well as in the file.
+        let mut c = parse_file(FILE).unwrap();
+        c.ltoudp[0].zones = vec!["Zone \u{20ac}".into()];
+        assert!(validate(&c).unwrap_err().contains("Mac OS Roman"), "{:?}", validate(&c));
+        let mut c = parse_file(FILE).unwrap();
+        c.name = "route\u{20ac}r".into();
+        assert!(validate(&c).unwrap_err().contains("Mac OS Roman"));
+        // A Mac OS Roman byte spelled as Latin-1 is fine, and counts as one.
+        let mut c = parse_file(FILE).unwrap();
+        c.ltoudp[0].zones = vec!["Caf\u{8e}".repeat(8)];
+        assert!(validate(&c).is_ok());
+        assert!(parse_ltoudp_spec("6801:Caf\u{20ac}").unwrap_err().contains("Mac OS Roman"));
+        assert!(parse_ether_spec("eth9:1:Caf\u{20ac}").unwrap_err().contains("Mac OS Roman"));
+        assert!(parse_tashtalk_spec("/dev/x:1:Caf\u{20ac}").unwrap_err().contains("Mac OS Roman"));
     }
 
     #[test]

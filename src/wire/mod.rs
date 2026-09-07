@@ -69,26 +69,35 @@ pub(crate) fn mac_bytes(m: MacAddr) -> [u8; 6] {
 
 /// Reads a length-prefixed (Pascal) string, returning it and the rest.
 ///
-/// ponytail: AppleTalk names are Mac OS Roman; non-ASCII bytes become '.'
-/// rather than mangling them. Swap in encoding_rs::MACINTOSH if accented zone
-/// names start mattering.
+/// The mapping is Latin-1 — byte `b` becomes the char with code point `b` —
+/// so every byte survives and `put_pstring` maps it straight back. AppleTalk
+/// names are really Mac OS Roman, so a high byte is *not* the character it
+/// looks like here; nothing but a dump ever interprets one, and `printable`
+/// is what a dump shows.
+///
+/// ponytail: swap in encoding_rs::MACINTOSH on both sides if a dump ever has
+/// to spell an accented zone name properly. The wire bytes are unaffected.
 fn pstring(p: &[u8]) -> Option<(String, &[u8])> {
     let len = *p.first()? as usize;
     let s = p.get(1..1 + len)?;
-    let text = s
-        .iter()
-        .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
-        .collect();
-    Some((text, &p[1 + len..]))
+    Some((s.iter().map(|&b| b as char).collect(), &p[1 + len..]))
 }
 
-/// Writes a length-prefixed (Pascal) string. Names are capped at 32 bytes by
-/// the protocol; anything longer is truncated rather than corrupting the
-/// length byte.
+/// Writes a length-prefixed (Pascal) string, undoing `pstring`'s mapping.
+/// Names are capped at 32 characters by the protocol; anything longer is
+/// truncated rather than corrupting the length byte. A char above U+00FF
+/// cannot have come off the wire, and `config::validate` refuses one, so the
+/// cast never loses anything a real name carried.
 pub(crate) fn put_pstring(out: &mut Vec<u8>, s: &str) {
-    let bytes = &s.as_bytes()[..s.len().min(32)];
+    let bytes: Vec<u8> = s.chars().take(32).map(|c| c as u32 as u8).collect();
     out.push(bytes.len() as u8);
     out.extend(bytes);
+}
+
+/// A name as a dump prints it: anything outside printable ASCII as '.'. The
+/// bytes themselves are never changed — only what is shown.
+pub(crate) fn printable(s: &str) -> String {
+    s.chars().map(|c| if (' '..'\u{7f}').contains(&c) { c } else { '.' }).collect()
 }
 
 /// An AppleTalk network address: 16-bit network, 8-bit node.
