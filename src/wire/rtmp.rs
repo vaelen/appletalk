@@ -5,7 +5,6 @@
 //!
 //! Layouts from Inside AppleTalk, PDF 138-139 (Data) and 140-142 (tuples,
 //! Request, Response and RDR).
-#![allow(dead_code)]
 
 use std::fmt;
 

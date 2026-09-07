@@ -3,10 +3,6 @@
 
 //! AURP: the AppleTalk Update-Based Routing Protocol tunnelled over UDP 387.
 //! `docs/AURP.md` has the layouts, the worked examples and the discard table.
-//!
-//! stub: Task 10 gives these types their first caller; until then nothing in
-//! the binary parses an AURP packet.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::fmt;

@@ -163,22 +163,14 @@ impl fmt::Display for Zip {
 /// the transaction reassembler rather than through `decode`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ZipAtp {
-    // Only `parse_request` constructs these three, and nothing calls it
-    // outside tests yet: `Session` classifies completed responses, not
-    // requests. Wire this in once a frontend wants to show the request that
-    // prompted a reply.
-    #[allow(dead_code)]
     GetMyZone,
-    #[allow(dead_code)]
     GetZoneList { start: u16 },
-    #[allow(dead_code)]
     GetLocalZones { start: u16 },
     Reply { last: bool, zones: Vec<String> },
 }
 
 impl ZipAtp {
     /// `user` is the ATP request's four user bytes.
-    #[allow(dead_code)] // only tests call this; no production request-side caller yet
     pub fn parse_request(user: &[u8], _data: &[u8]) -> Option<Self> {
         let u: &[u8; 4] = user.get(..4)?.try_into().ok()?;
         let start = u16::from_be_bytes([u[2], u[3]]);
@@ -211,7 +203,6 @@ impl ZipAtp {
     ///
     /// The count is derived from `zones` here rather than passed in, so a reply
     /// cannot claim more names than it carries.
-    #[allow(dead_code)] // stub: Task 8
     pub fn reply_parts(last: bool, zones: &[String]) -> ([u8; 4], Vec<u8>) {
         let mut data = Vec::new();
         for z in zones {
@@ -236,7 +227,6 @@ impl ZipAtp {
 /// ponytail: ASCII uppercasing only. PDF 191 defers to Appendix D for Mac OS
 /// Roman's accented forms, which fold differently; a zone whose name differs
 /// from another's only in an accent's case would share this address.
-#[allow(dead_code)] // stub: Task 8
 pub fn zone_multicast(zone: &str) -> MacAddr {
     const N: u16 = 253;
     let raw: Vec<u8> = zone.chars().map(|c| (c as u32 as u8).to_ascii_uppercase()).collect();
