@@ -478,9 +478,9 @@ Router mode has run live on a real internet: an EtherTalk port and an LToUDP
 port, the GlobalTalk peer list, and traffic routed to remote zones over the
 AURP tunnel. Not yet measured on a wire: the hop-count rule (one hop per
 cable, none for the tunnel) and a second seed router. The TashTalk port has met a real Mac on a real
-cable, beside the live router: it took our network number, listed every
-GlobalTalk zone in the Chooser, and its lookups were relayed onto the Ethernet
-cable. Not yet seen: a session with a server on the far side. A Phase 1 EtherTalk frame is dropped 
+cable: it took our network number, listed every GlobalTalk zone in the
+Chooser, and mounted a share from a remote network across the tunnel, with
+EtherTalk, LToUDP and TashTalk ports all on one router. A Phase 1 EtherTalk frame is dropped 
 by the router rather than routed: Phase 1 carries no length field to trim 
 Ethernet's padding by, so the datagram disagrees with its own length and fails 
 closed.
