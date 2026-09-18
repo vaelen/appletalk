@@ -156,7 +156,11 @@ never two), the second-seed-router-beside-jrouter arrangement, and an emulator
 on the LToUDP port listing the whole zone list through us. Two things to know
 before reading the logs: every line it prints is prefixed `router:`, and
 `SIGUSR1` prints the routing and zone table, the peer table and a per-port
-summary, in that order, as one log line. `SIGINT`/`SIGTERM` send RD to every
+summary, in that order, as one log line; `SIGUSR2` tickles every connected
+peer and logs a round-trip table two seconds later. Never probe the peers
+from a second process behind the same NAT: they key peers by IP alone, so an
+Open-Req from us with a fresh connection ID reads as a restart and breaks the
+live connection. `SIGINT`/`SIGTERM` send RD to every
 peer we are data sender to and drain for two seconds before exiting.
 
 | Live check                                                                                                                                             | State                                |
@@ -186,4 +190,5 @@ sudo setcap cap_net_raw,cap_net_bind_service+ep target/debug/appletalk
 ./target/debug/appletalk router [--config appletalk.toml]           # route between links and peers
 ./target/debug/appletalk peers import <file | url>                 # merge a peer list into the config
 kill -USR1 $(pidof appletalk)                                       # dump the router's tables
+kill -USR2 $(pidof appletalk)                                       # tickle every peer, report two seconds later
 ```

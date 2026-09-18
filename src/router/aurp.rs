@@ -27,6 +27,9 @@ pub const RETRIES: u32 = 5;
 pub const LAST_HEARD: Duration = Duration::from_secs(90);
 /// Tickles sent before the peer's routes are dropped.
 pub const TICKLE_RETRIES: u32 = 10;
+/// How long an operator's ping (`SIGUSR2`) waits for Tickle-Acks before the
+/// report is printed.
+pub const PING_GRACE: Duration = Duration::from_secs(2);
 /// Minimum spacing between RI-Upds, so events batch.
 pub const UPDATE_INTERVAL: Duration = Duration::from_secs(10);
 /// How often the reconnect scan looks at unconnected configured peers.
@@ -144,6 +147,12 @@ pub struct Peer {
     last_update: Instant,
     /// A null RI-Upd is out probing whether a conflicting Open-Req is genuine.
     probing: bool,
+
+    // ---- the operator's ping ----
+    /// When the ping's Tickle went out and is still unanswered.
+    pinged_at: Option<Instant>,
+    /// The round trip of the last answered ping, until the report takes it.
+    ping_rtt: Option<Duration>,
 }
 
 impl Peer {
@@ -168,6 +177,8 @@ impl Peer {
             pending: Vec::new(),
             last_update: now,
             probing: false,
+            pinged_at: None,
+            ping_rtt: None,
         }
     }
 
@@ -401,6 +412,9 @@ impl Peer {
                 self.receiver = Receiver::Connected;
                 self.recv_tries = 0;
                 self.last_heard = now;
+                if let Some(at) = self.pinged_at.take() {
+                    self.ping_rtt = Some(now.saturating_duration_since(at));
+                }
             }
             _ => {}
         }
@@ -717,6 +731,57 @@ impl Peers {
             p.sender = Sender::WaitRdAck;
         }
         out.acts
+    }
+
+    /// The operator's ping: a Tickle to every peer we are connected to as
+    /// receiver, timed by the Tickle-Ack. A peer already waiting on a tickle
+    /// gets one more without its retry count moving, so a ping can neither
+    /// hasten nor delay the drop of a dead peer's routes.
+    pub fn ping(&mut self, now: Instant) -> Vec<Action> {
+        let mut acts = Vec::new();
+        for p in self.peers.values_mut() {
+            match p.receiver {
+                Receiver::Connected => {
+                    p.receiver = Receiver::WaitTickleAck;
+                    p.recv_tries = 1;
+                    p.recv_at = now;
+                }
+                Receiver::WaitTickleAck => {}
+                _ => continue,
+            }
+            p.pinged_at = Some(now);
+            p.ping_rtt = None;
+            acts.push(p.send(p.conn_local, 0, Cmd::Tickle));
+        }
+        acts
+    }
+
+    /// The ping's results as a table, one row per configured peer in config
+    /// order and then any peer that found us on its own. Taking the report
+    /// clears it, so the next ping starts blank.
+    pub fn ping_report(&mut self) -> String {
+        let mut s = String::new();
+        let _ = writeln!(s, "{:<25}  {:<15}  {:<15}  ping", "peer", "address", "state");
+        let mut row = |name: &str, p: Option<&mut Peer>| {
+            let Some(p) = p else {
+                let _ = writeln!(s, "{name:<25}  {:<15}  {:<15}  -", "-", "unresolved");
+                return;
+            };
+            let result = match (p.ping_rtt.take(), p.pinged_at.take()) {
+                (Some(rtt), _) => format!("{} ms", rtt.as_millis()),
+                (None, Some(_)) => format!("no reply in {} s", PING_GRACE.as_secs()),
+                (None, None) => "-".to_string(),
+            };
+            let _ = writeln!(s, "{name:<25}  {:<15}  {:<15}  {result}", p.addr.to_string(), p.receiver.to_string());
+        };
+        for name in &self.configured {
+            let p = self.peers.values_mut().find(|p| p.configured.as_deref() == Some(name.as_str()));
+            row(name, p);
+        }
+        for p in self.peers.values_mut().filter(|p| p.configured.is_none()) {
+            row("-", Some(p));
+        }
+        s
     }
 
     pub fn dump(&self) -> String {
@@ -1765,5 +1830,49 @@ mod tests {
             }
         }
         assert_eq!(seen, names.len());
+    }
+
+    #[test]
+    fn ping_tickles_every_connected_peer_and_reports_the_round_trip() {
+        let t0 = Instant::now();
+        let mut tb = Tables::new();
+        tb.add_port(0, (6800, 6800), true, vec!["A".into()], t0);
+        let (mut ps, a1, _) = connected(&mut tb, t0);
+        let a = ps.ping(t0);
+        assert_eq!(cmds(&a), vec![(a1, 0, Cmd::Tickle)]);
+        assert_eq!(ps.peers[&REMOTE].receiver, Receiver::WaitTickleAck);
+        let acked = t0 + Duration::from_millis(38);
+        ps.packet(REMOTE, &routing(a1, 0, Cmd::TickleAck), &mut tb, acked);
+        assert_eq!(ps.peers[&REMOTE].receiver, Receiver::Connected);
+        assert_eq!(
+            ps.ping_report(),
+            "peer                       address          state            ping\n\
+             peer                       192.0.2.2        connected        38 ms\n"
+        );
+        // The report is of one ping only: the next one starts blank.
+        assert!(ps.ping_report().ends_with("connected        -\n"));
+    }
+
+    #[test]
+    fn ping_report_names_no_reply_and_the_state_of_peers_it_could_not_ping() {
+        let t0 = Instant::now();
+        let mut tb = Tables::new();
+        tb.add_port(0, (6800, 6800), true, vec!["A".into()], t0);
+        let (mut ps, _, _) = connected(&mut tb, t0);
+        ps.configured.push("gone.example".into());
+        ps.configured.push("quiet.example".into());
+        let quiet = Ipv4Addr::new(192, 0, 2, 3);
+        ps.resolved("quiet.example", quiet, t0);
+        let a = ps.ping(t0);
+        // Only the connected peer is tickled; the unconnected one is left to
+        // the reconnect scan.
+        assert_eq!(cmds(&a).len(), 1);
+        assert_eq!(
+            ps.ping_report(),
+            "peer                       address          state            ping\n\
+             peer                       192.0.2.2        wait tickle-ack  no reply in 2 s\n\
+             gone.example               -                unresolved       -\n\
+             quiet.example              192.0.2.3        unconnected      -\n"
+        );
     }
 }

@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use crate::capture::{self, Event, PortId, Tx};
 use crate::config::Config;
 use crate::ltoudp::Ltoudp;
-use crate::router::aurp::{Peers, RECONNECT_SCAN};
+use crate::router::aurp::{PING_GRACE, Peers, RECONNECT_SCAN};
 use crate::router::local::Local;
 use crate::router::ports::{Inbound, Kind, Port};
 use crate::router::table::{RouteChange, Tables};
@@ -108,6 +108,10 @@ pub enum In<'a> {
     Aurp { from: Ipv4Addr, bytes: &'a [u8] },
     Tick,
     Dump,
+    /// `SIGUSR2`: tickle every connected peer now.
+    Ping,
+    /// `PING_GRACE` after a `Ping`: print what answered.
+    PingReport,
 }
 
 pub struct Router {
@@ -195,6 +199,8 @@ impl Router {
                 out.extend(self.changed(changes));
                 out
             }
+            In::Ping => self.peers.ping(now),
+            In::PingReport => vec![Action::Log(format!("\n{}", self.peers.ping_report().trim_end()))],
             In::Dump => {
                 vec![Action::Log(format!(
                     "\n{}\n{}\n{}",
@@ -425,6 +431,7 @@ fn port_specs(cfg: &Config) -> Vec<((u16, u16), Vec<String>)> {
 /// do nothing but this: it runs between two arbitrary instructions.
 static DUMP: AtomicBool = AtomicBool::new(false);
 static STOP: AtomicBool = AtomicBool::new(false);
+static PING: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_dump(_: libc::c_int) {
     DUMP.store(true, Ordering::Relaxed);
@@ -432,6 +439,9 @@ extern "C" fn on_dump(_: libc::c_int) {
 
 extern "C" fn on_stop(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
+}
+extern "C" fn on_ping(_: libc::c_int) {
+    PING.store(true, Ordering::Relaxed);
 }
 
 /// The links a port can be, once opened. EtherTalk transmits through the
@@ -464,16 +474,18 @@ pub fn run(mut cfg: Config) -> io::Result<()> {
         cfg.public_ip.map_or(Di::Null, Di::Ip)
     );
 
-    // SAFETY: both handlers only store to a `static AtomicBool`, which is all
+    // SAFETY: every handler only stores to a `static AtomicBool`, which is all
     // a handler may portably do.
     unsafe {
         libc::signal(libc::SIGUSR1, on_dump as libc::sighandler_t);
+        libc::signal(libc::SIGUSR2, on_ping as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_stop as libc::sighandler_t);
         libc::signal(libc::SIGTERM, on_stop as libc::sighandler_t);
     }
 
     let mut next_scan = now;
     let mut deadline: Option<Instant> = None;
+    let mut ping_report: Option<Instant> = None;
     loop {
         // Sampled after the blocking receive, not before: taken any earlier,
         // `now` would be up to TICK stale by the time the event is handled.
@@ -506,6 +518,14 @@ pub fn run(mut cfg: Config) -> io::Result<()> {
         }
         if DUMP.swap(false, Ordering::Relaxed) {
             actions.extend(r.step(In::Dump, now));
+        }
+        if PING.swap(false, Ordering::Relaxed) {
+            actions.extend(r.step(In::Ping, now));
+            ping_report = Some(now + PING_GRACE);
+        }
+        if ping_report.is_some_and(|d| now >= d) {
+            ping_report = None;
+            actions.extend(r.step(In::PingReport, now));
         }
         if deadline.is_none() && STOP.swap(false, Ordering::Relaxed) {
             eprintln!("router: shutting down");

@@ -388,10 +388,17 @@ address reconnects on its own once DNS catches up.
 
 `SIGUSR1` dumps three things to stderr, in order: the routing and zone table,
 the peer table, then a line per port with its kind, name, network range,
-claimed node and zones. All in aligned columns.
+claimed node and zones. All in aligned columns. `SIGUSR2` is an AURP ping: a
+Tickle goes to every peer we hold a connection to, and two seconds later a
+table lists each configured peer with its address, connection state and the
+round-trip time, or `no reply`. A peer is pinged over the connection the
+router already holds because that is the only way to do it from behind its
+NAT: peers key connections by source IP alone, so a fresh Open-Req from the
+same address would read as the router restarting.
 
 ```sh
 kill -USR1 $(pidof appletalk)
+kill -USR2 $(pidof appletalk)   # ping every peer; the table follows two seconds later
 ```
 
 `SIGINT` or `SIGTERM` shuts it down politely: it sends an RD to every peer it
@@ -430,7 +437,8 @@ sudo systemctl enable --now appletalk-router
 
 Logs go to the journal (`journalctl -u appletalk-router -f`), `systemctl stop`
 sends the `SIGTERM` the router shuts down politely on, and the dump is
-`systemctl kill -s USR1 appletalk-router`. A TashTalk port needs the serial
+`systemctl kill -s USR1 appletalk-router`, the ping `systemctl kill -s USR2
+appletalk-router`. A TashTalk port needs the serial
 device let through; the unit has the two lines to uncomment. Edit the peer
 list with `sudo appletalk peers import ... --config
 /etc/appletalk/appletalk.toml` and restart the service to pick it up.
