@@ -162,9 +162,13 @@ peer we are data sender to and drain for two seconds before exiting.
 | Live check                                                                                                                                          | State                               |
 |-----------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------|
 | EtherTalk and LToUDP ports up, GlobalTalk peers connected over UDP 387, traffic routed to remote zones across the tunnel                            | Confirmed 2026-09-08                |
-| Second seed router beside jrouter, with an LToUDP port on its own net: an emulator lists the whole zone list through us and pings across the tunnel | Pending                             |
+| Second seed router beside the live one, with a TashTalk port on its own net: the neighbours learn our net's zone and a Mac lists every zone through us | Confirmed 2026-09-18                |
+| The same with an LToUDP port, and a ping from the LocalTalk side across the tunnel                                                                  | Pending                             |
 | `tcpdump -e -x` shows hop counts one higher on the cable than on the tunnel, never two                                                              | Pending                             |
-| TashTalk against a real board: the claim, an ENQ answered by the firmware, a physical Mac reaching the cable and the tunnel                         | Deferred until the hardware arrives |
+| TashTalk board with an empty cable: opens at 1 Mbaud with CTS asserted; init, ENQs, node bitmap and RTMP go out with a correct FCS; clean SIGTERM   | Confirmed 2026-09-15                |
+| TashTalk with a Mac on the cable: RTS/CTS both ways, frames decoded with a good FCS, GetMyZone and GetLocalZones answered, BrRq turned into a LkUp | Confirmed 2026-09-18                |
+| TashTalk beside an EtherTalk port: the Mac's Chooser lookup for a remote zone leaves us as a zone-multicast LkUp on the Ethernet cable             | Confirmed 2026-09-18                |
+| A LocalTalk Mac reaching a server across the cable or the tunnel; the firmware answering an ENQ for our node ID                                     | Pending, needs a server to answer   |
 
 One deployment lesson from that run: under systemd, `RestrictAddressFamilies`
 must include `AF_NETLINK` or interface enumeration returns nothing and every

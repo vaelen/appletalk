@@ -24,7 +24,7 @@ bugs hide:
 | A reply with no zone multicast address | Accepted since the `Option<MacAddr>` change, never seen                                                                                                                                                                                    |
 | A Phase 1 network                      | We only ever transmit Phase 2                                                                                                                                                                                                              |
 | Router mode: hop counts on the wire    | Confirmed live 2026-09-08: EtherTalk and LToUDP ports, GlobalTalk peers, remote zones reachable. Unmeasured: `tcpdump -e -x` hops one higher on the cable than on the tunnel, never two; a second seed router beside jrouter               |
-| TashTalk against real hardware         | Deferred until the board arrives. Its serial framing — FCS, escapes, the node bitmap — is tested against byte literals only, and no ENQ has ever been answered by the firmware                                                             |
+| TashTalk against real hardware         | Confirmed 2026-09-18 with a Mac on the cable: it took net 6802 from our RTMP, asked GetMyZone and GetLocalZones and got the zone, the Chooser listed it, and its BrRq went back out as a LkUp. Beside the live router with an EtherTalk port too, the Mac saw every GlobalTalk zone and its lookups left us as zone-multicast LkUps on the cable. Unexercised: the firmware answering an ENQ for our ID, and a session with a server across the cable |
 
 ## Protocols not yet parsed
 
